@@ -14,6 +14,15 @@
 //!   texture instance spans REPEAT_CELLS x REPEAT_CELLS cells) so nothing
 //!   looks like per-cell squares.
 //!
+//! Depth (v3): the fragment depth is the dot of the rotated world position
+//! with the iso view ray (1,1,0.5) — strictly monotone along the ray, so
+//! overlapping fragments never tie. (Screen-derived depth did tie: the
+//! LessEqual test then resolved by float rounding, which flickered while
+//! zooming and let water show through slopes.)
+//!
+//! Textures (v3): full mip chain generated at startup (blit until 1x1) with
+//! Linear mipmap filtering — no minification shimmer on zoom.
+//!
 //! The rendering internals are shared by the `city_terrain` example (offscreen
 //! CLI) and `kolomna-app` (windowed + `--shot`).
 
@@ -123,7 +132,12 @@ fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) w
     let iso = vec2<f32>((rp.x - rp.y) * 0.5, (rp.x + rp.y) * 0.25 - p.z * params.hz);
     let scr = (iso - params.center) * params.scale;
     let ndc = vec2<f32>(scr.x / params.half.x, -scr.y / params.half.y);
-    o.pos = vec4<f32>(ndc.x, ndc.y, (ndc.y + 1.0) * 0.499 + 0.001, 1.0);
+    // True view depth: the iso camera looks along (1, 1, 0.5) in rotated mesh
+    // space, so a surface is closer to the eye when dot(rp.xy + z*0.5) is
+    // LARGER. Monotone along the whole view ray -> overlapping fragments get
+    // distinct depths (no tie lottery -> no flicker, no water through slopes).
+    let dep = (rp.x + rp.y + p.z * 0.5) * (0.9 / (4.0 * params.pivot + 40.0));
+    o.pos = vec4<f32>(ndc.x, ndc.y, 0.95 - dep, 1.0);
     o.uv = uv;
     o.wpos = p;
     o.wdep = wdep;
@@ -185,6 +199,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let lit = 0.72 + 0.38 * max(dot(n, l), 0.0);
     let c = textureSample(atlas, samp, in.uv, i32(in.layer + 0.5));
     return vec4<f32>(c.rgb * lit, 1.0);
+}
+"#;
+
+/// Fullscreen-triangle blit used to build the texture mip chain.
+const MIP_SHADER: &str = r#"
+@group(0) @binding(0) var src: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+
+struct MipOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+@vertex
+fn vs_mip(@builtin(vertex_index) i: u32) -> MipOut {
+    let x = f32((i << 1u) & 2u);
+    let y = f32(i & 2u);
+    var o: MipOut;
+    o.pos = vec4<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0, 0.0, 1.0);
+    o.uv = vec2<f32>(x, 1.0 - y);
+    return o;
+}
+
+@fragment
+fn fs_mip(in: MipOut) -> @location(0) vec4<f32> {
+    return textureSample(src, samp, in.uv);
 }
 "#;
 
@@ -372,6 +412,132 @@ pub fn load_atlas(dat_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>>
     Ok(layers)
 }
 
+/// Build the full mip chain of `tex` (array layers, level 0 uploaded already)
+/// by successive fullscreen blits: level i = box-ish average of level i-1.
+fn generate_mips(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, levels: u32) {
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("mip-shader"),
+        source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MIP_SHADER)),
+    });
+    let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("mip-bgl"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("mip-layout"),
+        bind_group_layouts: &[Some(&bgl)],
+        immediate_size: 0,
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("mip-pipeline"),
+        layout: Some(&layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs_mip"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs_mip"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("mip-sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Linear,
+        min_filter: wgpu::FilterMode::Linear,
+        mipmap_filter: wgpu::MipmapFilterMode::Linear,
+        ..Default::default()
+    });
+    let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("mip-enc"),
+    });
+    for level in 1..levels {
+        for layer in 0..SOURCES.len() as u32 {
+            let src = tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_mip_level: level - 1,
+                mip_level_count: Some(1),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            });
+            let dst = tex.create_view(&wgpu::TextureViewDescriptor {
+                dimension: Some(wgpu::TextureViewDimension::D2),
+                base_mip_level: level,
+                mip_level_count: Some(1),
+                base_array_layer: layer,
+                array_layer_count: Some(1),
+                ..Default::default()
+            });
+            let bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mip-bg"),
+                layout: &bgl,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&src),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("mip-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &dst,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.draw(0..3, 0..1);
+        }
+    }
+    queue.submit(Some(enc.finish()));
+}
+
 /// Render-ready terrain: pipeline + bind group + buffers, usable with any
 /// color target format (offscreen Rgba8UnormSrgb or a window surface).
 pub struct TerrainRenderer {
@@ -392,6 +558,7 @@ impl TerrainRenderer {
         verts: &[Vertex],
     ) -> Self {
         let layer_bytes = (TILE * TILE * 4) as usize;
+        let mip_levels = (TILE as f32).log2() as u32 + 1;
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atlas-array"),
             size: wgpu::Extent3d {
@@ -399,11 +566,13 @@ impl TerrainRenderer {
                 height: TILE,
                 depth_or_array_layers: SOURCES.len() as u32,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_levels,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         for (i, chunk) in layers.chunks(layer_bytes).enumerate() {
@@ -431,6 +600,7 @@ impl TerrainRenderer {
                 },
             );
         }
+        generate_mips(device, queue, &atlas_tex, mip_levels);
         let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
@@ -441,6 +611,8 @@ impl TerrainRenderer {
             address_mode_v: wgpu::AddressMode::Repeat,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            // sampler default here is Nearest for mips -> shimmer while zooming
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
 
@@ -605,14 +777,15 @@ pub fn default_params(w: f32, h: f32, grid: f32, zspan: f32) -> Params {
 }
 
 /// Render the terrain mesh offscreen (4x MSAA, resolve, readback) and return
-/// the RGBA8 pixels (w * h * 4 bytes).
-pub fn render_offscreen(
+/// the RGBA8 pixels (w * h * 4 bytes). `zoom` = 1.0 frames the whole grid.
+pub fn render_offscreen_with(
     w: u32,
     h: u32,
     layers: &[u8],
     verts: &[Vertex],
     grid: f32,
     zspan: f32,
+    zoom: f32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -643,7 +816,9 @@ pub fn render_offscreen(
         layers,
         verts,
     );
-    renderer.set_params(&queue, &default_params(w as f32, h as f32, grid, zspan));
+    let mut params = default_params(w as f32, h as f32, grid, zspan);
+    params.scale *= zoom;
+    renderer.set_params(&queue, &params);
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("target-msaa"),
@@ -766,6 +941,18 @@ pub fn render_offscreen(
     let data = slice.get_mapped_range()?.to_vec();
     readback.unmap();
     Ok(data)
+}
+
+/// Whole-grid framing (zoom = 1.0) — thin wrapper over `render_offscreen_with`.
+pub fn render_offscreen(
+    w: u32,
+    h: u32,
+    layers: &[u8],
+    verts: &[Vertex],
+    grid: f32,
+    zspan: f32,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    render_offscreen_with(w, h, layers, verts, grid, zspan, 1.0)
 }
 
 /// Encode RGBA8 pixels (w * h * 4 bytes) as a PNG file.

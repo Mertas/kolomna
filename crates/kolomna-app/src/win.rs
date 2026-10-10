@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use kolomna_render::{
     Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, load_atlas,
-    load_terrain, render_offscreen, water_level, write_png,
+    load_terrain, render_offscreen_with, water_level, write_png,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -70,16 +70,18 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     })
 }
 
-/// Headless mode: render exactly one frame offscreen with the default camera.
-pub fn shot(out: &str, city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
+/// Headless mode: render exactly one frame offscreen with the default camera
+/// (`zoom` scales the framing; 1.0 = whole grid) and write it as a PNG.
+pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     let scene = load_scene(city, dat)?;
-    let rgba = render_offscreen(
+    let rgba = render_offscreen_with(
         VIEW_W,
         VIEW_H,
         &scene.atlas,
         &scene.base,
         scene.grid,
         scene.zspan,
+        zoom,
     )?;
     write_png(out, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out}");
