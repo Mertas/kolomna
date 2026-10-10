@@ -37,6 +37,10 @@ use std::io;
 
 use bytemuck::{Pod, Zeroable};
 
+pub mod model;
+pub mod road;
+pub mod assets;
+
 pub const VIEW_W: u32 = 1600;
 pub const VIEW_H: u32 = 1200;
 pub const TILE: u32 = 256;

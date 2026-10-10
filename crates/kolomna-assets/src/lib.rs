@@ -10,3 +10,4 @@
 
 pub mod bitmap;
 pub mod fsh;
+pub mod mesh3d;

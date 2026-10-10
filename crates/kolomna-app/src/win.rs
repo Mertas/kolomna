@@ -16,9 +16,12 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
+use kolomna_render::assets::{fsh_rgba_search, mesh3d_from_dat};
+use kolomna_render::model::{mesh_from_mesh3d, ModelMesh, ModelRenderer, PlacedModel};
+use kolomna_render::road::{build_road_mesh, load_road_tiles, RoadMesh, RoadRenderer};
 use kolomna_render::{
     Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, load_atlas,
-    load_terrain, render_offscreen_with, water_level, write_png,
+    load_terrain, water_level, write_png,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -47,6 +50,14 @@ pub struct Scene {
     mn: f32,
     /// water surface level (metres)
     wl: f32,
+    /// road network from the save (16 m tiles)
+    road_mesh: RoadMesh,
+    road_textures: Vec<(u32, u32, Vec<u8>)>,
+    /// one house model (Z5, R$ house family) standing next to a road
+    model_mesh: ModelMesh,
+    model_textures: Vec<(u32, u32, Vec<u8>)>,
+    model_pos: [f32; 3],
+    model_rot: f32,
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
@@ -66,6 +77,42 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     let base = build_mesh(&terrain, mn, mx, wl);
     println!("mesh: {} triangles", base.len() / 3);
 
+    // ---- road network from the save (one 16 m tile per record)
+    let tiles = load_road_tiles(city)?;
+    println!("roads: {} tiles", tiles.len());
+    let road_mesh = build_road_mesh(&tiles, mn, wl);
+    let mut road_textures = Vec::new();
+    for id in &road_mesh.texture_ids {
+        road_textures.push(fsh_rgba_search(dat, *id)?);
+    }
+    println!("road textures: {}", road_textures.len());
+
+    // ---- one real house model (Z5 tile of the R$ family), placed by a road
+    let s1 = sibling(dat, "data1.dat");
+    let mesh3d = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, 0x00ad0400)?;
+    let model_mesh = mesh_from_mesh3d(&mesh3d);
+    let mut model_textures = Vec::new();
+    for id in &model_mesh.texture_ids {
+        model_textures.push(fsh_rgba_search(dat, *id)?);
+    }
+    println!(
+        "house: {} verts, {} indices, tex {:08x?}",
+        model_mesh.verts.len(),
+        model_mesh.indices.len(),
+        model_mesh.texture_ids
+    );
+    let t = &tiles[tiles.len() / 2];
+    let alt = (t.verts[0][1] + t.verts[2][1]) * 0.5;
+    let model_pos = [
+        (t.verts[0][0] + t.verts[2][0]) * 0.5 / 16.0,
+        (t.verts[0][2] + t.verts[2][2]) * 0.5 / 16.0 - 1.0,
+        (alt - mn) * ZSCALE,
+    ];
+    println!(
+        "house at cell ({:.1}, {:.1}), altitude {alt:.1} m",
+        model_pos[0], model_pos[1]
+    );
+
     Ok(Scene {
         base,
         atlas,
@@ -73,14 +120,34 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         zspan: (mx - mn) * ZSCALE,
         mn,
         wl,
+        road_mesh,
+        road_textures,
+        model_mesh,
+        model_textures,
+        model_pos,
+        model_rot: 0.0,
     })
+}
+
+/// Sibling archive in the same folder (data1.dat next to data2.dat).
+fn sibling(any_dat: &str, name: &str) -> String {
+    std::path::Path::new(any_dat)
+        .parent()
+        .map(|p| p.join(name).to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string())
 }
 
 /// Headless mode: render exactly one frame offscreen with the default camera
 /// (`zoom` scales the framing; 1.0 = whole grid) and write it as a PNG.
 pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     let scene = load_scene(city, dat)?;
-    let rgba = render_offscreen_with(
+    let house = PlacedModel {
+        mesh: &scene.model_mesh,
+        textures: &scene.model_textures,
+        pos: scene.model_pos,
+        rot: scene.model_rot,
+    };
+    let rgba = kolomna_render::model::render_scene_with_models(
         VIEW_W,
         VIEW_H,
         &scene.atlas,
@@ -90,6 +157,10 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         zoom,
         scene.mn,
         scene.wl,
+        None,
+        &[house],
+        Some(&scene.road_mesh),
+        &scene.road_textures,
     )?;
     write_png(out, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out}");
@@ -260,6 +331,8 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     terrain: TerrainRenderer,
+    road: RoadRenderer,
+    model: ModelRenderer,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 }
@@ -313,6 +386,22 @@ impl Renderer {
             scene.mn,
             scene.wl,
         );
+        let road = RoadRenderer::new(
+            &device,
+            &queue,
+            config.format,
+            4,
+            &scene.road_mesh,
+            &scene.road_textures,
+        );
+        let model = ModelRenderer::new(
+            &device,
+            &queue,
+            config.format,
+            4,
+            &scene.model_mesh,
+            &scene.model_textures,
+        );
         let (msaa_view, depth_view) = make_targets(&device, &config);
 
         Ok(Self {
@@ -321,6 +410,8 @@ impl Renderer {
             queue,
             config,
             terrain,
+            road,
+            model,
             msaa_view,
             depth_view,
         })
@@ -349,6 +440,10 @@ impl Renderer {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
         self.terrain.set_params(&self.queue, &params);
+        self.road.set_params(&self.queue, &params);
+        self.model.set_params(&self.queue, &params);
+        self.model
+            .set_placement(&self.queue, scene.model_pos, scene.model_rot);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -403,6 +498,8 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
+            self.road.draw(&mut pass);
+            self.model.draw(&mut pass);
         }
         self.queue.submit(Some(enc.finish()));
         self.queue.present(frame);
