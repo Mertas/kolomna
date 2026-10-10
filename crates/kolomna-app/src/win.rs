@@ -62,6 +62,57 @@ pub struct Scene {
     village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
 }
 
+/// One planned section (house) of a courtyard block.
+struct BlockSec {
+    seed: u64,
+    w: f32,
+    d: f32,
+    arch: bool,
+}
+
+/// Plan a row of sections whose widths (plus >= 0.6 m gaps) fill `target`
+/// metres: widths are 12..28 m in 2 m steps; the closing section is rounded
+/// so the row lands on the target within a couple of metres.
+fn plan_row(seed0: u64, target: f32) -> Vec<BlockSec> {
+    let mut r = kolomna_render::procgen::Rng::new(seed0);
+    let mut out: Vec<BlockSec> = Vec::new();
+    let mut rest = target;
+    let mut k = 0u64;
+    while rest >= 12.6 {
+        let w = if rest <= 28.6 {
+            (((rest - 0.6) / 2.0).floor() * 2.0).clamp(12.0, 28.0)
+        } else {
+            let mut w = 12.0f32;
+            let mut guard = 0;
+            loop {
+                w = [12.0f32, 16.0, 20.0, 24.0, 28.0][r.below(5) as usize];
+                let r2 = rest - w - 0.6;
+                if w <= rest - 0.6 && (r2 >= 12.6 || r2 <= 11.5) {
+                    break;
+                }
+                guard += 1;
+                if guard > 30 {
+                    break;
+                }
+            }
+            w
+        };
+        let d = [10.0f32, 12.0, 14.0][r.below(3) as usize];
+        out.push(BlockSec {
+            seed: seed0.wrapping_mul(31).wrapping_add(k.wrapping_mul(101)),
+            w,
+            d,
+            arch: false,
+        });
+        rest -= w + 0.6;
+        k += 1;
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    out
+}
+
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     let mut terrain = load_terrain(city)?;
     let n = grid_side(&terrain);
@@ -111,12 +162,14 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     let sm = smooth_field(&terrain, wl);
     println!("mesh: {} triangles", base.len() / 3);
 
-    // ---- the Petersburg street: 20 generated tenements in two rows --------
-    // Each house adapts to the slope: it is seated on the HIGHEST ground under
-    // its footprint (so the hill never crops walls or windows), and the
-    // basement skirt baked into the mesh continues the walls down to the
-    // LOWEST ground (so nothing floats). Two rows face the road, sizes and
-    // storeys vary with the seed.
+    // ---- two Petersburg courtyards (дворы-колодцы) beside the street ------
+    // Each block is a closed perimeter of tenements around a tight yard:
+    // the outer facades are the parade side, the walls facing the yard are
+    // plain with black (service) entrances and coach-house gates, and one or
+    // two houses per block are pierced by a carriage arch leading from the
+    // street into the courtyard. Every house is still seated on the HIGHEST
+    // ground under its footprint and gets a ground-following plinth, so the
+    // slope neither crops walls nor leaves voids.
     let h_at = |x: f32, z: f32| -> f32 {
         sample_h(
             &sm,
@@ -125,100 +178,156 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             z.clamp(0.0, (n - 1) as f32),
         )
     };
-    let nvec = [-dz, dx]; // road normal (side offset direction)
+    let nvec = [-dz, dx]; // road normal
+    let eu = [dx, dz]; // along the street
     let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)> = Vec::new();
-    let mut report: Vec<(f32, f32, f32, f32)> = Vec::new();
-    for row in 0..2u32 {
-        // the entrance facade (+z locally) turns to face the road
-        let rot = if row == 0 {
-            (-nvec[0]).atan2(nvec[1])
-        } else {
-            nvec[0].atan2(-nvec[1])
-        };
-        let (cr, sr) = rot.sin_cos();
-        // first pass: sizes only, so the row accumulates without overlaps
-        let mut sizes = Vec::new();
-        for k in 0..10u64 {
-            let seed = 7100 + row as u64 * 97 + k * 31;
-            let (_, _, w, d) = kolomna_render::piter::generate_manor(seed);
-            sizes.push((seed, w, d));
-        }
-        let total: f32 = sizes.iter().map(|s| s.1).sum::<f32>() + 9.0 * 4.5;
-        let mut along = -total / 2.0;
-        for (seed, w, d) in sizes {
-            along += w / 2.0;
-            // Pick the calmest spot near the row line: roads are cut along the
-            // contour, so the closer to the road the flatter the ground. Try
-            // several side offsets and small shifts, keep the smallest fall
-            // (measured over the corners plus an 8 m apron so the house never
-            // teeters on the lip of a ravine).
-            let mut best: Option<(f32, f32, f32, f32, f32)> = None;
-            for cand_side in [1.4f32, 2.0, 2.6, 3.2, 3.8] {
-                let s = if row == 0 { -cand_side } else { cand_side };
-                for cand_shift in [-2.5f32, 0.0, 2.5] {
-                    let cxx =
-                        anchor[0] + dx * ((along + cand_shift) / 16.0) + nvec[0] * s;
-                    let czz =
-                        anchor[1] + dz * ((along + cand_shift) / 16.0) + nvec[1] * s;
-                    // h_max over the footprint itself (seat height); h_min the
-                    // skirt has to reach; fall also sees the 8 m apron
-                    let mut hmx = f32::NEG_INFINITY;
-                    let mut hmn = f32::INFINITY;
-                    let mut hmn_all = f32::INFINITY;
-                    for (lx, lz, wide) in [
-                        (0.0, 0.0, false),
-                        (-w / 2.0, -d / 2.0, false),
-                        (w / 2.0, -d / 2.0, false),
-                        (-w / 2.0, d / 2.0, false),
-                        (w / 2.0, d / 2.0, false),
-                        (-w / 2.0, d / 2.0 + 2.6, false),
-                        (w / 2.0, d / 2.0 + 2.6, false),
-                        (-w / 2.0 - 8.0, -d / 2.0 - 8.0, true),
-                        (w / 2.0 + 8.0, -d / 2.0 - 8.0, true),
-                        (-w / 2.0 - 8.0, d / 2.0 + 8.0, true),
-                        (w / 2.0 + 8.0, d / 2.0 + 8.0, true),
-                    ] {
-                        let mx_ = cxx + lx * cr - lz * sr;
-                        let mz_ = czz + lx * sr + lz * cr;
-                        let h = h_at(mx_, mz_);
-                        if !wide {
-                            hmx = hmx.max(h);
-                            hmn = hmn.min(h);
-                        }
-                        hmn_all = hmn_all.min(h);
-                    }
-                    let fall = hmx - hmn_all;
-                    if best.is_none() || fall < best.unwrap().0 {
-                        best = Some((fall, cxx, czz, hmx, hmn));
-                    }
-                }
+    let mut report: Vec<(f32, f32, f32)> = Vec::new(); // w, d, fall
+
+    // outer size of a block + the street setback of its front facade
+    let wq = 58.0f32; // along the street
+    let dq = 50.0f32; // deep
+    let setback = 20.0f32;
+    let gap0 = 0.6f32;
+    for blk in 0..2u64 {
+        let s: f32 = if blk == 0 { 1.0 } else { -1.0 }; // which side of the road
+        let u_off = if blk == 0 { 0.0f32 } else { 18.0 };
+        let base_seed = 9000 + blk * 131;
+        // left / right rows run the full depth and carry the corners;
+        // front / back fill between them, so no two houses overlap
+        let mut l_pl = plan_row(base_seed + 11, dq);
+        let mut r_pl = plan_row(base_seed + 23, dq);
+        let dl0 = l_pl[0].d;
+        let dl_last = l_pl[l_pl.len() - 1].d;
+        let dr0 = r_pl[0].d;
+        let dr_last = r_pl[r_pl.len() - 1].d;
+        let f_avail = wq - dl0 - dr0 - 2.0 * gap0;
+        let b_avail = wq - dl_last - dr_last - 2.0 * gap0;
+        let mut f_pl = plan_row(base_seed + 37, f_avail);
+        let b_pl = plan_row(base_seed + 53, b_avail);
+        // carriage arches: one per block on the front row (a second sometimes)
+        if !f_pl.is_empty() {
+            let a = f_pl.len() / 2;
+            f_pl[a].arch = true;
+            if blk == 0 && f_pl.len() >= 3 {
+                f_pl[0].arch = true;
             }
-            let (_, cx, cz, h_max, _h_min) = best.unwrap();
+        }
+        // place one section: (xl, zl) is its footprint centre in the block
+        // frame; rot turns the parade facade outwards
+        let mut place_sec = |sec: &BlockSec, rot: f32, xl: f32, zl: f32| {
+            let (cr, sr) = rot.sin_cos();
+            let cx = anchor[0]
+                + eu[0] * ((u_off + xl) / 16.0)
+                + nvec[0] * (s * (setback + zl) / 16.0);
+            let cz = anchor[1]
+                + eu[1] * ((u_off + xl) / 16.0)
+                + nvec[1] * (s * (setback + zl) / 16.0);
+            let (w, d) = (sec.w, sec.d);
+            let mut h_max = f32::NEG_INFINITY;
+            let mut h_min = f32::INFINITY;
+            for (lx, lz) in [
+                (0.0f32, 0.0f32),
+                (-w / 2.0, -d / 2.0),
+                (w / 2.0, -d / 2.0),
+                (-w / 2.0, d / 2.0),
+                (w / 2.0, d / 2.0),
+            ] {
+                let mx_ = cx + (lx * cr - lz * sr) / 16.0;
+                let mz_ = cz + (lx * sr + lz * cr) / 16.0;
+                let h = h_at(mx_, mz_);
+                h_max = h_max.max(h);
+                h_min = h_min.min(h);
+            }
             let seat = (h_max + 0.05).max(wl + 2.0);
-            // model origin such that the rotated LOCAL CENTRE lands on (cx, cz)
-            let ox = cx - (w / 2.0 * cr - d / 2.0 * sr) / 16.0;
-            let oz = cz - (w / 2.0 * sr + d / 2.0 * cr) / 16.0;
-            let (mesh, texs, _, _) = kolomna_render::piter::generate_manor(seed);
-            // ground-following basement plinth: for any LOCAL point of the
-            // house, how far below the floor slab the real ground lies
+            let (mesh, texs, _, _, archr) =
+                kolomna_render::piter::generate_manor(sec.seed, sec.arch, Some((w, d)));
             let low = |lx: f32, lz: f32| -> f32 {
-                let mx_ = cx + lx * cr - lz * sr;
-                let mz_ = cz + lx * sr + lz * cr;
+                let mx_ = cx + (lx * cr - lz * sr) / 16.0;
+                let mz_ = cz + (lx * sr + lz * cr) / 16.0;
                 h_at(mx_, mz_) - seat
             };
-            let plinth = kolomna_render::piter::manor_plinth(w, d, &low);
+            let pl = kolomna_render::piter::manor_plinth(w, d, &low, archr);
             let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
+            let ox = cx - (w / 2.0 * cr - d / 2.0 * sr) / 16.0;
+            let oz = cz - (w / 2.0 * sr + d / 2.0 * cr) / 16.0;
             let place = [ox, oz, (seat - mn) * ZSCALE];
-            village.push((plinth, vec![base_tex], place, rot));
+            village.push((pl, vec![base_tex], place, rot));
             village.push((mesh, texs, place, rot));
-            report.push((w, d, _h_min, h_max - _h_min));
-            along += w / 2.0 + 4.5;
+            report.push((w, d, h_max - h_min));
+        };
+        // left: parade facades face −eu
+        {
+            let n = l_pl.len();
+            let sum: f32 = l_pl.iter().map(|x| x.w).sum();
+            let gap = if n > 1 {
+                ((dq - sum - 2.0 * gap0) / (n as f32 - 1.0)).clamp(gap0, 12.0)
+            } else {
+                0.0
+            };
+            let rot = eu[0].atan2(-eu[1]);
+            let mut c = gap0;
+            for sec in &l_pl {
+                let zlc = c + sec.w / 2.0;
+                place_sec(sec, rot, -wq / 2.0 + sec.d / 2.0, zlc);
+                c += sec.w + gap;
+            }
+        }
+        // right: parade facades face +eu
+        {
+            let n = r_pl.len();
+            let sum: f32 = r_pl.iter().map(|x| x.w).sum();
+            let gap = if n > 1 {
+                ((dq - sum - 2.0 * gap0) / (n as f32 - 1.0)).clamp(gap0, 12.0)
+            } else {
+                0.0
+            };
+            let rot = (-eu[0]).atan2(eu[1]);
+            let mut c = gap0;
+            for sec in &r_pl {
+                let zlc = c + sec.w / 2.0;
+                place_sec(sec, rot, wq / 2.0 - sec.d / 2.0, zlc);
+                c += sec.w + gap;
+            }
+        }
+        // front: parade facades face the street (−s·nvec)
+        {
+            let n = f_pl.len();
+            let sum: f32 = f_pl.iter().map(|x| x.w).sum();
+            let gap = if n > 1 {
+                ((f_avail - sum) / (n as f32 - 1.0)).clamp(gap0, 12.0)
+            } else {
+                0.0
+            };
+            let rot = (s * nvec[0]).atan2(-s * nvec[1]);
+            let mut c = -wq / 2.0 + dl0 + gap0;
+            for sec in &f_pl {
+                let xlc = c + sec.w / 2.0;
+                place_sec(sec, rot, xlc, sec.d / 2.0);
+                c += sec.w + gap;
+            }
+        }
+        // back: parade facades face away from the street (+s·nvec)
+        {
+            let n = b_pl.len();
+            let sum: f32 = b_pl.iter().map(|x| x.w).sum();
+            let gap = if n > 1 {
+                ((b_avail - sum) / (n as f32 - 1.0)).clamp(gap0, 12.0)
+            } else {
+                0.0
+            };
+            let rot = (-s * nvec[0]).atan2(s * nvec[1]);
+            let mut c = -wq / 2.0 + dl_last + gap0;
+            for sec in &b_pl {
+                let xlc = c + sec.w / 2.0;
+                place_sec(sec, rot, xlc, dq - sec.d / 2.0);
+                c += sec.w + gap;
+            }
         }
     }
-    for (i, (w, d, _hmin, dh)) in report.iter().enumerate() {
+    for (i, (w, d, dh)) in report.iter().enumerate() {
         println!("tenement {i:02}: {w:.0}x{d:.0} m, slope {dh:.2} m");
     }
-    println!("village: {} Petersburg tenements", village.len());
+    println!("village: {} Petersburg tenements", report.len());
 
     Ok(Scene {
         base,

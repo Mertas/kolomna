@@ -28,7 +28,13 @@ pub const M_IRON: u32 = 10; // solid cast iron (pipes, lanterns, anchors)
 pub const M_BAND: u32 = 11; // string course / cornice band
 pub const M_DORMER: u32 = 12; // dormer front
 pub const M_RAILING: u32 = 13; // balcony railing (alpha cut-out)
-pub const N_MATS: u32 = 14;
+pub const M_WIN_PLAIN: u32 = 14; // yard-side window: bare frame, no trim
+pub const M_BLACK_DOOR: u32 = 15; // service entrance (black door)
+pub const M_STABLE: u32 = 16; // coach-house gates seen from the yard
+pub const N_MATS: u32 = 17;
+
+/// Clear height of the carriage arch (above the basement + piano nobile line).
+pub const ARCH_H: f32 = 4.6;
 
 pub const TEX_W: usize = 128; // 2 m at 64 px/m
 pub const TEX_H: usize = 192; // 3 m
@@ -192,10 +198,12 @@ fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
         1 => 66,
         2 => 58,
         3 => img.h as i32 - 96,
+        4 => 66,
         _ => 62,
     };
     // nalidnik: bright band with a dark contour so it reads when zoomed out
-    if style != 3 {
+    // (styles 3 = basement grille and 4 = plain yard window have none)
+    if style != 3 && style != 4 {
         img.rect(wx0 - 13, wy0 - 13, wx1 + 13, wy1 + 11, edge);
         img.rect(wx0 - 11, wy0 - 11, wx1 + 11, wy1 + 9, nl);
     }
@@ -328,6 +336,62 @@ fn door_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     img.px
 }
 
+/// Service entrance on the yard side: a plain plank door in a stone reveal,
+/// no portal, no transom, a stone lintel above.
+fn black_door_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, pal.basement);
+    rusticate(&mut img, pal.basement, 44);
+    img.noise(r, 3);
+    let dx0 = 40;
+    let dx1 = TEX_W as i32 - 40;
+    let dy0 = 60;
+    let dy1 = TEX_H as i32 - 12;
+    img.rect(dx0 - 6, dy0 - 6, dx1 + 6, dy1 + 2, shift(pal.basement, -40));
+    img.rect(dx0, dy0, dx1, dy1, shift(pal.door, -16));
+    for x in (dx0 + 8..dx1).step_by(12) {
+        img.line_v(x, dy0, dy1, shift(pal.door, -28));
+    }
+    img.rect(dx1 - 20, dy0 + 42, dx1 - 15, dy0 + 48, pal.iron);
+    img.rect(dx0 - 8, dy0 - 14, dx1 + 8, dy0 - 6, shift(pal.basement, 24));
+    img.px
+}
+
+/// Coach-house gates: broad double doors of dark planks with iron straps and
+/// studs, an arched head — seen from inside the yard.
+fn stable_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, pal.basement);
+    rusticate(&mut img, pal.basement, 44);
+    img.noise(r, 3);
+    let gx0 = 12;
+    let gx1 = TEX_W as i32 - 12;
+    let gy0 = 30;
+    let gy1 = TEX_H as i32 - 8;
+    img.rect(gx0 - 6, gy0 - 10, gx1 + 6, gy1 + 2, shift(pal.basement, -44));
+    for k in 0..14 {
+        let cut = ((14 - k) as f32 * 1.1) as i32;
+        img.rect(gx0 + cut, gy0 - 8 + k, gx1 - cut, gy0 - 7 + k, shift(pal.basement, -18));
+    }
+    let dk = shift(pal.door, -24);
+    img.rect(gx0, gy0, gx1, gy1, dk);
+    for x in (gx0 + 10..gx1).step_by(14) {
+        img.line_v(x, gy0, gy1, shift(dk, -12));
+        img.line_v(x + 1, gy0, gy1, shift(dk, 10));
+    }
+    let mid = (gx0 + gx1) / 2;
+    img.line_v(mid - 1, gy0, gy1, shift(dk, -22));
+    img.line_v(mid, gy0, gy1, shift(dk, -22));
+    for yy in [gy0 + 26, gy1 - 36] {
+        img.rect(gx0 + 4, yy, gx1 - 4, yy + 5, pal.iron);
+    }
+    let mut x = gx0 + 16;
+    while x < gx1 - 8 {
+        img.rect(x, gy0 + 27, x + 4, gy0 + 31, pal.gold);
+        img.rect(x, gy1 - 35, x + 4, gy1 - 31, pal.gold);
+        x += 26;
+    }
+    img.px
+}
+
 fn roof_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     let mut img = Img::new(TEX_S, TEX_S, pal.roof);
     img.noise(r, 5);
@@ -442,6 +506,12 @@ struct Manor {
     tiles: usize,
     win_tiles: Vec<usize>,
     door_tile: usize,
+    /// carriage arch: first of the two street-wall tiles it pierces
+    arch: Option<usize>,
+    /// service (black) entrance on the yard side
+    yard_door: Option<usize>,
+    /// coach-house gates on the yard side
+    stable: Option<usize>,
 }
 
 /// Basement plinth that follows the real ground instead of a fixed depth.
@@ -452,14 +522,30 @@ struct Manor {
 /// plinth digs into the hill — the house reads as BUILT ON it: nothing is
 /// ever cropped by the slope (the house is seated on the high ground) and
 /// nothing hovers (the plinth reaches the low ground).
-pub fn manor_plinth(w: f32, d: f32, low: &dyn Fn(f32, f32) -> f32) -> ModelMesh {
+pub fn manor_plinth(
+    w: f32,
+    d: f32,
+    low: &dyn Fn(f32, f32) -> f32,
+    arch: Option<(f32, f32)>,
+) -> ModelMesh {
     const YMIN: f32 = -14.0; // sane clamp (we are not pouring into a lake)
     let mut b = Builder::new();
-    let yl = |l: &dyn Fn(f32, f32) -> f32, x: f32, z: f32| (l(x, z) - 0.05).max(YMIN);
+    let yl = |l: &dyn Fn(f32, f32) -> f32, x: f32, z: f32| (l(x, z) - 0.45).max(YMIN);
+    let in_arch = |x0: f32, x1: f32| {
+        if let Some((a0, a1)) = arch {
+            x1 > a0 && x0 < a1
+        } else {
+            false
+        }
+    };
     // south (+z): strips along x
     let mut x = 0.0f32;
     while x < w - 1e-4 {
         let x1 = (x + 2.0).min(w);
+        if in_arch(x, x1) {
+            x = x1;
+            continue; // the carriage passage goes down to the ground
+        }
         let yy = yl(low, x, d).min(yl(low, x1, d));
         b.quad(
             0, 
@@ -472,6 +558,10 @@ pub fn manor_plinth(w: f32, d: f32, low: &dyn Fn(f32, f32) -> f32) -> ModelMesh 
     x = w;
     while x > 1e-4 {
         let x0 = (x - 2.0).max(0.0);
+        if in_arch(x0, x) {
+            x = x0;
+            continue;
+        }
         let yy = yl(low, x, 0.0).min(yl(low, x0, 0.0));
         b.quad(
             0,
@@ -510,7 +600,11 @@ pub fn manor_plinth(w: f32, d: f32, low: &dyn Fn(f32, f32) -> f32) -> ModelMesh 
     x = kx0;
     while x < kx1 - 1e-4 {
         let x1 = (x + 2.5).min(kx1);
-        let yy = (yl(low, x, kz1).min(yl(low, x1, kz1)) - 0.3).max(YMIN);
+        if in_arch(x, x1) {
+            x = x1;
+            continue; // no kerb across the carriage entrance
+        }
+        let yy = (yl(low, x, kz1).min(yl(low, x1, kz1)) - 0.7).max(YMIN);
         b.quad(
             0,
             [[x, yy0, kz1], [x1, yy0, kz1], [x1, yy, kz1], [x, yy, kz1]],
@@ -527,7 +621,7 @@ pub fn manor_plinth(w: f32, d: f32, low: &dyn Fn(f32, f32) -> f32) -> ModelMesh 
         let mut zz = kz0;
         while zz < kz1 - 1e-4 {
             let z1 = (zz + 2.5).min(kz1);
-            let yy = (yl(low, kx, zz).min(yl(low, kx, z1)) - 0.3).max(YMIN);
+            let yy = (yl(low, kx, zz).min(yl(low, kx, z1)) - 0.7).max(YMIN);
             b.quad(
                 0,
                 [[kx, yy0, zz], [kx, yy0, z1], [kx, yy, z1], [kx, yy, zz]],
@@ -583,13 +677,22 @@ impl Manor {
 
 /// Build one tenement house; returns the mesh, its palette textures and the
 /// footprint size (w, d) in metres so the caller can place and rotate it.
-pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32) {
+pub fn generate_manor(
+    seed: u64,
+    arch: bool,
+    size: Option<(f32, f32)>,
+) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32, Option<(f32, f32)>) {
     let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
     let pal = Palette::new(&mut r);
 
-    let tiles = [6usize, 8, 10, 12, 14][r.below(5) as usize]; // 12..28 m
-    let w = 2.0 * tiles as f32;
-    let d = [10.0f32, 12.0, 14.0][r.below(3) as usize];
+    // footprint: fixed when the block planner sums a row exactly, else rolled
+    let (w, d) = if let Some((fw, fd)) = size {
+        (fw.round(), fd.round())
+    } else {
+        let t = [6usize, 8, 10, 12, 14][r.below(5) as usize]; // 12..28 m
+        (2.0 * t as f32, [10.0f32, 12.0, 14.0][r.below(3) as usize])
+    };
+    let tiles = (w / 2.0).round() as usize;
     let upper = 1 + r.below(5); // 1..5 upper floors → 3..7 storeys with basement
     let mut heights = vec![2.6f32, 3.9];
     for k in 0..upper {
@@ -604,6 +707,36 @@ pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f
         .filter(|&t| t >= 1 && t <= tiles - 2)
         .collect();
     let door_tile = win_tiles[win_tiles.len() / 2];
+    // carriage arch: two street-wall tiles (4 m), close to the facade centre,
+    // never overlapping the entrance; the passage runs right through to the yard
+    let arch = if arch && tiles >= 6 {
+        let mut cand: Vec<usize> = (1..tiles - 2)
+            .filter(|&a| a != door_tile && a + 1 != door_tile)
+            .collect();
+        cand.sort_by_key(|&a| ((2 * a as i32 + 1) - tiles as i32).abs());
+        cand.first().copied()
+    } else {
+        None
+    };
+    // yard side: a black entrance (always) and sometimes coach-house gates
+    let mut yard_door = None;
+    let mut stable = None;
+    {
+        let plain_tiles: Vec<usize> = (0..tiles).filter(|t| !win_tiles.contains(t)).collect();
+        if !plain_tiles.is_empty() && r.f() < 0.85 {
+            yard_door = Some(plain_tiles[r.below(plain_tiles.len() as u32) as usize]);
+        }
+        if r.f() < 0.45 {
+            let cand: Vec<usize> = win_tiles
+                .iter()
+                .copied()
+                .filter(|&t| Some(t) != yard_door && Some(t) != arch && Some(t) != arch.map(|a| a + 1))
+                .collect();
+            if !cand.is_empty() {
+                stable = Some(cand[r.below(cand.len() as u32) as usize]);
+            }
+        }
+    }
 
     let mut m = Manor {
         b: Builder::new(),
@@ -615,11 +748,15 @@ pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f
         tiles,
         win_tiles,
         door_tile,
+        arch,
+        yard_door,
+        stable,
     };
     m.build(&mut r);
     let texs = m.textures();
     let mesh = m.b.finish(N_MATS);
-    (mesh, texs, w, d)
+    let arch_range = arch.map(|a| (2.0 * a as f32, 2.0 * (a + 2) as f32));
+    (mesh, texs, w, d, arch_range)
 }
 
 impl Manor {
@@ -645,9 +782,21 @@ impl Manor {
                 ),
                 _ => (M_WALL, M_WIN),
             };
-            // south (front)
+            // south (street): the parade facade — entrance, nalidniks,
+            // sandriks; pierced by the carriage arch tiles
             for t in 0..tiles {
                 let x0 = 2.0 * t as f32;
+                if let Some(a) = self.arch {
+                    if t == a || t == a + 1 {
+                        if fi == 0 {
+                            continue; // the passage: no wall here
+                        }
+                        if fi == 1 {
+                            self.wall_quad(mat_wall, 0, x0, x0 + 2.0, ARCH_H, y + fh, d);
+                            continue;
+                        }
+                    }
+                }
                 let mat = if fi == 0 && t == self.door_tile {
                     M_DOOR
                 } else if self.win_tiles.contains(&t) && !(fi == 0 && t == self.door_tile) {
@@ -661,22 +810,46 @@ impl Manor {
                 };
                 self.wall_quad(mat, 0, x0, x0 + 2.0, y, y + fh, d);
             }
-            // north (back): windows on every other axis, plain
+            // north (yard): a plainer back — bare windows, a black entrance,
+            // coach-house gates; the arch passes through here as well
             for t in 0..tiles {
                 let x0 = 2.0 * t as f32;
-                let mat = if self.win_tiles.contains(&t) {
-                    mat_win
+                if let Some(a) = self.arch {
+                    if t == a || t == a + 1 {
+                        if fi == 0 {
+                            continue;
+                        }
+                        if fi == 1 {
+                            self.wall_quad(mat_wall, 1, x0, x0 + 2.0, ARCH_H, y + fh, 0.0);
+                            continue;
+                        }
+                    }
+                }
+                let mat = if fi == 0 && Some(t) == self.stable {
+                    M_STABLE
+                } else if fi == 0 && Some(t) == self.yard_door {
+                    M_BLACK_DOOR
+                } else if self.win_tiles.contains(&t) {
+                    if fi == 0 {
+                        M_BASE_WIN
+                    } else {
+                        M_WIN_PLAIN
+                    }
                 } else {
                     mat_wall
                 };
                 self.wall_quad(mat, 1, x0, x0 + 2.0, y, y + fh, 0.0);
             }
-            // ends: a window near the middle of each floor
+            // ends: a plain window near the middle of each floor
             let dts = (d / 2.0).floor() as usize;
             for t in 0..dts {
                 let z0 = 2.0 * t as f32;
                 let mat = if t == dts / 2 {
-                    mat_win
+                    if fi == 0 {
+                        M_BASE_WIN
+                    } else {
+                        M_WIN_PLAIN
+                    }
                 } else {
                     mat_wall
                 };
@@ -687,6 +860,49 @@ impl Manor {
             self.y_band.push(y);
         }
         let y_wall_top = y;
+
+        // ---- carriage arch: the passage through the house ------------------
+        if let Some(a) = self.arch {
+            let (a0, a1) = (2.0 * a as f32, 2.0 * (a + 2) as f32);
+            let ah = ARCH_H;
+            // jambs (inside faces of the passage)
+            self.b.quad(
+                M_BASE,
+                [[a0, 0.0, 0.0], [a0, 0.0, d], [a0, ah, d], [a0, ah, 0.0]],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, ah / 2.6], [0.0, ah / 2.6]],
+            );
+            self.b.quad(
+                M_BASE,
+                [[a1, 0.0, d], [a1, 0.0, 0.0], [a1, ah, 0.0], [a1, ah, d]],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, ah / 2.6], [0.0, ah / 2.6]],
+            );
+            // ceiling
+            self.b.quad(
+                M_BASE,
+                [[a0, ah, d], [a1, ah, d], [a1, ah, 0.0], [a0, ah, 0.0]],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, d / 2.0], [0.0, d / 2.0]],
+            );
+            // stone edging around the opening, street and yard faces
+            for zz in [d + 0.06, -0.06] {
+                for (x0, x1) in [(a0 - 0.22, a0), (a1, a1 + 0.22)] {
+                    self.b.quad(
+                        M_BAND,
+                        [[x0, 0.0, zz], [x1, 0.0, zz], [x1, ah + 0.5, zz], [x0, ah + 0.5, zz]],
+                        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    );
+                }
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [a0 - 0.22, ah + 0.25, zz],
+                        [a1 + 0.22, ah + 0.25, zz],
+                        [a1 + 0.22, ah + 0.5, zz],
+                        [a0 - 0.22, ah + 0.5, zz],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
+        }
 
         // ---- string courses between floors + stepped crowning cornice -----
         let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32| {
@@ -754,6 +970,11 @@ impl Manor {
                     }
                     if bf == 1 && wt == self.door_tile {
                         continue;
+                    }
+                    if let Some(a) = self.arch {
+                        if wt == a || wt == a + 1 {
+                            continue; // no balcony over the carriage arch
+                        }
                     }
                     let xc = 2.0 * wt as f32 + 1.0;
                     let x0 = xc - 1.15;
