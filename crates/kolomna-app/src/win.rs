@@ -63,7 +63,7 @@ pub struct Scene {
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
-    let terrain = load_terrain(city)?;
+    let mut terrain = load_terrain(city)?;
     let n = grid_side(&terrain);
     if n * n != terrain.len() {
         return Err(format!("terrain grid is not square ({} values)", terrain.len()).into());
@@ -76,9 +76,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     let atlas = load_atlas(dat)?;
     println!("atlas: 6 textures -> 256x256 px layers");
 
-    let base = build_mesh(&terrain, mn, mx, wl);
-    let sm = smooth_field(&terrain, wl);
-    println!("mesh: {} triangles", base.len() / 3);
+    // (the terrain mesh is built after the tenement pads are levelled below)
 
     // ---- road network from the save (one 16 m tile per record)
     let tiles = load_road_tiles(city)?;
@@ -94,48 +92,54 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     // generated Petersburg tenements; the 3DMD parser stays for the examples.)
     let t = &tiles[tiles.len() / 2];
     let alt = (t.verts[0][1] + t.verts[2][1]) * 0.5;
-    let model_pos = [
+    let anchor = [
         (t.verts[0][0] + t.verts[2][0]) * 0.5 / 16.0,
         (t.verts[0][2] + t.verts[2][2]) * 0.5 / 16.0 - 1.0,
-        (alt - mn) * ZSCALE,
-    ];
-    // snap the house onto the terrain under it (sm = smoothed height field),
-    // otherwise a slope through its tile crops the ground floor
-    let hxi = model_pos[0].round().clamp(0.0, (n - 1) as f32) as usize;
-    let hzi = model_pos[1].round().clamp(0.0, (n - 1) as f32) as usize;
-    let model_pos = [
-        model_pos[0],
-        model_pos[1],
-        (sm[hzi * n + hxi] - mn) * ZSCALE + 0.02,
     ];
     println!(
-        "house at cell ({:.1}, {:.1}), altitude {alt:.1} m",
-        model_pos[0], model_pos[1]
+        "street anchor at cell ({:.1}, {:.1}), altitude {alt:.1} m",
+        anchor[0], anchor[1]
     );
-
-    // ---- the Petersburg street: only the freshly generated tenements
-    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])> = Vec::new();
     let mut dx = t.verts[1][0] - t.verts[0][0];
     let mut dz = t.verts[1][2] - t.verts[0][2];
     let dl = (dx * dx + dz * dz).sqrt().max(1e-6);
     dx /= dl;
     dz /= dl;
-    let height_cell = |x: f32, z: f32| -> f32 {
-        let i = x.round().clamp(0.0, (n - 1) as f32) as usize;
-        let j = z.round().clamp(0.0, (n - 1) as f32) as usize;
-        (sm[j * n + i] - mn) * ZSCALE
-    };
+
     // ---- a street of Petersburg tenements (доходные дома, E:/My/Clicker) ----
+    // A tenement on a slope: cut a level pad under the footprint into the
+    // height grid BEFORE the mesh is built (terraced lots do the same). The
+    // pad height is the smoothed height at the house centre, so the hill is
+    // cut from behind and filled from below — the house sits on a terrace
+    // that follows the hill, and no corner gets sliced by the slope.
+    let sm0 = smooth_field(&terrain, wl);
+    let h0 = |x: f32, z: f32| -> f32 {
+        let i = x.clamp(0.0, (n - 1) as f32);
+        let j = z.clamp(0.0, (n - 1) as f32);
+        sample_h(&sm0, n, i, j)
+    };
+    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])> = Vec::new();
     for k in 0..4u32 {
         let along = (k as f32 - 1.5) * 2.6;
         let side: f32 = -4.8;
-        let gx = model_pos[0] + dx * along - dz * side;
-        let gz = model_pos[1] + dz * along + dx * side;
-        let hz2 = height_cell(gx, gz);
+        let gx = anchor[0] + dx * along - dz * side;
+        let gz = anchor[1] + dz * along + dx * side;
         let (mesh, texs) = kolomna_render::piter::generate_manor(7100 + k as u64 * 31);
-        village.push((mesh, texs, [gx, gz, hz2 + 0.02]));
+        let h_pad = h0(gx, gz).max(wl + 2.0);
+        // half extents incl. a 1–2 m apron (metres; the grid cell is 16 m)
+        kolomna_render::flatten_pad(&mut terrain, n, gx * 16.0, gz * 16.0, 13.0, 8.0, h_pad, 22.0);
+        village.push((mesh, texs, [gx, gz, h_pad]));
     }
     println!("village: {} Petersburg tenements", village.len());
+
+    // ---- terrain mesh (after the pads were levelled) -----------------------
+    let base = build_mesh(&terrain, mn, mx, wl);
+    let sm = smooth_field(&terrain, wl);
+    println!("mesh: {} triangles", base.len() / 3);
+    // final placement heights: sample the levelled field at each centre
+    for (_, _, p) in village.iter_mut() {
+        p[2] = (sample_h(&sm, n, p[0], p[1]) - mn) * ZSCALE + 0.02;
+    }
 
     Ok(Scene {
         base,

@@ -495,7 +495,13 @@ pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
         heights.push(3.4 - 0.25 * k as f32);
     }
     let win_start = r.below(2) as usize;
-    let win_tiles: Vec<usize> = (win_start..tiles).step_by(2).collect();
+    let win_tiles: Vec<usize> = (win_start..tiles)
+        .step_by(2)
+        // keep one 2 m tile of blank wall between the outermost windows and
+        // the building corners — a nalidnik/sandrik glued to the corner reads
+        // wrong (the user asked for corner clearance)
+        .filter(|&t| t >= 1 && t <= tiles - 2)
+        .collect();
     let door_tile = win_tiles[win_tiles.len() / 2];
 
     let mut m = Manor {
