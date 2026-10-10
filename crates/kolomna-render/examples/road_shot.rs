@@ -141,6 +141,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             textures: &texsets[k],
             pos: [hx, hz, hz_mesh],
             rot: 0.0,
+            spin: 1.0,
         };
         let rgba = render_scene_with_models(
             VIEW_W,

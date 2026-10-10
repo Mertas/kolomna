@@ -64,6 +64,8 @@ pub struct Scene {
     model_texture_sets: Vec<Vec<(u32, u32, Vec<u8>)>>,
     model_pos: [f32; 3],
     model_rot: f32,
+    /// procedural village (Foundation-style houses) along the road
+    village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])>,
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
@@ -123,10 +125,46 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         (t.verts[0][2] + t.verts[2][2]) * 0.5 / 16.0 - 1.0,
         (alt - mn) * ZSCALE,
     ];
+    // snap the house onto the terrain under it (sm = smoothed height field),
+    // otherwise a slope through its tile crops the ground floor
+    let hxi = model_pos[0].round().clamp(0.0, (n - 1) as f32) as usize;
+    let hzi = model_pos[1].round().clamp(0.0, (n - 1) as f32) as usize;
+    let model_pos = [
+        model_pos[0],
+        model_pos[1],
+        (sm[hzi * n + hxi] - mn) * ZSCALE + 0.02,
+    ];
     println!(
         "house at cell ({:.1}, {:.1}), altitude {alt:.1} m",
         model_pos[0], model_pos[1]
     );
+
+    // ---- a small procedural village (Foundation-style) along the road
+    let ptex = kolomna_render::procgen::textures();
+    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])> = Vec::new();
+    let mut dx = t.verts[1][0] - t.verts[0][0];
+    let mut dz = t.verts[1][2] - t.verts[0][2];
+    let dl = (dx * dx + dz * dz).sqrt().max(1e-6);
+    dx /= dl;
+    dz /= dl;
+    let height_cell = |x: f32, z: f32| -> f32 {
+        let i = x.round().clamp(0.0, (n - 1) as f32) as usize;
+        let j = z.round().clamp(0.0, (n - 1) as f32) as usize;
+        (sm[j * n + i] - mn) * ZSCALE
+    };
+    for k in 0..6u32 {
+        let along = (k as f32 - 2.5) * 0.85;
+        let side = if k % 2 == 0 { 1.55 } else { -1.55 };
+        let gx = model_pos[0] + dx * along - dz * side;
+        let gz = model_pos[1] + dz * along + dx * side;
+        let hz2 = height_cell(gx, gz);
+        village.push((
+            kolomna_render::procgen::generate_house(9000 + k as u64 * 7),
+            ptex.clone(),
+            [gx, gz, hz2 + 0.02],
+        ));
+    }
+    println!("village: {} procedural houses along the road", village.len());
 
     Ok(Scene {
         base,
@@ -143,6 +181,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         model_texture_sets,
         model_pos,
         model_rot: 0.0,
+        village,
     })
 }
 
@@ -163,7 +202,21 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         textures: &scene.model_texture_sets[0],
         pos: scene.model_pos,
         rot: scene.model_rot,
+        spin: 1.0,
     };
+    let mut placed = vec![house];
+    for (mesh, texs, pos) in &scene.village {
+        placed.push(PlacedModel {
+            mesh,
+            textures: texs,
+            pos: *pos,
+            rot: 0.0,
+            spin: 0.0,
+        });
+    }
+    let view = scene.village.get(scene.village.len() / 2).map(|(_, _, p)| {
+        ([(p[0] - p[1]) * 0.5, (p[0] + p[1]) * 0.25 - p[2] - 0.4], 0.0)
+    });
     let rgba = kolomna_render::model::render_scene_with_models(
         VIEW_W,
         VIEW_H,
@@ -174,8 +227,8 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         zoom,
         scene.mn,
         scene.wl,
-        None,
-        &[house],
+        view,
+        &placed,
         Some(&scene.road_mesh),
         &scene.road_textures,
     )?;
@@ -418,6 +471,7 @@ struct Renderer {
     terrain: TerrainRenderer,
     road: RoadRenderer,
     models: Vec<ModelRenderer>,
+    village: Vec<ModelRenderer>,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 }
@@ -487,6 +541,16 @@ impl Renderer {
                 ModelRenderer::new(&device, &queue, config.format, 4, mesh, texs)
             })
             .collect();
+
+        let village: Vec<ModelRenderer> = scene
+            .village
+            .iter()
+            .map(|(mesh, texs, pos)| {
+                let r = ModelRenderer::new(&device, &queue, config.format, 4, mesh, texs);
+                r.set_placement(&queue, *pos, 0.0, 0.0);
+                r
+            })
+            .collect();
         let (msaa_view, depth_view) = make_targets(&device, &config);
 
         Ok(Self {
@@ -497,6 +561,7 @@ impl Renderer {
             terrain,
             road,
             models,
+            village,
             msaa_view,
             depth_view,
         })
@@ -533,7 +598,10 @@ impl Renderer {
             as usize;
         let m = &self.models[k];
         m.set_params(&self.queue, &params);
-        m.set_placement(&self.queue, scene.model_pos, scene.model_rot);
+        m.set_placement(&self.queue, scene.model_pos, scene.model_rot, 1.0);
+        for r in &self.village {
+            r.set_params(&self.queue, &params);
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -590,6 +658,9 @@ impl Renderer {
             self.terrain.draw(&mut pass);
             self.road.draw(&mut pass);
             self.models[k].draw(&mut pass);
+            for r in &self.village {
+                r.draw(&mut pass);
+            }
         }
         self.queue.submit(Some(enc.finish()));
         self.queue.present(frame);

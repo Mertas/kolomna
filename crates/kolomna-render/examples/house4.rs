@@ -77,8 +77,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         models.push(PlacedModel {
             mesh: &meshes[k],
             textures: &texsets[k],
-            pos: [cx + 1.7 * k as f32, hy, hz_mesh],
+            pos: [cx + 1.6 * k as f32, cz - 2.0, hz_mesh],
             rot: 0.0,
+            spin: 1.0,
         });
     }
     let ccx = cx + 1.7 * 1.5;

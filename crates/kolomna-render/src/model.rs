@@ -37,6 +37,10 @@ struct Params {
 struct ModelParams {
     pos: vec3<f32>,
     rot: f32,
+    spin: f32,
+    _p0: f32,
+    _p1: f32,
+    _p2: f32,
 };
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<uniform> mp: ModelParams;
@@ -52,12 +56,10 @@ struct VsOut {
 @vertex
 fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) nrm: vec3<f32>) -> VsOut {
     // model y-up metres -> scene z-up; horizontal metres -> cells (16 m)
-    // Buildings store only their south+east facades: the model must
-    // spin with the camera so its facade always faces the viewer
-    // the world — and with it the building — rotates as one; the back/west
-    // walls simply don't exist in the 3DMD). In-world rotation is therefore
-    // mp.rot - params.angle; the screen-space orientation stays mp.rot.
-    let rot = mp.rot - params.angle;
+    // 3DMD buildings spin with the camera (spin = 1): the picked orientation
+    // variant always faces the viewer, its rot compensating the camera angle.
+    // Full 3-D models (procedural houses, spin = 0) are world-fixed.
+    let rot = mp.rot - params.angle * mp.spin;
     let c = cos(rot);
     let s = sin(rot);
     let wx = (p.x * c - p.z * s) / 16.0 + mp.pos.x;
@@ -105,6 +107,11 @@ pub struct ModelVertex {
 pub struct ModelParams {
     pub pos: [f32; 3],
     pub rot: f32,
+    /// 1.0 = spin with the camera (rotated house meshes), 0.0 = world-fixed
+    pub spin: f32,
+    pub _p0: f32,
+    pub _p1: f32,
+    pub _p2: f32,
 }
 
 pub struct ModelPart {
@@ -482,8 +489,15 @@ impl ModelRenderer {
         queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(params));
     }
 
-    pub fn set_placement(&self, queue: &wgpu::Queue, pos: [f32; 3], rot: f32) {
-        let mp = ModelParams { pos, rot };
+    pub fn set_placement(&self, queue: &wgpu::Queue, pos: [f32; 3], rot: f32, spin: f32) {
+        let mp = ModelParams {
+            pos,
+            rot,
+            spin,
+            _p0: 0.0,
+            _p1: 0.0,
+            _p2: 0.0,
+        };
         queue.write_buffer(&self.model_buf, 0, bytemuck::bytes_of(&mp));
     }
 
@@ -510,6 +524,8 @@ pub struct PlacedModel<'a> {
     pub textures: &'a [(u32, u32, Vec<u8>)],
     pub pos: [f32; 3],
     pub rot: f32,
+    /// 1.0 = spin with the camera (3DMD buildings), 0.0 = world-fixed
+    pub spin: f32,
 }
 
 /// Offscreen render of terrain + placed models -> RGBA8 (w*h*4).
@@ -567,7 +583,7 @@ pub fn render_scene_with_models(
         .map(|m| {
             let r = ModelRenderer::new(&device, &queue, format, sample_count, m.mesh, m.textures);
             r.set_params(&queue, &params);
-            r.set_placement(&queue, m.pos, m.rot);
+            r.set_placement(&queue, m.pos, m.rot, m.spin);
             r
         })
         .collect();
