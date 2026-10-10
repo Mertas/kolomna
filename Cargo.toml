@@ -1,4 +1,5 @@
 [workspace]
+resolver = "3"
 members = ["crates/kolomna-dbpf", "crates/kolomna-assets", "crates/kolomna-render", "crates/kolomna-app"]
 
 [workspace.package]
