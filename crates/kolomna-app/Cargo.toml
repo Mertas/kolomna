@@ -2,4 +2,11 @@
 name = "kolomna-app"
 version.workspace = true
 edition.workspace = true
-description = "Kolomna application binary"
+description = "Kolomna application binary (winit window + wgpu terrain renderer)"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+pollster = "1.0.1"
+kolomna-render = { version = "0.1.0", path = "../kolomna-render" }
+wgpu = "30.0.1"
+winit = "0.30"
