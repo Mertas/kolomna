@@ -3,8 +3,9 @@
 //! Reads the terrain height grid from a city save (chunk a9dd6ff4/e98f9525/1:
 //! u16 version, then an n*n grid of f32 altitudes in meters, n = 129),
 //! meshes it as iso diamonds and textures it with its own terrain atlas.
-//! Water cells (flat plateaus near the minimum) get the water tile; a thin
-//! sandy rim marks the banks; land is a mosaic of grass variants.
+//! Water is a flat plane at the detected water level, shaded procedurally
+//! (noise waves, sun glints, bed-depth tint, shore foam); a thin sandy rim
+//! marks the banks; land is a rotated mosaic of grass tints.
 //!
 //! usage: cargo run -p kolomna-render --example city_terrain -- <city.save> <data2.dat> <out.png>
 
@@ -36,20 +37,24 @@ const SOURCES: [(u32, u32); 6] = [
     (0x891b0e1a, 0x00000034),
     (0x891b0e1a, 0x00000035),
 ];
-/// atlas cell used for water cells
+/// atlas cell for the water cells' placeholder uv (never sampled)
 const WATER_TILE: usize = 0;
-/// atlas cells mixed stably over the land (grass with occasional dry patches)
-const LAND_TILES: [usize; 6] = [5, 4, 5, 4, 2, 1];
+/// atlas cells mixed stably over the land (three grass tints, no dry patches)
+const LAND_TILES: [usize; 8] = [5, 4, 5, 4, 5, 4, 4, 1];
 /// atlas cell used for the sandy rim just above the water
 const BANK_TILE: usize = 2;
+/// height band (m) above the water level painted with the sandy bank texture
+const BANK_BAND: f32 = 2.0;
 /// texture block size in cells (texture instance spans BLOCK x BLOCK cells)
-const BLOCK: usize = 2;
+const BLOCK: usize = 4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct Vertex {
     pos: [f32; 3],
     uv: [f32; 2],
+    /// water bed depth in meters (>= 0.10) for water vertices; -1 for dry land
+    wdep: f32,
 }
 
 #[repr(C)]
@@ -78,10 +83,11 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) wpos: vec3<f32>,
+    @location(2) wdep: f32,
 };
 
 @vertex
-fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>) -> VsOut {
+fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) wdep: f32) -> VsOut {
     var o: VsOut;
     let iso = vec2<f32>((p.x - p.y) * 0.5, (p.x + p.y) * 0.25 - p.z * params.hz);
     let scr = (iso - params.center) * params.scale;
@@ -89,14 +95,61 @@ fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>) -> VsOut {
     o.pos = vec4<f32>(ndc.x, ndc.y, (ndc.y + 1.0) * 0.499 + 0.001, 1.0);
     o.uv = uv;
     o.wpos = p;
+    o.wdep = wdep;
     return o;
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    var q = fract(p * vec2<f32>(123.34, 345.45));
+    q = q + dot(q, q + 34.345);
+    return fract(q.x * q.y);
+}
+
+// two-octave value noise: non-repeating wave field for water normals
+fn wwater(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let n1 = mix(mix(hash21(i), hash21(i + vec2<f32>(1.0, 0.0)), u.x),
+                 mix(hash21(i + vec2<f32>(0.0, 1.0)), hash21(i + vec2<f32>(1.0, 1.0)), u.x), u.y);
+    let p2 = p * 2.7 + vec2<f32>(13.7, 7.3);
+    let i2 = floor(p2);
+    let f2 = fract(p2);
+    let u2 = f2 * f2 * (3.0 - 2.0 * f2);
+    let n2 = mix(mix(hash21(i2), hash21(i2 + vec2<f32>(1.0, 0.0)), u2.x),
+                 mix(hash21(i2 + vec2<f32>(0.0, 1.0)), hash21(i2 + vec2<f32>(1.0, 1.0)), u2.x), u2.y);
+    return n1 + 0.5 * n2;
 }
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    // water: procedural wave normals + fresnel sky + sun glint + depth tint + shore foam
+    if (in.wdep > -0.5) {
+        let wp = in.wpos.xy * 1.3;
+        let e = 0.30;
+        let h0 = wwater(wp);
+        let hx = wwater(wp + vec2<f32>(e, 0.0));
+        let hy = wwater(wp + vec2<f32>(0.0, e));
+        let g = (vec2<f32>(h0 - hx, h0 - hy) / e) * 0.12;
+        let n = normalize(vec3<f32>(g.x, g.y, 1.0));
+        let sun = normalize(vec3<f32>(-0.30, -0.50, 0.55));
+        let eye = normalize(vec3<f32>(0.15, 0.25, 0.95));
+        let spec = pow(max(dot(reflect(-sun, n), eye), 0.0), 90.0) * 1.1;
+        let fres = pow(1.0 - max(dot(n, eye), 0.0), 2.0);
+        let dep = clamp(in.wdep / 6.0, 0.0, 1.0);
+        let shallow = vec3<f32>(0.16, 0.28, 0.38);
+        let deep = vec3<f32>(0.02, 0.06, 0.11);
+        let sky = vec3<f32>(0.55, 0.67, 0.82);
+        var col = mix(shallow, deep, dep);
+        col = col + sky * (0.10 + fres * 0.55);
+        col = col + vec3<f32>(1.0, 0.98, 0.92) * spec;
+        let shore = 1.0 - smoothstep(0.1, 1.0, in.wdep);
+        col = mix(col, vec3<f32>(0.30, 0.34, 0.33), shore * 0.45);
+        return vec4<f32>(col, 1.0);
+    }
     let n = normalize(cross(dpdx(in.wpos), dpdy(in.wpos)));
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
-    let lit = 0.66 + 0.44 * max(dot(n, l), 0.0);
+    let lit = 0.72 + 0.38 * max(dot(n, l), 0.0);
     let c = textureSample(atlas, samp, in.uv);
     return vec4<f32>(c.rgb * lit, 1.0);
 }
@@ -189,6 +242,9 @@ fn water_level(vals: &[f32], mn: f32) -> f32 {
 }
 
 /// Mesh the height grid as iso diamonds; per-cell texture from the atlas.
+/// Water cells form a flat plane at `wl` and carry a per-vertex bed-depth
+/// attribute for the procedural water shading; land gets rotated quadrants of
+/// grass textures (no visible tiling).
 fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     let n = (vals.len() as f64).sqrt().round() as usize;
     let aw = (ATLAS_COLS * TILE) as f32;
@@ -203,9 +259,10 @@ fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let h11 = vals[(cy + 1) * n + cx + 1];
             let havg = (h00 + h10 + h01 + h11) * 0.25;
 
-            let cell = if havg <= wl + 0.02 {
+            let is_water = havg <= wl + 0.02;
+            let cell = if is_water {
                 WATER_TILE
-            } else if havg < wl + 3.0 {
+            } else if havg < wl + BANK_BAND {
                 BANK_TILE
             } else {
                 let bx = (cx / BLOCK) as u32;
@@ -214,10 +271,11 @@ fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 LAND_TILES[(hsh as usize) % LAND_TILES.len()]
             };
 
-            // water: whole tile; land: quadrant of a BLOCK x BLOCK block
-            let (u0, v0, u1, v1) = if cell == WATER_TILE {
-                let col = (cell as u32) % ATLAS_COLS;
-                let row = (cell as u32) / ATLAS_COLS;
+            // water gets the whole tile (never sampled); land gets a rotated
+            // quadrant of a BLOCK x BLOCK block
+            let (u0, v0, u1, v1) = if is_water {
+                let col = (WATER_TILE as u32) % ATLAS_COLS;
+                let row = (WATER_TILE as u32) / ATLAS_COLS;
                 (
                     ((col * TILE) as f32 + 0.5) / aw,
                     ((row * TILE) as f32 + 0.5) / ah,
@@ -227,8 +285,30 @@ fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             } else {
                 let col = (cell as u32) % ATLAS_COLS;
                 let row = (cell as u32) / ATLAS_COLS;
-                let qx = (cx % BLOCK) as f32;
-                let qy = (cy % BLOCK) as f32;
+                let bx = (cx / BLOCK) as u32;
+                let by = (cy / BLOCK) as u32;
+                let hsh = bx.wrapping_mul(73_856_093) ^ by.wrapping_mul(19_349_663);
+                let last = (BLOCK - 1) as i32;
+                let mut qx = (cx % BLOCK) as i32;
+                let mut qy = (cy % BLOCK) as i32;
+                match (hsh >> 8) & 3 {
+                    1 => {
+                        let t = qx;
+                        qx = last - qy;
+                        qy = t;
+                    }
+                    2 => {
+                        qx = last - qx;
+                        qy = last - qy;
+                    }
+                    3 => {
+                        let t = qx;
+                        qx = qy;
+                        qy = last - t;
+                    }
+                    _ => {}
+                }
+                let (qx, qy) = (qx as f32, qy as f32);
                 let qw = (TILE / BLOCK as u32) as f32;
                 (
                     ((col * TILE) as f32 + qx * qw + 0.5) / aw,
@@ -238,7 +318,16 @@ fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 )
             };
 
+            // per-vertex bed depth in meters for the water shader; -1 = dry land
+            let wd = |h: f32| {
+                if is_water {
+                    (wl - h).clamp(0.10, 8.0)
+                } else {
+                    -1.0
+                }
+            };
             let (z00, z10, z01, z11) = (zof(h00), zof(h10), zof(h01), zof(h11));
+            let (d00, d10, d01, d11) = (wd(h00), wd(h10), wd(h01), wd(h11));
             let x0 = cx as f32;
             let x1 = (cx + 1) as f32;
             let y0 = cy as f32;
@@ -246,26 +335,32 @@ fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             verts.push(Vertex {
                 pos: [x0, y0, z00],
                 uv: [u0, v0],
+                wdep: d00,
             });
             verts.push(Vertex {
                 pos: [x1, y0, z10],
                 uv: [u1, v0],
+                wdep: d10,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
+                wdep: d11,
             });
             verts.push(Vertex {
                 pos: [x0, y0, z00],
                 uv: [u0, v0],
+                wdep: d00,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
+                wdep: d11,
             });
             verts.push(Vertex {
                 pos: [x0, y1, z01],
                 uv: [u0, v1],
+                wdep: d01,
             });
         }
     }
@@ -333,6 +428,8 @@ fn render(
         trace: wgpu::Trace::Off,
     }))
     .expect("failed to create device");
+
+    let sample_count = 4u32;
 
     let atlas_w = ATLAS_COLS * TILE;
     let atlas_h = ATLAS_ROWS * TILE;
@@ -475,7 +572,7 @@ fn render(
             buffers: &[Some(wgpu::VertexBufferLayout {
                 array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                 step_mode: wgpu::VertexStepMode::Vertex,
-                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2],
+                attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32],
             })],
         },
         fragment: Some(wgpu::FragmentState {
@@ -500,13 +597,31 @@ fn render(
             stencil: wgpu::StencilState::default(),
             bias: wgpu::DepthBiasState::default(),
         }),
-        multisample: wgpu::MultisampleState::default(),
+        multisample: wgpu::MultisampleState {
+            count: sample_count,
+            ..Default::default()
+        },
         multiview_mask: None,
         cache: None,
     });
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("target"),
+        label: Some("target-msaa"),
+        size: wgpu::Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let resolved = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("target-resolved"),
         size: wgpu::Extent3d {
             width: w,
             height: h,
@@ -519,7 +634,7 @@ fn render(
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
-    let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+    let resolved_view = resolved.create_view(&wgpu::TextureViewDescriptor::default());
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth"),
         size: wgpu::Extent3d {
@@ -528,7 +643,7 @@ fn render(
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -545,7 +660,7 @@ fn render(
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &target_view,
                 depth_slice: None,
-                resolve_target: None,
+                resolve_target: Some(&resolved_view),
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(wgpu::Color {
                         r: 0.60,
@@ -583,7 +698,7 @@ fn render(
     });
     enc.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &target,
+            texture: &resolved,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
