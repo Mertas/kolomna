@@ -43,21 +43,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         road_tex.push(img);
     }
 
-    // ---- house: Z5S model of a small house
+    // ---- house: all four Z5 orientations of a small house
     let s1 = sibling(dat, "data1.dat");
-    let m = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, 0x00ad0400)?;
-    let mesh = mesh_from_mesh3d(&m);
-    println!(
-        "house mesh: {} verts, {} indices, textures {:08x?}",
-        mesh.verts.len(),
-        mesh.indices.len(),
-        mesh.texture_ids
-    );
-    let mut htex = Vec::new();
-    for id in &mesh.texture_ids {
-        let img = fsh_rgba_search(dat, *id)?;
-        println!("house tex {id:08x}: {}x{}", img.0, img.1);
-        htex.push(img);
+    let mut meshes = Vec::new();
+    let mut texsets: Vec<Vec<(u32, u32, Vec<u8>)>> = Vec::new();
+    for inst in [0x00ad0400u32, 0x00ad0410, 0x00ad0420, 0x00ad0430] {
+        let m = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, inst)?;
+        let mesh = mesh_from_mesh3d(&m);
+        let mut ts = Vec::new();
+        for id in &mesh.texture_ids {
+            let img = fsh_rgba_search(dat, *id)?;
+            println!("house {inst:08x} tex {id:08x}: {}x{}", img.0, img.1);
+            ts.push(img);
+        }
+        meshes.push(mesh);
+        texsets.push(ts);
     }
 
     // place the house next to the middle road tile
@@ -72,8 +72,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // wide shot: whole grid
     let house = PlacedModel {
-        mesh: &mesh,
-        textures: &htex,
+        mesh: &meshes[0],
+        textures: &texsets[0],
         pos: [hx, hz, hz_mesh],
         rot: 0.0,
     };
@@ -99,8 +99,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // close shot: centre on the house
     let center = [(hx - hz) * 0.5, (hx + hz) * 0.25 - hz_mesh - 0.4];
     let house = PlacedModel {
-        mesh: &mesh,
-        textures: &htex,
+        mesh: &meshes[0],
+        textures: &texsets[0],
         pos: [hx, hz, hz_mesh],
         rot: 0.0,
     };
@@ -134,9 +134,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let rpx = d[0] * ca - d[1] * sa + p;
         let rpy = d[0] * sa + d[1] * ca + p;
         let center = [(rpx - rpy) * 0.5, (rpx + rpy) * 0.25 - hz_mesh - 0.6];
+        // same swap rule as the app: orientation index = camera quadrant
+        let k = ((*a / std::f32::consts::FRAC_PI_2).round() as i64).rem_euclid(4) as usize;
         let house = PlacedModel {
-            mesh: &mesh,
-            textures: &htex,
+            mesh: &meshes[k],
+            textures: &texsets[k],
             pos: [hx, hz, hz_mesh],
             rot: 0.0,
         };

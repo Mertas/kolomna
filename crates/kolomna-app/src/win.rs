@@ -58,9 +58,10 @@ pub struct Scene {
     /// road network from the save (16 m tiles)
     road_mesh: RoadMesh,
     road_textures: Vec<(u32, u32, Vec<u8>)>,
-    /// one house model (Z5, R$ house family) standing next to a road
-    model_mesh: ModelMesh,
-    model_textures: Vec<(u32, u32, Vec<u8>)>,
+    /// house models (Z5, R$ house family): four camera orientations — the
+    /// they swap as the view rotates by 90° steps
+    model_meshes: Vec<ModelMesh>,
+    model_texture_sets: Vec<Vec<(u32, u32, Vec<u8>)>>,
     model_pos: [f32; 3],
     model_rot: f32,
 }
@@ -93,20 +94,28 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     }
     println!("road textures: {}", road_textures.len());
 
-    // ---- one real house model (Z5 tile of the R$ family), placed by a road
+    // ---- house: all four Z5 orientations (0x00/0x10/0x20/0x30).
+    // buildings are four rotated copies; they swap when the camera
+    // rotates, so the visible facades always face the viewer
     let s1 = sibling(dat, "data1.dat");
-    let mesh3d = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, 0x00ad0400)?;
-    let model_mesh = mesh_from_mesh3d(&mesh3d);
-    let mut model_textures = Vec::new();
-    for id in &model_mesh.texture_ids {
-        model_textures.push(fsh_rgba_search(dat, *id)?);
+    let mut model_meshes: Vec<ModelMesh> = Vec::new();
+    let mut model_texture_sets: Vec<Vec<(u32, u32, Vec<u8>)>> = Vec::new();
+    for inst in [0x00ad0400u32, 0x00ad0410, 0x00ad0420, 0x00ad0430] {
+        let mesh3d = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, inst)?;
+        let mesh = mesh_from_mesh3d(&mesh3d);
+        let mut texs = Vec::new();
+        for id in &mesh.texture_ids {
+            texs.push(fsh_rgba_search(dat, *id)?);
+        }
+        println!(
+            "house {inst:08x}: {} verts, {} indices, tex {:08x?}",
+            mesh.verts.len(),
+            mesh.indices.len(),
+            mesh.texture_ids
+        );
+        model_meshes.push(mesh);
+        model_texture_sets.push(texs);
     }
-    println!(
-        "house: {} verts, {} indices, tex {:08x?}",
-        model_mesh.verts.len(),
-        model_mesh.indices.len(),
-        model_mesh.texture_ids
-    );
     let t = &tiles[tiles.len() / 2];
     let alt = (t.verts[0][1] + t.verts[2][1]) * 0.5;
     let model_pos = [
@@ -130,8 +139,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         n,
         road_mesh,
         road_textures,
-        model_mesh,
-        model_textures,
+        model_meshes,
+        model_texture_sets,
         model_pos,
         model_rot: 0.0,
     })
@@ -150,8 +159,8 @@ fn sibling(any_dat: &str, name: &str) -> String {
 pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     let scene = load_scene(city, dat)?;
     let house = PlacedModel {
-        mesh: &scene.model_mesh,
-        textures: &scene.model_textures,
+        mesh: &scene.model_meshes[0],
+        textures: &scene.model_texture_sets[0],
         pos: scene.model_pos,
         rot: scene.model_rot,
     };
@@ -408,7 +417,7 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     terrain: TerrainRenderer,
     road: RoadRenderer,
-    model: ModelRenderer,
+    models: Vec<ModelRenderer>,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 }
@@ -470,14 +479,14 @@ impl Renderer {
             &scene.road_mesh,
             &scene.road_textures,
         );
-        let model = ModelRenderer::new(
-            &device,
-            &queue,
-            config.format,
-            4,
-            &scene.model_mesh,
-            &scene.model_textures,
-        );
+        let models: Vec<ModelRenderer> = scene
+            .model_meshes
+            .iter()
+            .zip(scene.model_texture_sets.iter())
+            .map(|(mesh, texs)| {
+                ModelRenderer::new(&device, &queue, config.format, 4, mesh, texs)
+            })
+            .collect();
         let (msaa_view, depth_view) = make_targets(&device, &config);
 
         Ok(Self {
@@ -487,7 +496,7 @@ impl Renderer {
             config,
             terrain,
             road,
-            model,
+            models,
             msaa_view,
             depth_view,
         })
@@ -517,9 +526,14 @@ impl Renderer {
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
         self.terrain.set_params(&self.queue, &params);
         self.road.set_params(&self.queue, &params);
-        self.model.set_params(&self.queue, &params);
-        self.model
-            .set_placement(&self.queue, scene.model_pos, scene.model_rot);
+        // camera quadrant -> house orientation index: the model rotates with
+        // the camera in 90° steps (its rot is compensated by -angle in the
+        // shader, so the picked facade always faces the screen)
+        let k = ((params.angle / std::f32::consts::FRAC_PI_2).round() as i64).rem_euclid(4)
+            as usize;
+        let m = &self.models[k];
+        m.set_params(&self.queue, &params);
+        m.set_placement(&self.queue, scene.model_pos, scene.model_rot);
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -575,7 +589,7 @@ impl Renderer {
             });
             self.terrain.draw(&mut pass);
             self.road.draw(&mut pass);
-            self.model.draw(&mut pass);
+            self.models[k].draw(&mut pass);
         }
         self.queue.submit(Some(enc.finish()));
         self.queue.present(frame);
