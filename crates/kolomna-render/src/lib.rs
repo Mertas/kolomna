@@ -4,15 +4,17 @@
 //! u16 version, then an n*n grid of f32 altitudes in meters, n = 129),
 //! meshes it as iso diamonds and textures it with its own terrain atlas.
 //!
-//! Surface rules (v2):
+//! Surface rules (v4):
 //! - water is a flat plane at the detected surface level, shaded procedurally
 //!   (noise waves, sun glints, bed-depth tint, shore foam);
-//! - a thin sandy rim marks the banks; steep cliffs (> STEEP_M between cell
-//!   corners) get the dirt texture; grass comes in three height-bands
-//!   (light meadow / mid / dark forest) dithered at the edges;
-//! - land textures use a continuous world UV with REPEAT sampling (each
-//!   texture instance spans REPEAT_CELLS x REPEAT_CELLS cells) so nothing
-//!   looks like per-cell squares.
+//! - land textures are blended CONTINUOUSLY in the fragment shader — sand by
+//!   metres above the water plane, dirt/rock by slope from smooth vertex
+//!   normals, grass by three height-bands (dithered). No per-cell binary
+//!   classification for sand/cliffs, so boundaries can never look like
+//!   squares cut into a slope.
+//! - land UVs are continuous world coordinates with REPEAT sampling (each
+//!   texture instance spans REPEAT_CELLS x REPEAT_CELLS cells); steep faces
+//!   blend in a vertical projection so texels do not streak.
 //!
 //! Depth (v3): the fragment depth is the dot of the rotated world position
 //! with the iso view ray (1,1,0.5) — strictly monotone along the ray, so
@@ -22,6 +24,9 @@
 //!
 //! Textures (v3): full mip chain generated at startup (blit until 1x1) with
 //! Linear mipmap filtering — no minification shimmer on zoom.
+//!
+//! Lighting (v4): smooth per-vertex normals (central differences of the
+//! height field) instead of flat per-triangle derivatives.
 //!
 //! The rendering internals are shared by the `city_terrain` example (offscreen
 //! CLI) and `kolomna-app` (windowed + `--shot`).
@@ -39,20 +44,18 @@ pub const FSH_TYPE: u32 = 0x7AB50E44;
 pub const TERRAIN_TYPE: u32 = 0xa9dd6ff4;
 pub const TERRAIN_GROUP: u32 = 0xe98f9525;
 pub const TERRAIN_INSTANCE: u32 = 1;
-/// map units per meter of altitude (visual relief exaggeration)
+/// map units (mesh units) per meter of altitude (visual relief exaggeration)
 pub const ZSCALE: f32 = 0.14;
 /// world cells per texture repeat (texture instance spans this many cells)
 pub const REPEAT_CELLS: f32 = 5.0;
 /// water surface sits this many metres above the flat-bed mode (see water_level)
 pub const WATER_MARGIN: f32 = 2.2;
-/// sandy rim band above the water surface (m)
-pub const BANK_BAND: f32 = 2.0;
-/// corner-height spread (m) within a cell that paints it as a cliff (dirt)
-pub const STEEP_M: f32 = 12.0;
 
 /// data2.dat terrain textures (group, instance), all 256x256 DXT1.
 /// Layers: 0 = water (unused by shaders), 1 = dark forest green, 2 = sand,
 /// 3 = dirt, 4 = mid green, 5 = light meadow green.
+/// Sand (2) and dirt (3) are sampled with CONSTANT indices by the shader;
+/// the per-vertex `layer` picks among the three green tints only.
 pub const SOURCES: [(u32, u32); 6] = [
     (0x891b0e1a, 0x00000013),
     (0x891b0e1a, 0x00000031),
@@ -61,8 +64,6 @@ pub const SOURCES: [(u32, u32); 6] = [
     (0x891b0e1a, 0x00000034),
     (0x891b0e1a, 0x00000035),
 ];
-const LAYER_SAND: f32 = 2.0;
-const LAYER_DIRT: f32 = 3.0;
 const LAYER_GRASS_MID: f32 = 4.0;
 const LAYER_GRASS_LIGHT: f32 = 5.0;
 const LAYER_GRASS_DARK: f32 = 1.0;
@@ -75,8 +76,10 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// water bed depth in meters (>= 0.10) for water vertices; -1 for dry land
     pub wdep: f32,
-    /// texture layer index for land vertices (ignored for water)
+    /// green texture layer for land vertices (ignored for water)
     pub layer: f32,
+    /// smooth mesh-space normal (for land lighting and slope blending)
+    pub nrm: [f32; 3],
 }
 
 #[repr(C)]
@@ -92,6 +95,7 @@ pub struct Params {
     pub time: f32,
     /// rotation pivot (grid / 2)
     pub pivot: f32,
+    /// water plane height in mesh units — filled by TerrainRenderer::set_params
     pub _pad0: f32,
     pub _pad1: f32,
     pub _pad2: f32,
@@ -106,7 +110,8 @@ struct Params {
     angle: f32,
     time: f32,
     pivot: f32,
-    pad0: f32,
+    // water plane height in mesh units (set by the renderer)
+    water_z: f32,
     pad1: f32,
     pad2: f32,
 };
@@ -120,10 +125,11 @@ struct VsOut {
     @location(1) wpos: vec3<f32>,
     @location(2) wdep: f32,
     @location(3) layer: f32,
+    @location(4) nrm: vec3<f32>,
 };
 
 @vertex
-fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) wdep: f32, @location(3) layer: f32) -> VsOut {
+fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) wdep: f32, @location(3) layer: f32, @location(4) nrm: vec3<f32>) -> VsOut {
     var o: VsOut;
     let d = p.xy - vec2<f32>(params.pivot);
     let ca = cos(params.angle);
@@ -142,6 +148,7 @@ fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) w
     o.wpos = p;
     o.wdep = wdep;
     o.layer = layer;
+    o.nrm = nrm;
     return o;
 }
 
@@ -194,11 +201,30 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         col = mix(col, vec3<f32>(0.30, 0.34, 0.33), shore * 0.35);
         return vec4<f32>(col, 1.0);
     }
-    let n = normalize(cross(dpdx(in.wpos), dpdy(in.wpos)));
+    // land: smooth vertex normal -> no flat-shaded facets
+    let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     let lit = 0.72 + 0.38 * max(dot(n, l), 0.0);
-    let c = textureSample(atlas, samp, in.uv, i32(in.layer + 0.5));
-    return vec4<f32>(c.rgb * lit, 1.0);
+    let g = textureSample(atlas, samp, in.uv, i32(in.layer + 0.5));
+    // sand: CONTINUOUS fade by metres above the water plane — a hard per-cell
+    // rule here was what cut green squares into sandy slopes.
+    let zs = 0.14; // ZSCALE (mesh units per metre)
+    let above = (in.wpos.z - params.water_z) / zs;
+    let ws = 1.0 - smoothstep(0.5, 3.5, above);
+    let sand = textureSample(atlas, samp, in.uv, 2);
+    var col = mix(g.rgb, sand.rgb, ws);
+    // cliffs: blend dirt/rock by slope from the smooth normals; the sample is
+    // TRIPLANAR (top + both vertical faces, weighted by n^2) so steep slopes
+    // show no stretched streaks and no cell-shaped patches.
+    let slope = 1.0 - n.z;
+    let wd = smoothstep(0.12, 0.50, slope);
+    let sx = textureSample(atlas, samp, vec2<f32>(in.uv.y, in.wpos.z / 5.0), 3);
+    let sy = textureSample(atlas, samp, vec2<f32>(in.uv.x, in.wpos.z / 5.0), 3);
+    let sz = textureSample(atlas, samp, in.uv, 3);
+    let wts = n * n + vec3<f32>(1e-4);
+    let dirt = (sx.rgb * wts.x + sy.rgb * wts.y + sz.rgb * wts.z) / (wts.x + wts.y + wts.z);
+    col = mix(col, dirt, wd);
+    return vec4<f32>(col * lit, 1.0);
 }
 "#;
 
@@ -286,13 +312,59 @@ pub fn water_level(vals: &[f32], mn: f32) -> f32 {
     }
 }
 
-/// Mesh the height grid as iso diamonds with continuous world UVs.
-/// Water cells form a flat plane at `wl` and carry a per-vertex bed-depth
-/// attribute for the procedural water shading; land is painted by rules
-/// (sand rim / cliffs / three grass bands) — no per-cell texture squares.
+/// Mesh the height grid as iso diamonds with continuous world UVs and smooth
+/// per-vertex normals. Water cells form a flat plane at `wl` and carry a
+/// per-vertex bed-depth attribute for the procedural water shading; land
+/// vertices carry only a green-tint layer — sand and dirt are blended
+/// continuously in the shader, so no per-cell classification squares exist.
 pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     let n = grid_side(vals);
+    // clamped field: geometry and normals treat the water bed as the surface
+    let mut hc: Vec<f32> = vals.iter().map(|&h| h.max(wl)).collect();
+    // 3x3 [1 2 1]^2 blur (one pass): the save's height field is ragged at cell
+    // scale (31% of cells deviate >1 m from their 4-neighbours), and cell-shaped
+    // spikes / patchy cliff-grass speckle read as "protruding squares" on
+    // screen. A light pass turns them into smooth slopes while leaving real
+    // cliffs and plateaus intact.
+    {
+        let passes: usize = 1;
+        for _ in 0..passes {
+            let src = hc.clone();
+            for gy in 1..n - 1 {
+                for gx in 1..n - 1 {
+                    let s = src[(gy - 1) * n + (gx - 1)]
+                        + 2.0 * src[(gy - 1) * n + gx]
+                        + src[(gy - 1) * n + (gx + 1)]
+                        + 2.0 * src[gy * n + (gx - 1)]
+                        + 4.0 * src[gy * n + gx]
+                        + 2.0 * src[gy * n + (gx + 1)]
+                        + src[(gy + 1) * n + (gx - 1)]
+                        + 2.0 * src[(gy + 1) * n + gx]
+                        + src[(gy + 1) * n + (gx + 1)];
+                    hc[gy * n + gx] = (s / 16.0).max(wl);
+                }
+            }
+        }
+    }
     let zof = |h: f32| (h.max(wl) - mn) * ZSCALE;
+
+    // per-grid-vertex normals in mesh units (central differences, one-sided at borders)
+    let mut normals = vec![[0.0f32, 0.0, 1.0]; n * n];
+    for gy in 0..n {
+        for gx in 0..n {
+            let xl = gx.saturating_sub(1);
+            let xr = (gx + 1).min(n - 1);
+            let yl = gy.saturating_sub(1);
+            let yr = (gy + 1).min(n - 1);
+            let wx = if gx == 0 || gx + 1 == n { 1.0 } else { 2.0 };
+            let wy = if gy == 0 || gy + 1 == n { 1.0 } else { 2.0 };
+            let dzdx = (hc[gy * n + xr] - hc[gy * n + xl]) / wx * ZSCALE;
+            let dzdy = (hc[yr * n + gx] - hc[yl * n + gx]) / wy * ZSCALE;
+            let inv = 1.0 / (dzdx * dzdx + dzdy * dzdy + 1.0).sqrt();
+            normals[gy * n + gx] = [-dzdx * inv, -dzdy * inv, inv];
+        }
+    }
+
     let mut verts = Vec::with_capacity((n - 1) * (n - 1) * 6);
     for cy in 0..n - 1 {
         for cx in 0..n - 1 {
@@ -305,25 +377,18 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let is_water = havg <= wl + 0.02;
             let layer: f32 = if is_water {
                 0.0
-            } else if havg < wl + BANK_BAND {
-                LAYER_SAND
             } else {
-                let spread = h00.max(h10).max(h01).max(h11) - h00.min(h10).min(h01).min(h11);
-                if spread > STEEP_M {
-                    LAYER_DIRT
+                // three grass tints by altitude, dithered at the band edges
+                let hsh =
+                    (cx as u32).wrapping_mul(73_856_093) ^ (cy as u32).wrapping_mul(19_349_663);
+                let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
+                let h = havg + jit;
+                if h > wl + 60.0 {
+                    LAYER_GRASS_DARK
+                } else if h > wl + 25.0 {
+                    LAYER_GRASS_MID
                 } else {
-                    // three grass tints by altitude, dithered at the band edges
-                    let hsh = (cx as u32).wrapping_mul(73_856_093)
-                        ^ (cy as u32).wrapping_mul(19_349_663);
-                    let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
-                    let h = havg + jit;
-                    if h > wl + 60.0 {
-                        LAYER_GRASS_DARK
-                    } else if h > wl + 25.0 {
-                        LAYER_GRASS_MID
-                    } else {
-                        LAYER_GRASS_LIGHT
-                    }
+                    LAYER_GRASS_LIGHT
                 }
             };
 
@@ -335,8 +400,19 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                     -1.0
                 }
             };
-            let (z00, z10, z01, z11) = (zof(h00), zof(h10), zof(h01), zof(h11));
+            let (z00, z10, z01, z11) = (
+                zof(hc[cy * n + cx]),
+                zof(hc[cy * n + cx + 1]),
+                zof(hc[(cy + 1) * n + cx]),
+                zof(hc[(cy + 1) * n + cx + 1]),
+            );
             let (d00, d10, d01, d11) = (wd(h00), wd(h10), wd(h01), wd(h11));
+            let (n00, n10, n01, n11) = (
+                normals[cy * n + cx],
+                normals[cy * n + cx + 1],
+                normals[(cy + 1) * n + cx],
+                normals[(cy + 1) * n + cx + 1],
+            );
             let x0 = cx as f32;
             let x1 = (cx + 1) as f32;
             let y0 = cy as f32;
@@ -349,36 +425,42 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 uv: [u0, v0],
                 wdep: d00,
                 layer,
+                nrm: n00,
             });
             verts.push(Vertex {
                 pos: [x1, y0, z10],
                 uv: [u1, v0],
                 wdep: d10,
                 layer,
+                nrm: n10,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
                 wdep: d11,
                 layer,
+                nrm: n11,
             });
             verts.push(Vertex {
                 pos: [x0, y0, z00],
                 uv: [u0, v0],
                 wdep: d00,
                 layer,
+                nrm: n00,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
                 wdep: d11,
                 layer,
+                nrm: n11,
             });
             verts.push(Vertex {
                 pos: [x0, y1, z01],
                 uv: [u0, v1],
                 wdep: d01,
                 layer,
+                nrm: n01,
             });
         }
     }
@@ -546,6 +628,8 @@ pub struct TerrainRenderer {
     params_buf: wgpu::Buffer,
     verts_buf: wgpu::Buffer,
     nverts: u32,
+    /// water plane height in mesh units (feeds the shader's sand blend)
+    water_z: f32,
 }
 
 impl TerrainRenderer {
@@ -556,7 +640,10 @@ impl TerrainRenderer {
         sample_count: u32,
         layers: &[u8],
         verts: &[Vertex],
+        mn: f32,
+        wl: f32,
     ) -> Self {
+        let water_z = (wl - mn) * ZSCALE;
         let layer_bytes = (TILE * TILE * 4) as usize;
         let mip_levels = (TILE as f32).log2() as u32 + 1;
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
@@ -703,7 +790,7 @@ impl TerrainRenderer {
                     array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
                     attributes: &wgpu::vertex_attr_array![
-                        0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Float32
+                        0 => Float32x3, 1 => Float32x2, 2 => Float32, 3 => Float32, 4 => Float32x3
                     ],
                 })],
             },
@@ -743,11 +830,15 @@ impl TerrainRenderer {
             params_buf,
             verts_buf,
             nverts: verts.len() as u32,
+            water_z,
         }
     }
 
     pub fn set_params(&self, queue: &wgpu::Queue, params: &Params) {
-        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(params));
+        // the water plane height is renderer state, not caller state
+        let mut p = *params;
+        p._pad0 = self.water_z;
+        queue.write_buffer(&self.params_buf, 0, bytemuck::bytes_of(&p));
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
@@ -777,7 +868,8 @@ pub fn default_params(w: f32, h: f32, grid: f32, zspan: f32) -> Params {
 }
 
 /// Render the terrain mesh offscreen (4x MSAA, resolve, readback) and return
-/// the RGBA8 pixels (w * h * 4 bytes). `zoom` = 1.0 frames the whole grid.
+/// the RGBA8 pixels (w * h * 4 bytes). `zoom` = 1.0 frames the whole grid;
+/// `mn` / `wl` are the terrain min altitude and water surface level (metres).
 pub fn render_offscreen_with(
     w: u32,
     h: u32,
@@ -786,6 +878,8 @@ pub fn render_offscreen_with(
     grid: f32,
     zspan: f32,
     zoom: f32,
+    mn: f32,
+    wl: f32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -815,6 +909,8 @@ pub fn render_offscreen_with(
         sample_count,
         layers,
         verts,
+        mn,
+        wl,
     );
     let mut params = default_params(w as f32, h as f32, grid, zspan);
     params.scale *= zoom;
@@ -951,8 +1047,10 @@ pub fn render_offscreen(
     verts: &[Vertex],
     grid: f32,
     zspan: f32,
+    mn: f32,
+    wl: f32,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    render_offscreen_with(w, h, layers, verts, grid, zspan, 1.0)
+    render_offscreen_with(w, h, layers, verts, grid, zspan, 1.0, mn, wl)
 }
 
 /// Encode RGBA8 pixels (w * h * 4 bytes) as a PNG file.

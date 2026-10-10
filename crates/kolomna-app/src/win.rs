@@ -43,6 +43,10 @@ pub struct Scene {
     atlas: Vec<u8>,
     grid: f32,
     zspan: f32,
+    /// terrain min altitude (metres) — feeds the shader's sand blend
+    mn: f32,
+    /// water surface level (metres)
+    wl: f32,
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
@@ -67,6 +71,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         atlas,
         grid: (n - 1) as f32,
         zspan: (mx - mn) * ZSCALE,
+        mn,
+        wl,
     })
 }
 
@@ -82,6 +88,8 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         scene.grid,
         scene.zspan,
         zoom,
+        scene.mn,
+        scene.wl,
     )?;
     write_png(out, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out}");
@@ -174,8 +182,8 @@ impl Camera {
             } else {
                 0.0
             };
-            desired[0] += fx as f32;
-            desired[1] += fy as f32;
+            desired[0] += fx;
+            desired[1] += fy;
         }
         let k = 1.0 - (-8.0 * dt).exp();
         self.vel[0] += (desired[0] - self.vel[0]) * k;
@@ -201,6 +209,7 @@ impl Camera {
             angle: self.rot,
             time: self.time,
             pivot: grid * 0.5,
+            // the water plane height is filled by TerrainRenderer::set_params
             _pad0: 0.0,
             _pad1: 0.0,
             _pad2: 0.0,
@@ -294,7 +303,16 @@ impl Renderer {
         );
         surface.configure(&device, &config);
 
-        let terrain = TerrainRenderer::new(&device, &queue, config.format, 4, &scene.atlas, &scene.base);
+        let terrain = TerrainRenderer::new(
+            &device,
+            &queue,
+            config.format,
+            4,
+            &scene.atlas,
+            &scene.base,
+            scene.mn,
+            scene.wl,
+        );
         let (msaa_view, depth_view) = make_targets(&device, &config);
 
         Ok(Self {

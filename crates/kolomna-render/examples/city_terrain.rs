@@ -35,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("mesh: {} triangles", verts.len() / 3);
 
     let zspan = (mx - mn) * ZSCALE;
-    let rgba = render_offscreen(VIEW_W, VIEW_H, &atlas, &verts, (n - 1) as f32, zspan)?;
+    let rgba = render_offscreen(VIEW_W, VIEW_H, &atlas, &verts, (n - 1) as f32, zspan, mn, wl)?;
     write_png(&args[2], VIEW_W, VIEW_H, &rgba)?;
     println!("saved {}", args[2]);
     Ok(())
