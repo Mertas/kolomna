@@ -512,6 +512,8 @@ struct Manor {
     yard_door: Option<usize>,
     /// coach-house gates on the yard side
     stable: Option<usize>,
+    /// corner house: the east end is a second parade facade (two streets)
+    corner: bool,
 }
 
 /// Basement plinth that follows the real ground instead of a fixed depth.
@@ -594,48 +596,28 @@ pub fn manor_plinth(
         );
         z = z0;
     }
-    // pavement kerb (front + two sides): same ground-following strips
-    let (kx0, kx1, kz0, kz1) = (-1.5f32, w + 1.5, d + 0.05, d + 2.2);
-    let yy0 = 0.03f32;
-    x = kx0;
-    while x < kx1 - 1e-4 {
-        let x1 = (x + 2.5).min(kx1);
-        if in_arch(x, x1) {
-            x = x1;
-            continue; // no kerb across the carriage entrance
-        }
-        let yy = (yl(low, x, kz1).min(yl(low, x1, kz1)) - 0.7).max(YMIN);
-        b.quad(
-            0,
-            [[x, yy0, kz1], [x1, yy0, kz1], [x1, yy, kz1], [x, yy, kz1]],
-            [
-                [0.0, 0.0],
-                [1.0, 0.0],
-                [1.0, (yy - yy0) / 2.6],
-                [0.0, (yy - yy0) / 2.6],
-            ],
-        );
-        x = x1;
-    }
-    for kx in [kx0, kx1] {
-        let mut zz = kz0;
-        while zz < kz1 - 1e-4 {
-            let z1 = (zz + 2.5).min(kz1);
-            let yy = (yl(low, kx, zz).min(yl(low, kx, z1)) - 0.7).max(YMIN);
-            b.quad(
-                0,
-                [[kx, yy0, zz], [kx, yy0, z1], [kx, yy, z1], [kx, yy, zz]],
-                [
-                    [0.0, 0.0],
-                    [1.0, 0.0],
-                    [1.0, (yy - yy0) / 2.6],
-                    [0.0, (yy - yy0) / 2.6],
-                ],
-            );
-            zz = z1;
-        }
-    }
     b.finish(1)
+}
+
+/// Map a mesh bilinearly from its local rectangle (0..w, 0..d) onto the quad
+/// `c` = [(0,0), (w,0), (0,d), (w,d)] -> four target points. This is how a
+/// rectangular generator output becomes an irregular four-sided house that
+/// slots into the block plan without gaps.
+pub fn deform(mesh: &mut ModelMesh, w: f32, d: f32, c: [[f32; 2]; 4]) {
+    for v in mesh.verts.iter_mut() {
+        let u = v.pos[0] / w;
+        let t = v.pos[2] / d;
+        let x = (1.0 - u) * (1.0 - t) * c[0][0]
+            + u * (1.0 - t) * c[1][0]
+            + (1.0 - u) * t * c[2][0]
+            + u * t * c[3][0];
+        let z = (1.0 - u) * (1.0 - t) * c[0][1]
+            + u * (1.0 - t) * c[1][1]
+            + (1.0 - u) * t * c[2][1]
+            + u * t * c[3][1];
+        v.pos[0] = x;
+        v.pos[2] = z;
+    }
 }
 
 impl Manor {
@@ -681,6 +663,7 @@ pub fn generate_manor(
     seed: u64,
     arch: bool,
     size: Option<(f32, f32)>,
+    corner: bool,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32, Option<(f32, f32)>) {
     let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
     let pal = Palette::new(&mut r);
@@ -751,6 +734,7 @@ pub fn generate_manor(
         arch,
         yard_door,
         stable,
+        corner,
     };
     m.build(&mut r);
     let texs = m.textures();
@@ -840,10 +824,27 @@ impl Manor {
                 };
                 self.wall_quad(mat, 1, x0, x0 + 2.0, y, y + fh, 0.0);
             }
-            // ends: a plain window near the middle of each floor
+            // ends: a plain window near the middle (west, yard facing the
+            // neighbour) — or a second parade facade on the east end when
+            // this house owns a street corner
             let dts = (d / 2.0).floor() as usize;
             for t in 0..dts {
                 let z0 = 2.0 * t as f32;
+                if self.corner && t >= 1 && t <= dts.saturating_sub(2) && t % 2 == 1 {
+                    let mat = if fi == 0 { M_BASE_WIN } else { mat_win };
+                    self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
+                } else {
+                    let mat = if t == dts / 2 {
+                        if fi == 0 {
+                            M_BASE_WIN
+                        } else {
+                            M_WIN_PLAIN
+                        }
+                    } else {
+                        mat_wall
+                    };
+                    self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
+                }
                 let mat = if t == dts / 2 {
                     if fi == 0 {
                         M_BASE_WIN
@@ -854,7 +855,6 @@ impl Manor {
                     mat_wall
                 };
                 self.wall_quad(mat, 2, z0, z0 + 2.0, y, y + fh, 0.0);
-                self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
             }
             y += fh;
             self.y_band.push(y);
@@ -1348,30 +1348,6 @@ impl Manor {
             );
         }
 
-        // ---- pavement strip along the front facade -----------------------------
-        {
-            let x0 = -1.5f32;
-            let x1 = w + 1.5;
-            let z0 = d + 0.05;
-            let z1 = d + 2.2;
-            let yy = 0.03f32;
-            self.b.quad(
-                M_BASE,
-                [
-                    [x0, yy, z1],
-                    [x1, yy, z1],
-                    [x1, yy, z0],
-                    [x0, yy, z0],
-                ],
-                [
-                    [0.0, 0.0],
-                    [(x1 - x0) / 2.0, 0.0],
-                    [(x1 - x0) / 2.0, 1.0],
-                    [0.0, 1.0],
-                ],
-            );
-        }
-
         // ---- anchor plates on the facade --------------------------------------
         for k in 0..n_floors.saturating_sub(1) {
             let yy = (self.y_band[k] - 1.4).max(1.2);
@@ -1411,6 +1387,9 @@ impl Manor {
             (TEX_S as u32, 32, band_tex(&pal)),                                       // 11 M_BAND
             (TEX_S as u32, TEX_S as u32, dormer_tex(&pal, &mut rr)),                  // 12 M_DORMER
             (TEX_S as u32, 64, railing_tex(&pal)),                                    // 13 M_RAILING (alpha)
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(4), false, &mut rr)), // 14 M_WIN_PLAIN
+            (TEX_W as u32, TEX_H as u32, black_door_tex(&pal, &mut rr)),              // 15 M_BLACK_DOOR
+            (TEX_W as u32, TEX_H as u32, stable_tex(&pal, &mut rr)),                  // 16 M_STABLE
         ]
     }
 }
