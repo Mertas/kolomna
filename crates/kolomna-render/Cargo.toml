@@ -1,0 +1,5 @@
+[package]
+name = "kolomna-render"
+version.workspace = true
+edition.workspace = true
+description = "Isometric tile renderer for Kolomna (wgpu)"

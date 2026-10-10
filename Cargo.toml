@@ -1,0 +1,6 @@
+[workspace]
+members = ["crates/kolomna-dbpf", "crates/kolomna-assets", "crates/kolomna-render", "crates/kolomna-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
