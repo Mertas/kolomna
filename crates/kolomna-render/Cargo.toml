@@ -3,3 +3,11 @@ name = "kolomna-render"
 version.workspace = true
 edition.workspace = true
 description = "Isometric tile renderer for Kolomna (wgpu)"
+
+[dependencies]
+bytemuck = { version = "1.25.2", features = ["derive"] }
+png = "0.18.1"
+pollster = "1.0.1"
+kolomna-assets = { version = "0.1.0", path = "../kolomna-assets" }
+kolomna-dbpf = { version = "0.1.0", path = "../kolomna-dbpf" }
+wgpu = "30.0.1"

@@ -22,6 +22,13 @@
     rustup default stable-x86_64-pc-windows-gnu   # на этой машине MSVC нет; C: забит — GNU-тулчейн
     cargo build
     cargo run -p kolomna-dbpf --example scan -- "data1.dat"
+    # субфайлы: листинг и извлечение (со сжатием)
+    cargo run -p kolomna-dbpf --example entries -- <file.dat>
+    cargo run -p kolomna-dbpf --example extract -- <file.dat> <type> <group> <instance> <out.bin>
+    # текстуры FSH по TGI
+    cargo run -p kolomna-assets --example fsh_pick -- "F:/.../data2.dat" out/citytex 7ab50e44 891b0e1a 13
+    # рендер реального города из сейва в PNG
+    cargo run -p kolomna-render --example city_terrain -- "C:/Users/<user>/Kolomna/city.save" "data2.dat" out/city.png
 
 ## Статус
 
@@ -29,8 +36,10 @@
 - [x] RefPack-декомпрессор + DIR-список сжатых (проверено: 200/200 случайных сжатых файлов data2)
 
 - [x] FSH-декодер: DXT1/DXT3/32/24/16/8-бит → RGBA + дамп PNG (`--example fsh_dump`)
-- [ ] Окно + изометрический рендер террейна из данных копии
-- [ ] Сейвы: чтение города (террейн, зоны)
+- [x] Изометрический рендер террейна из данных копии (offscreen → PNG: `--example terrain_preview`, `--example city_terrain`)
+- [x] Сейвы: чтение террейна города (чанк `a9dd6ff4`: сетка 129×129 f32, метры) и рендер реального города
+- [ ] Окно (winit) + свободная камера
+- [ ] Сейвы: зоны, сети, здания
 - [ ] Симуляция: спрос/рост/бюджет
 
 ## Референсы (только чтение, не вендоринг)
