@@ -316,6 +316,33 @@ pub fn water_level(vals: &[f32], mn: f32) -> f32 {
     }
 }
 
+/// Clamped height field + one 3x3 [1 2 1]^2 blur pass. The save's height field
+/// is ragged at cell scale (31% of cells deviate >1 m from their 4-neighbours),
+/// and cell-shaped spikes / patchy cliff-grass speckle read as "protruding
+/// squares" on screen; a light pass turns them into smooth slopes while leaving
+/// real cliffs and plateaus intact. Exposed separately so the camera can
+/// raycast the *visual* surface (rotation pivot under the cursor).
+pub fn smooth_field(vals: &[f32], wl: f32) -> Vec<f32> {
+    let n = grid_side(vals);
+    let mut hc: Vec<f32> = vals.iter().map(|&h| h.max(wl)).collect();
+    let src = hc.clone();
+    for gy in 1..n - 1 {
+        for gx in 1..n - 1 {
+            let s = src[(gy - 1) * n + (gx - 1)]
+                + 2.0 * src[(gy - 1) * n + gx]
+                + src[(gy - 1) * n + (gx + 1)]
+                + 2.0 * src[gy * n + (gx - 1)]
+                + 4.0 * src[gy * n + gx]
+                + 2.0 * src[gy * n + (gx + 1)]
+                + src[(gy + 1) * n + (gx - 1)]
+                + 2.0 * src[(gy + 1) * n + gx]
+                + src[(gy + 1) * n + (gx + 1)];
+            hc[gy * n + gx] = (s / 16.0).max(wl);
+        }
+    }
+    hc
+}
+
 /// Mesh the height grid as iso diamonds with continuous world UVs and smooth
 /// per-vertex normals. Water cells form a flat plane at `wl` and carry a
 /// per-vertex bed-depth attribute for the procedural water shading; land
@@ -323,33 +350,9 @@ pub fn water_level(vals: &[f32], mn: f32) -> f32 {
 /// continuously in the shader, so no per-cell classification squares exist.
 pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     let n = grid_side(vals);
-    // clamped field: geometry and normals treat the water bed as the surface
-    let mut hc: Vec<f32> = vals.iter().map(|&h| h.max(wl)).collect();
-    // 3x3 [1 2 1]^2 blur (one pass): the save's height field is ragged at cell
-    // scale (31% of cells deviate >1 m from their 4-neighbours), and cell-shaped
-    // spikes / patchy cliff-grass speckle read as "protruding squares" on
-    // screen. A light pass turns them into smooth slopes while leaving real
-    // cliffs and plateaus intact.
-    {
-        let passes: usize = 1;
-        for _ in 0..passes {
-            let src = hc.clone();
-            for gy in 1..n - 1 {
-                for gx in 1..n - 1 {
-                    let s = src[(gy - 1) * n + (gx - 1)]
-                        + 2.0 * src[(gy - 1) * n + gx]
-                        + src[(gy - 1) * n + (gx + 1)]
-                        + 2.0 * src[gy * n + (gx - 1)]
-                        + 4.0 * src[gy * n + gx]
-                        + 2.0 * src[gy * n + (gx + 1)]
-                        + src[(gy + 1) * n + (gx - 1)]
-                        + 2.0 * src[(gy + 1) * n + gx]
-                        + src[(gy + 1) * n + (gx + 1)];
-                    hc[gy * n + gx] = (s / 16.0).max(wl);
-                }
-            }
-        }
-    }
+    // clamped + blurred field (see smooth_field): geometry and normals treat
+    // the water bed as the surface
+    let hc = smooth_field(vals, wl);
     let zof = |h: f32| (h.max(wl) - mn) * ZSCALE;
 
     // per-grid-vertex normals in mesh units (central differences, one-sided at borders)

@@ -52,8 +52,14 @@ struct VsOut {
 @vertex
 fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) nrm: vec3<f32>) -> VsOut {
     // model y-up metres -> scene z-up; horizontal metres -> cells (16 m)
-    let c = cos(mp.rot);
-    let s = sin(mp.rot);
+    // Buildings store only their south+east facades: the model must
+    // spin with the camera so its facade always faces the viewer
+    // the world — and with it the building — rotates as one; the back/west
+    // walls simply don't exist in the 3DMD). In-world rotation is therefore
+    // mp.rot - params.angle; the screen-space orientation stays mp.rot.
+    let rot = mp.rot - params.angle;
+    let c = cos(rot);
+    let s = sin(rot);
     let wx = (p.x * c - p.z * s) / 16.0 + mp.pos.x;
     let wy = (p.x * s + p.z * c) / 16.0 + mp.pos.y;
     let wz = p.y * 0.14 + mp.pos.z;

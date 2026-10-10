@@ -122,6 +122,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let out_close = format!("{out}_close.png");
     write_png(&out_close, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out_close}");
+
+    // turntable: render the house from 4 camera angles (check all walls)
+    let p = grid * 0.5;
+    let d = [hx - p, hz - p];
+    for (k, a) in [0.0f32, std::f32::consts::FRAC_PI_2, std::f32::consts::PI, 4.712389]
+        .iter()
+        .enumerate()
+    {
+        let (ca, sa) = (a.cos(), a.sin());
+        let rpx = d[0] * ca - d[1] * sa + p;
+        let rpy = d[0] * sa + d[1] * ca + p;
+        let center = [(rpx - rpy) * 0.5, (rpx + rpy) * 0.25 - hz_mesh - 0.6];
+        let house = PlacedModel {
+            mesh: &mesh,
+            textures: &htex,
+            pos: [hx, hz, hz_mesh],
+            rot: 0.0,
+        };
+        let rgba = render_scene_with_models(
+            VIEW_W,
+            VIEW_H,
+            &atlas,
+            &verts,
+            grid,
+            zspan,
+            20.0,
+            mn,
+            wl,
+            Some((center, *a)),
+            &[house],
+            Some(&road_mesh),
+            &road_tex,
+        )?;
+        let f = format!("{out}_turn{k}.png");
+        write_png(&f, VIEW_W, VIEW_H, &rgba)?;
+        println!("saved {f}");
+    }
     Ok(())
 }
 

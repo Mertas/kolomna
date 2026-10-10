@@ -21,7 +21,7 @@ use kolomna_render::model::{mesh_from_mesh3d, ModelMesh, ModelRenderer, PlacedMo
 use kolomna_render::road::{build_road_mesh, load_road_tiles, RoadMesh, RoadRenderer};
 use kolomna_render::{
     Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, load_atlas,
-    load_terrain, water_level, write_png,
+    load_terrain, smooth_field, water_level, write_png,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -50,6 +50,11 @@ pub struct Scene {
     mn: f32,
     /// water surface level (metres)
     wl: f32,
+    /// smoothed height grid (metres, water-clamped) — the exact field the
+    /// mesh is built from; the camera raycasts it for the rotation pivot
+    sm: Vec<f32>,
+    /// grid side length of `sm`
+    n: usize,
     /// road network from the save (16 m tiles)
     road_mesh: RoadMesh,
     road_textures: Vec<(u32, u32, Vec<u8>)>,
@@ -75,6 +80,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     println!("atlas: 6 textures -> 256x256 px layers");
 
     let base = build_mesh(&terrain, mn, mx, wl);
+    let sm = smooth_field(&terrain, wl);
     println!("mesh: {} triangles", base.len() / 3);
 
     // ---- road network from the save (one 16 m tile per record)
@@ -120,6 +126,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         zspan: (mx - mn) * ZSCALE,
         mn,
         wl,
+        sm,
+        n,
         road_mesh,
         road_textures,
         model_mesh,
@@ -176,6 +184,12 @@ struct Camera {
     zoom_target: f32,
     rot: f32,
     rot_target: f32,
+    /// last `rot` the pivot compensation was applied at
+    rot_applied: f32,
+    /// rotation pivot, cell coords (set under the cursor on middle-press)
+    pivot: [f32; 2],
+    /// grid side (cells) — pivot compensation needs it
+    grid: f32,
     /// smoothed pan velocity (screen px/s)
     vel: [f32; 2],
     /// seconds since start (water shimmer)
@@ -190,6 +204,9 @@ impl Camera {
             zoom_target: 1.0,
             rot: 0.0,
             rot_target: 0.0,
+            rot_applied: 0.0,
+            pivot: [grid * 0.5, grid * 0.5],
+            grid,
             vel: [0.0; 2],
             time: 0.0,
         }
@@ -268,6 +285,22 @@ impl Camera {
         self.zoom += (self.zoom_target - self.zoom) * kz;
         let kr = 1.0 - (-14.0 * dt).exp();
         self.rot += (self.rot_target - self.rot) * kr;
+        // keep the rotation pivot pinned under the cursor: rotating the world
+        // about the map centre moves every point on screen; shifting `target`
+        // by the pivot's own screen displacement cancels that exactly at the
+        // pivot, so the ground under the mouse stays put while rotating
+        if (self.rot - self.rot_applied).abs() > 1e-6 {
+            let c0 = self.grid * 0.5;
+            let d = [self.pivot[0] - c0, self.pivot[1] - c0];
+            let (s0, c0c) = self.rot_applied.sin_cos();
+            let (s1, c1) = self.rot.sin_cos();
+            let v0 = [d[0] * c0c - d[1] * s0, d[0] * s0 + d[1] * c0c];
+            let v1 = [d[0] * c1 - d[1] * s1, d[0] * s1 + d[1] * c1];
+            let dd = [v1[0] - v0[0], v1[1] - v0[1]];
+            self.target[0] += (dd[0] - dd[1]) * 0.5;
+            self.target[1] += (dd[0] + dd[1]) * 0.25;
+            self.rot_applied = self.rot;
+        }
         self.time += dt;
     }
 
@@ -286,6 +319,49 @@ impl Camera {
             _pad2: 0.0,
         }
     }
+
+    /// Point the rotation pivot at the terrain under a screen position:
+    /// invert the iso projection, then walk the view ray onto the smoothed
+    /// height field (the mesh is drawn from the same field, so the pivot
+    /// lands where the user clicked).
+    fn set_pivot_from_screen(
+        &mut self,
+        sm: &[f32],
+        n: usize,
+        mn: f32,
+        px: f64,
+        py: f64,
+        win: (f64, f64),
+        base_scale: f32,
+    ) {
+        let scale = (base_scale * self.zoom).max(1e-3);
+        let a = self.target[0] + (px as f32 - win.0 as f32 * 0.5) / scale;
+        let b = self.target[1] + (py as f32 - win.1 as f32 * 0.5) / scale;
+        // iso ray: x = s + a, y = s - a, z(s) = s/2 - b (z in mesh units)
+        let mut s = 2.0 * b;
+        for _ in 0..16 {
+            let cx = (s + a).clamp(0.0, self.grid);
+            let cy = (s - a).clamp(0.0, self.grid);
+            let zmesh = (sample_h(sm, n, cx, cy) - mn) * ZSCALE;
+            s = 2.0 * (b + zmesh);
+        }
+        self.pivot = [(s + a).clamp(0.0, self.grid), (s - a).clamp(0.0, self.grid)];
+    }
+}
+
+/// Bilinear sample of the smoothed height grid (metres) at cell coordinates.
+fn sample_h(sm: &[f32], n: usize, cx: f32, cy: f32) -> f32 {
+    let x = cx.clamp(0.0, (n - 1) as f32);
+    let y = cy.clamp(0.0, (n - 1) as f32);
+    let x0 = (x as usize).min(n.saturating_sub(2));
+    let y0 = (y as usize).min(n.saturating_sub(2));
+    let fx = x - x0 as f32;
+    let fy = y - y0 as f32;
+    let h00 = sm[y0 * n + x0];
+    let h10 = sm[y0 * n + x0 + 1];
+    let h01 = sm[(y0 + 1) * n + x0];
+    let h11 = sm[(y0 + 1) * n + x0 + 1];
+    (h00 * (1.0 - fx) + h10 * fx) * (1.0 - fy) + (h01 * (1.0 - fx) + h11 * fx) * fy
 }
 
 // ------------------------------------------------------------- renderer ----
@@ -634,6 +710,31 @@ impl ApplicationHandler for App {
                             self.drag_pan = true;
                         } else {
                             self.drag_rot = pressed;
+                            if pressed {
+                                // rotation pivots around the terrain point
+                                // under the cursor
+                                let base_scale = self
+                                    .renderer
+                                    .as_ref()
+                                    .zip(self.scene.as_ref())
+                                    .map(|(r, s)| r.base_scale(s))
+                                    .unwrap_or(1.0);
+                                if let (Some(scene), Some(cam), Some((px, py))) = (
+                                    self.scene.as_ref(),
+                                    self.camera.as_mut(),
+                                    self.cursor,
+                                ) {
+                                    cam.set_pivot_from_screen(
+                                        &scene.sm,
+                                        scene.n,
+                                        scene.mn,
+                                        px,
+                                        py,
+                                        self.win_size,
+                                        base_scale,
+                                    );
+                                }
+                            }
                         }
                     }
                     MouseButton::Left | MouseButton::Right => self.drag_pan = pressed,
