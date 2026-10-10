@@ -64,7 +64,7 @@ fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) 
     let s = sin(rot);
     let wx = (p.x * c - p.z * s) / 16.0 + mp.pos.x;
     let wy = (p.x * s + p.z * c) / 16.0 + mp.pos.y;
-    let wz = p.y * 0.14 + mp.pos.z;
+    let wz = p.y * 0.035 + mp.pos.z;
     let d = vec2<f32>(wx, wy) - vec2<f32>(params.pivot);
     let ca = cos(params.angle);
     let sa = sin(params.angle);

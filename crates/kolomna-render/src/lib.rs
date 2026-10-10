@@ -50,7 +50,7 @@ pub const TERRAIN_TYPE: u32 = 0xa9dd6ff4;
 pub const TERRAIN_GROUP: u32 = 0xe98f9525;
 pub const TERRAIN_INSTANCE: u32 = 1;
 /// map units (mesh units) per meter of altitude (visual relief exaggeration)
-pub const ZSCALE: f32 = 0.14;
+pub const ZSCALE: f32 = 0.035;
 /// world cells per texture repeat (texture instance spans this many cells)
 pub const REPEAT_CELLS: f32 = 5.0;
 /// water surface sits this many metres above the flat-bed mode (see water_level)
@@ -213,7 +213,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let g = textureSample(atlas, samp, in.uv, i32(in.layer + 0.5));
     // sand: CONTINUOUS fade by metres above the water plane — a hard per-cell
     // rule here was what cut green squares into sandy slopes.
-    let zs = 0.14; // ZSCALE (mesh units per metre)
+    let zs = 0.035; // ZSCALE (mesh units per metre)
     let above = (in.wpos.z - params.water_z) / zs;
     let ws = 1.0 - smoothstep(0.5, 3.5, above);
     let sand = textureSample(atlas, samp, in.uv, 2);
