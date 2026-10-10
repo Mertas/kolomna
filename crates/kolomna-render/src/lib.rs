@@ -328,44 +328,6 @@ pub fn water_level(vals: &[f32], mn: f32) -> f32 {
 /// squares" on screen; a light pass turns them into smooth slopes while leaving
 /// real cliffs and plateaus intact. Exposed separately so the camera can
 /// raycast the *visual* surface (rotation pivot under the cursor).
-/// Level the terrain under a building footprint into a flat pad that blends
-/// into the surrounding slope (the terraced look). Grid vertices inside
-/// the footprint get `h_pad`; around it the weight falls off with a
-/// smoothstep over `radius` metres, so the meshed terrain and the camera
-/// raycast field see the same surface and a house on a hill is never sliced
-/// by the slope. Coordinates are in metres; one grid cell = 16 m.
-pub fn flatten_pad(
-    vals: &mut [f32],
-    n: usize,
-    cx: f32,
-    cz: f32,
-    hw: f32,
-    hd: f32,
-    h_pad: f32,
-    radius: f32,
-) {
-    const M: f32 = 16.0;
-    let c0x = (((cx - hw - radius) / M).floor().max(0.0)) as usize;
-    let c1x = ((((cx + hw + radius) / M).ceil()).min((n - 1) as f32)) as usize;
-    let c0z = (((cz - hd - radius) / M).floor().max(0.0)) as usize;
-    let c1z = ((((cz + hd + radius) / M).ceil()).min((n - 1) as f32)) as usize;
-    for j in c0z..=c1z {
-        for i in c0x..=c1x {
-            let px = i as f32 * M;
-            let pz = j as f32 * M;
-            let dx = ((px - cx).abs() - hw).max(0.0);
-            let dz = ((pz - cz).abs() - hd).max(0.0);
-            let d = (dx * dx + dz * dz).sqrt();
-            let t = (d / radius).clamp(0.0, 1.0);
-            let w = 1.0 - t * t * (3.0 - 2.0 * t); // smoothstep falloff
-            if w > 0.0 {
-                let o = j * n + i;
-                vals[o] = vals[o] * (1.0 - w) + h_pad * w;
-            }
-        }
-    }
-}
-
 pub fn smooth_field(vals: &[f32], wl: f32) -> Vec<f32> {
     let n = grid_side(vals);
     let mut hc: Vec<f32> = vals.iter().map(|&h| h.max(wl)).collect();

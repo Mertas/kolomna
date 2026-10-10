@@ -58,8 +58,8 @@ pub struct Scene {
     /// road network from the save (16 m tiles)
     road_mesh: RoadMesh,
     road_textures: Vec<(u32, u32, Vec<u8>)>,
-    /// generated Petersburg tenements (mesh, textures, ground position)
-    village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])>,
+    /// generated Petersburg tenements (mesh, textures, model origin, world rot)
+    village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
@@ -106,40 +106,119 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     dx /= dl;
     dz /= dl;
 
-    // ---- a street of Petersburg tenements (доходные дома, E:/My/Clicker) ----
-    // A tenement on a slope: cut a level pad under the footprint into the
-    // height grid BEFORE the mesh is built (terraced lots do the same). The
-    // pad height is the smoothed height at the house centre, so the hill is
-    // cut from behind and filled from below — the house sits on a terrace
-    // that follows the hill, and no corner gets sliced by the slope.
-    let sm0 = smooth_field(&terrain, wl);
-    let h0 = |x: f32, z: f32| -> f32 {
-        let i = x.clamp(0.0, (n - 1) as f32);
-        let j = z.clamp(0.0, (n - 1) as f32);
-        sample_h(&sm0, n, i, j)
-    };
-    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])> = Vec::new();
-    for k in 0..4u32 {
-        let along = (k as f32 - 1.5) * 2.6;
-        let side: f32 = -4.8;
-        let gx = anchor[0] + dx * along - dz * side;
-        let gz = anchor[1] + dz * along + dx * side;
-        let (mesh, texs) = kolomna_render::piter::generate_manor(7100 + k as u64 * 31);
-        let h_pad = h0(gx, gz).max(wl + 2.0);
-        // half extents incl. a 1–2 m apron (metres; the grid cell is 16 m)
-        kolomna_render::flatten_pad(&mut terrain, n, gx * 16.0, gz * 16.0, 13.0, 8.0, h_pad, 22.0);
-        village.push((mesh, texs, [gx, gz, h_pad]));
-    }
-    println!("village: {} Petersburg tenements", village.len());
-
-    // ---- terrain mesh (after the pads were levelled) -----------------------
+    // ---- terrain field + mesh (the houses adapt to it, not vice versa) ----
     let base = build_mesh(&terrain, mn, mx, wl);
     let sm = smooth_field(&terrain, wl);
     println!("mesh: {} triangles", base.len() / 3);
-    // final placement heights: sample the levelled field at each centre
-    for (_, _, p) in village.iter_mut() {
-        p[2] = (sample_h(&sm, n, p[0], p[1]) - mn) * ZSCALE + 0.02;
+
+    // ---- the Petersburg street: 20 generated tenements in two rows --------
+    // Each house adapts to the slope: it is seated on the HIGHEST ground under
+    // its footprint (so the hill never crops walls or windows), and the
+    // basement skirt baked into the mesh continues the walls down to the
+    // LOWEST ground (so nothing floats). Two rows face the road, sizes and
+    // storeys vary with the seed.
+    let h_at = |x: f32, z: f32| -> f32 {
+        sample_h(
+            &sm,
+            n,
+            x.clamp(0.0, (n - 1) as f32),
+            z.clamp(0.0, (n - 1) as f32),
+        )
+    };
+    let nvec = [-dz, dx]; // road normal (side offset direction)
+    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)> = Vec::new();
+    let mut report: Vec<(f32, f32, f32, f32)> = Vec::new();
+    for row in 0..2u32 {
+        // the entrance facade (+z locally) turns to face the road
+        let rot = if row == 0 {
+            (-nvec[0]).atan2(nvec[1])
+        } else {
+            nvec[0].atan2(-nvec[1])
+        };
+        let (cr, sr) = rot.sin_cos();
+        // first pass: sizes only, so the row accumulates without overlaps
+        let mut sizes = Vec::new();
+        for k in 0..10u64 {
+            let seed = 7100 + row as u64 * 97 + k * 31;
+            let (_, _, w, d) = kolomna_render::piter::generate_manor(seed);
+            sizes.push((seed, w, d));
+        }
+        let total: f32 = sizes.iter().map(|s| s.1).sum::<f32>() + 9.0 * 4.5;
+        let mut along = -total / 2.0;
+        for (seed, w, d) in sizes {
+            along += w / 2.0;
+            // Pick the calmest spot near the row line: roads are cut along the
+            // contour, so the closer to the road the flatter the ground. Try
+            // several side offsets and small shifts, keep the smallest fall
+            // (measured over the corners plus an 8 m apron so the house never
+            // teeters on the lip of a ravine).
+            let mut best: Option<(f32, f32, f32, f32, f32)> = None;
+            for cand_side in [1.4f32, 2.0, 2.6, 3.2, 3.8] {
+                let s = if row == 0 { -cand_side } else { cand_side };
+                for cand_shift in [-2.5f32, 0.0, 2.5] {
+                    let cxx =
+                        anchor[0] + dx * ((along + cand_shift) / 16.0) + nvec[0] * s;
+                    let czz =
+                        anchor[1] + dz * ((along + cand_shift) / 16.0) + nvec[1] * s;
+                    // h_max over the footprint itself (seat height); h_min the
+                    // skirt has to reach; fall also sees the 8 m apron
+                    let mut hmx = f32::NEG_INFINITY;
+                    let mut hmn = f32::INFINITY;
+                    let mut hmn_all = f32::INFINITY;
+                    for (lx, lz, wide) in [
+                        (0.0, 0.0, false),
+                        (-w / 2.0, -d / 2.0, false),
+                        (w / 2.0, -d / 2.0, false),
+                        (-w / 2.0, d / 2.0, false),
+                        (w / 2.0, d / 2.0, false),
+                        (-w / 2.0, d / 2.0 + 2.6, false),
+                        (w / 2.0, d / 2.0 + 2.6, false),
+                        (-w / 2.0 - 8.0, -d / 2.0 - 8.0, true),
+                        (w / 2.0 + 8.0, -d / 2.0 - 8.0, true),
+                        (-w / 2.0 - 8.0, d / 2.0 + 8.0, true),
+                        (w / 2.0 + 8.0, d / 2.0 + 8.0, true),
+                    ] {
+                        let mx_ = cxx + lx * cr - lz * sr;
+                        let mz_ = czz + lx * sr + lz * cr;
+                        let h = h_at(mx_, mz_);
+                        if !wide {
+                            hmx = hmx.max(h);
+                            hmn = hmn.min(h);
+                        }
+                        hmn_all = hmn_all.min(h);
+                    }
+                    let fall = hmx - hmn_all;
+                    if best.is_none() || fall < best.unwrap().0 {
+                        best = Some((fall, cxx, czz, hmx, hmn));
+                    }
+                }
+            }
+            let (_, cx, cz, h_max, _h_min) = best.unwrap();
+            let seat = (h_max + 0.05).max(wl + 2.0);
+            // model origin such that the rotated LOCAL CENTRE lands on (cx, cz)
+            let ox = cx - (w / 2.0 * cr - d / 2.0 * sr) / 16.0;
+            let oz = cz - (w / 2.0 * sr + d / 2.0 * cr) / 16.0;
+            let (mesh, texs, _, _) = kolomna_render::piter::generate_manor(seed);
+            // ground-following basement plinth: for any LOCAL point of the
+            // house, how far below the floor slab the real ground lies
+            let low = |lx: f32, lz: f32| -> f32 {
+                let mx_ = cx + lx * cr - lz * sr;
+                let mz_ = cz + lx * sr + lz * cr;
+                h_at(mx_, mz_) - seat
+            };
+            let plinth = kolomna_render::piter::manor_plinth(w, d, &low);
+            let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
+            let place = [ox, oz, (seat - mn) * ZSCALE];
+            village.push((plinth, vec![base_tex], place, rot));
+            village.push((mesh, texs, place, rot));
+            report.push((w, d, _h_min, h_max - _h_min));
+            along += w / 2.0 + 4.5;
+        }
     }
+    for (i, (w, d, _hmin, dh)) in report.iter().enumerate() {
+        println!("tenement {i:02}: {w:.0}x{d:.0} m, slope {dh:.2} m");
+    }
+    println!("village: {} Petersburg tenements", village.len());
 
     Ok(Scene {
         base,
@@ -161,12 +240,12 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
 pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     let scene = load_scene(city, dat)?;
     let mut placed = Vec::new();
-    for (mesh, texs, pos) in &scene.village {
+    for (mesh, texs, pos, rot) in &scene.village {
         placed.push(PlacedModel {
             mesh,
             textures: texs,
             pos: *pos,
-            rot: 0.0,
+            rot: *rot,
             spin: 0.0,
         });
     }
@@ -182,7 +261,7 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
     let view = scene
         .village
         .get(scene.village.len().saturating_sub(2))
-        .map(|(_, _, p)| {
+        .map(|(_, _, p, _)| {
             // the shader rotates world points about the grid centre before the
             // iso projection — rotate the anchor the same way, or a frame with
             // a non-zero angle aims at the wrong place (empty ground).
@@ -195,7 +274,7 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
                 [
                     (rx - rz) * 0.5,
                     // + ~half the tenement height: keeps a ~17 m house centred
-                    (rx + rz) * (0.5 * tilt) - p[2] - 0.55,
+                    (rx + rz) * (0.5 * tilt) - p[2] - 0.6,
                 ],
                 angle,
             )
@@ -567,9 +646,9 @@ impl Renderer {
         let village: Vec<ModelRenderer> = scene
             .village
             .iter()
-            .map(|(mesh, texs, pos)| {
+            .map(|(mesh, texs, pos, rot)| {
                 let r = ModelRenderer::new(&device, &queue, config.format, 4, mesh, texs);
-                r.set_placement(&queue, *pos, 0.0, 0.0);
+                r.set_placement(&queue, *pos, *rot, 0.0);
                 r
             })
             .collect();

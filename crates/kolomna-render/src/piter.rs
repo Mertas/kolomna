@@ -444,6 +444,106 @@ struct Manor {
     door_tile: usize,
 }
 
+/// Basement plinth that follows the real ground instead of a fixed depth.
+/// The caller passes `low(lx, lz)`: for a LOCAL house coordinate, how far
+/// below the floor slab (y = 0) the ground lies, in metres (negative, with
+/// any safety margin already applied). Every 2 m strip of every wall is
+/// drawn down to the lowest ground under that strip, so on a slope the
+/// plinth digs into the hill — the house reads as BUILT ON it: nothing is
+/// ever cropped by the slope (the house is seated on the high ground) and
+/// nothing hovers (the plinth reaches the low ground).
+pub fn manor_plinth(w: f32, d: f32, low: &dyn Fn(f32, f32) -> f32) -> ModelMesh {
+    const YMIN: f32 = -14.0; // sane clamp (we are not pouring into a lake)
+    let mut b = Builder::new();
+    let yl = |l: &dyn Fn(f32, f32) -> f32, x: f32, z: f32| (l(x, z) - 0.05).max(YMIN);
+    // south (+z): strips along x
+    let mut x = 0.0f32;
+    while x < w - 1e-4 {
+        let x1 = (x + 2.0).min(w);
+        let yy = yl(low, x, d).min(yl(low, x1, d));
+        b.quad(
+            0, 
+            [[x, 0.0, d], [x1, 0.0, d], [x1, yy, d], [x, yy, d]],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, yy / 2.6], [0.0, yy / 2.6]],
+        );
+        x = x1;
+    }
+    // north (−z)
+    x = w;
+    while x > 1e-4 {
+        let x0 = (x - 2.0).max(0.0);
+        let yy = yl(low, x, 0.0).min(yl(low, x0, 0.0));
+        b.quad(
+            0,
+            [[x, 0.0, 0.0], [x0, 0.0, 0.0], [x0, yy, 0.0], [x, yy, 0.0]],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, yy / 2.6], [0.0, yy / 2.6]],
+        );
+        x = x0;
+    }
+    // west (−x): strips along z
+    let mut z = 0.0f32;
+    while z < d - 1e-4 {
+        let z1 = (z + 2.0).min(d);
+        let yy = yl(low, 0.0, z).min(yl(low, 0.0, z1));
+        b.quad(
+            0,
+            [[0.0, 0.0, z], [0.0, 0.0, z1], [0.0, yy, z1], [0.0, yy, z]],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, yy / 2.6], [0.0, yy / 2.6]],
+        );
+        z = z1;
+    }
+    // east (+x)
+    z = d;
+    while z > 1e-4 {
+        let z0 = (z - 2.0).max(0.0);
+        let yy = yl(low, w, z).min(yl(low, w, z0));
+        b.quad(
+            0,
+            [[w, 0.0, z], [w, 0.0, z0], [w, yy, z0], [w, yy, z]],
+            [[0.0, 0.0], [1.0, 0.0], [1.0, yy / 2.6], [0.0, yy / 2.6]],
+        );
+        z = z0;
+    }
+    // pavement kerb (front + two sides): same ground-following strips
+    let (kx0, kx1, kz0, kz1) = (-1.5f32, w + 1.5, d + 0.05, d + 2.2);
+    let yy0 = 0.03f32;
+    x = kx0;
+    while x < kx1 - 1e-4 {
+        let x1 = (x + 2.5).min(kx1);
+        let yy = (yl(low, x, kz1).min(yl(low, x1, kz1)) - 0.3).max(YMIN);
+        b.quad(
+            0,
+            [[x, yy0, kz1], [x1, yy0, kz1], [x1, yy, kz1], [x, yy, kz1]],
+            [
+                [0.0, 0.0],
+                [1.0, 0.0],
+                [1.0, (yy - yy0) / 2.6],
+                [0.0, (yy - yy0) / 2.6],
+            ],
+        );
+        x = x1;
+    }
+    for kx in [kx0, kx1] {
+        let mut zz = kz0;
+        while zz < kz1 - 1e-4 {
+            let z1 = (zz + 2.5).min(kz1);
+            let yy = (yl(low, kx, zz).min(yl(low, kx, z1)) - 0.3).max(YMIN);
+            b.quad(
+                0,
+                [[kx, yy0, zz], [kx, yy0, z1], [kx, yy, z1], [kx, yy, zz]],
+                [
+                    [0.0, 0.0],
+                    [1.0, 0.0],
+                    [1.0, (yy - yy0) / 2.6],
+                    [0.0, (yy - yy0) / 2.6],
+                ],
+            );
+            zz = z1;
+        }
+    }
+    b.finish(1)
+}
+
 impl Manor {
     fn wall_quad(&mut self, mat: u32, side: u8, t0: f32, t1: f32, y0: f32, y1: f32, x_or_z: f32) {
         let p = match side {
@@ -481,15 +581,16 @@ impl Manor {
     }
 }
 
-/// Build one tenement house; returns the mesh plus its own palette textures.
-pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
+/// Build one tenement house; returns the mesh, its palette textures and the
+/// footprint size (w, d) in metres so the caller can place and rotate it.
+pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32) {
     let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
     let pal = Palette::new(&mut r);
 
-    let tiles = [8usize, 10, 12][r.below(3) as usize]; // 16 / 20 / 24 m
+    let tiles = [6usize, 8, 10, 12, 14][r.below(5) as usize]; // 12..28 m
     let w = 2.0 * tiles as f32;
-    let d = [10.0f32, 12.0][r.below(2) as usize];
-    let upper = 2 + r.below(3); // 2..4 upper floors → 4..6 storeys with basement
+    let d = [10.0f32, 12.0, 14.0][r.below(3) as usize];
+    let upper = 1 + r.below(5); // 1..5 upper floors → 3..7 storeys with basement
     let mut heights = vec![2.6f32, 3.9];
     for k in 0..upper {
         heights.push(3.4 - 0.25 * k as f32);
@@ -518,7 +619,7 @@ pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
     m.build(&mut r);
     let texs = m.textures();
     let mesh = m.b.finish(N_MATS);
-    (mesh, texs)
+    (mesh, texs, w, d)
 }
 
 impl Manor {
