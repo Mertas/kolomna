@@ -90,6 +90,9 @@ fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) 
 @fragment
 fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
     let t = textureSample(tex, samp, in.uv);
+    if (t.a < 0.5) {
+        discard;
+    }
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     let lit = 0.60 + 0.50 * max(abs(dot(n, l)), 0.0);

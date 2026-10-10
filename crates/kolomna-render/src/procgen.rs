@@ -47,7 +47,7 @@ impl Rng {
 
 // -------------------------------------------------------------- builder ----
 
-struct Builder {
+pub struct Builder {
     verts: Vec<ModelVertex>,
     indices: Vec<u32>,
     /// (material slot, first index, index count) — one segment per material run
@@ -55,7 +55,7 @@ struct Builder {
 }
 
 impl Builder {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             verts: Vec::new(),
             indices: Vec::new(),
@@ -74,7 +74,7 @@ impl Builder {
     }
 
     /// Quad from 4 positions with per-corner UVs (CCW seen from outside).
-    fn quad(&mut self, mat: u32, p: [[f32; 3]; 4], uv: [[f32; 2]; 4]) {
+    pub fn quad(&mut self, mat: u32, p: [[f32; 3]; 4], uv: [[f32; 2]; 4]) {
         let n = face_n(p[0], p[1], p[2]);
         let base = self.verts.len() as u32;
         for k in 0..4 {
@@ -84,7 +84,7 @@ impl Builder {
         self.push_tri(mat, base, base + 2, base + 3);
     }
 
-    fn tri(&mut self, mat: u32, p: [[f32; 3]; 3], uv: [[f32; 2]; 3]) {
+    pub fn tri(&mut self, mat: u32, p: [[f32; 3]; 3], uv: [[f32; 2]; 3]) {
         let n = face_n(p[0], p[1], p[2]);
         let base = self.verts.len() as u32;
         for k in 0..3 {
@@ -93,7 +93,7 @@ impl Builder {
         self.push_tri(mat, base, base + 1, base + 2);
     }
 
-    fn finish(self) -> ModelMesh {
+    pub fn finish(self, n_tex: u32) -> ModelMesh {
         ModelMesh {
             verts: self.verts,
             indices: self.indices,
@@ -107,7 +107,7 @@ impl Builder {
                     texture: m,
                 })
                 .collect(),
-            texture_ids: (0..6).collect(),
+            texture_ids: (0..n_tex).collect(),
         }
     }
 }
@@ -387,7 +387,7 @@ pub fn generate_house(seed: u64) -> ModelMesh {
         roof(&mut b, wx0, wx1, wz0, wz1, wh, wrh, roof_mat, wall_mat);
     }
 
-    b.finish()
+    b.finish(6)
 }
 
 // -------------------------------------------------------------- textures ---

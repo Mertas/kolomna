@@ -164,7 +164,20 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             [gx, gz, hz2 + 0.02],
         ));
     }
-    println!("village: {} procedural houses along the road", village.len());
+    // ---- a street of Petersburg tenements (доходные дома, E:/My/Clicker) ----
+    for k in 0..3u32 {
+        let along = (k as f32 - 1.0) * 2.6;
+        let side: f32 = -4.8;
+        let gx = model_pos[0] + dx * along - dz * side;
+        let gz = model_pos[1] + dz * along + dx * side;
+        let hz2 = height_cell(gx, gz);
+        let (mesh, texs) = kolomna_render::piter::generate_manor(7100 + k as u64 * 31);
+        village.push((mesh, texs, [gx, gz, hz2 + 0.02]));
+    }
+    println!(
+        "village: {} houses (6 cottages + 3 Petersburg tenements)",
+        village.len()
+    );
 
     Ok(Scene {
         base,
@@ -219,7 +232,10 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.5)
         .clamp(0.0, 1.0);
-    let view = scene.village.get(scene.village.len() / 2).map(|(_, _, p)| {
+    let view = scene
+        .village
+        .get(scene.village.len().saturating_sub(2))
+        .map(|(_, _, p)| {
         (
             [
                 (p[0] - p[1]) * 0.5,
@@ -386,7 +402,11 @@ impl Camera {
             let v1 = [d[0] * c1 - d[1] * s1, d[0] * s1 + d[1] * c1];
             let dd = [v1[0] - v0[0], v1[1] - v0[1]];
             self.target[0] += (dd[0] - dd[1]) * 0.5;
-            self.target[1] += (dd[0] + dd[1]) * 0.25;
+            // sy of a rotated delta is (dx + dy) * (0.5 * tilt): the hardcoded
+            // 0.25 only matched tilt = 0.5, so at any other tilt the pivot
+            // drifted away from the cursor while rotating.
+            let t = self.tilt.clamp(0.05, 1.0);
+            self.target[1] += (dd[0] + dd[1]) * (0.5 * t);
             self.rot_applied = self.rot;
         }
         // eased tilt; the pivot point keeps its screen spot while tilting
@@ -433,13 +453,18 @@ impl Camera {
         let scale = (base_scale * self.zoom).max(1e-3);
         let a = self.target[0] + (px as f32 - win.0 as f32 * 0.5) / scale;
         let b = self.target[1] + (py as f32 - win.1 as f32 * 0.5) / scale;
-        // iso ray: x = s + a, y = s - a, z(s) = s/2 - b (z in mesh units)
-        let mut s = 2.0 * b;
-        for _ in 0..16 {
+        // Iso ray: x = s + a, y = s - a and sy = (x + y) * (0.5 * tilt) - z,
+        // so s = (b + z(s)) / tilt.  The old code hardcoded tilt = 0.5 (s =
+        // 2*(b+z)) which put the pivot at the wrong map point for every other
+        // tilt — the view then orbited around a phantom axis.
+        let t = self.tilt.clamp(0.07, 1.0);
+        let smax = 2.0 * self.grid;
+        let mut s = (b / t).clamp(0.0, smax);
+        for _ in 0..20 {
             let cx = (s + a).clamp(0.0, self.grid);
             let cy = (s - a).clamp(0.0, self.grid);
             let zmesh = (sample_h(sm, n, cx, cy) - mn) * ZSCALE;
-            s = 2.0 * (b + zmesh);
+            s = ((b + zmesh) / t).clamp(0.0, smax);
         }
         // The ray inversion yields camera-rotated ("rp") coordinates, but the
         // pivot compensation in `step` needs a world point: undo the yaw here,
@@ -875,9 +900,9 @@ impl ApplicationHandler for App {
                     let dy = (pos.1 - prev.1) as f32;
                     if self.drag_rot && !self.shift {
                         if let Some(cam) = self.camera.as_mut() {
-                            cam.rotate_by(dx * 0.007);
+                            cam.rotate_by(dx * 0.005);
                             // vertical drag = camera tilt (top-down <-> level)
-                            cam.tilt_by(dy as f32 * 0.0045);
+                            cam.tilt_by(dy as f32 * 0.0020);
                         }
                     }
                     if self.drag_pan || (self.drag_rot && self.shift) {

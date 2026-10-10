@@ -1,0 +1,1222 @@
+//! Petersburg tenement generator (доходный дом, эклектика XIX в.) — a 3D port
+//! of the element set from E:/My/Clicker (Petersburg Generators):
+//! basement + piano nobile with rustication, windows with nalidniks / sandriks
+//! / arch tops, balconies with cast-iron railings, floor bands, crowning
+//! cornice, hipped / gabled iron roof with dormers, brick chimneys and a
+//! weather-vane, a grand entrance with a transom, steps, canopy and lanterns,
+//! drain pipes and anchor plates. Palette follows the Clicker project.
+//!
+//! Output: (ModelMesh, textures) — textures carry the per-house palette, so
+//! every building gets its own generated tile set.
+
+use crate::model::ModelMesh;
+use crate::procgen::{Builder, Rng};
+
+// ---------------------------------------------------------------- material --
+
+pub const M_WALL: u32 = 0; // plain plaster
+pub const M_RUST: u32 = 1; // rusticated stone
+pub const M_WIN: u32 = 2; // window, plain nalidnik
+pub const M_WIN_SANDRIK: u32 = 3; // parade window with sandrik
+pub const M_WIN_ARCH: u32 = 4; // arched window with keystone
+pub const M_BASE: u32 = 5; // basement stone
+pub const M_BASE_WIN: u32 = 6; // basement window with grille
+pub const M_DOOR: u32 = 7; // entrance door with transom
+pub const M_ROOF: u32 = 8; // iron roofing with seams
+pub const M_BRICK: u32 = 9; // brick chimney
+pub const M_IRON: u32 = 10; // solid cast iron (pipes, lanterns, anchors)
+pub const M_BAND: u32 = 11; // string course / cornice band
+pub const M_DORMER: u32 = 12; // dormer front
+pub const M_RAILING: u32 = 13; // balcony railing (alpha cut-out)
+pub const N_MATS: u32 = 14;
+
+pub const TEX_W: usize = 128; // 2 m at 64 px/m
+pub const TEX_H: usize = 192; // 3 m
+pub const TEX_S: usize = 128; // square tiles
+
+// ---------------------------------------------------------------- palette ---
+
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub wall: [u8; 3],
+    pub wall_light: [u8; 3],
+    pub rust_dark: [u8; 3],
+    pub basement: [u8; 3],
+    pub brick: [u8; 3],
+    pub brick_dark: [u8; 3],
+    pub roof: [u8; 3],
+    pub roof_hl: [u8; 3],
+    pub frame: [u8; 3],
+    pub glass: [u8; 3],
+    pub glass_hl: [u8; 3],
+    pub iron: [u8; 3],
+    pub gold: [u8; 3],
+    pub door: [u8; 3],
+}
+
+fn rgb(v: u32) -> [u8; 3] {
+    [
+        ((v >> 16) & 255) as u8,
+        ((v >> 8) & 255) as u8,
+        (v & 255) as u8,
+    ]
+}
+
+pub fn shift(c: [u8; 3], d: i32) -> [u8; 3] {
+    [
+        (c[0] as i32 + d).clamp(0, 255) as u8,
+        (c[1] as i32 + d).clamp(0, 255) as u8,
+        (c[2] as i32 + d).clamp(0, 255) as u8,
+    ]
+}
+
+impl Palette {
+    /// Clicker base palette (colors.ts) with a per-seed brightness shift.
+    /// The wall hue varies: ochre / rose / grey-green / terracotta / grey-blue.
+    fn new(r: &mut Rng) -> Palette {
+        let hues: [[u32; 2]; 5] = [
+            [0xd9c8a9, 0xe8dcc8], // ochre (Clicker base)
+            [0xd8b8a8, 0xe8d0c4], // rose
+            [0xc2c8bc, 0xd4d8cc], // grey-green
+            [0xc09070, 0xd0a888], // terracotta
+            [0xbcc6cc, 0xd0d8dc], // grey-blue
+        ];
+        let h = hues[r.below(5) as usize];
+        let d = r.below(25) as i32 - 12;
+        Palette {
+            wall: shift(rgb(h[0]), d),
+            wall_light: shift(rgb(h[1]), d),
+            rust_dark: shift(rgb(0x6e6557), d / 2),
+            basement: shift(rgb(0x7a7060), d / 2),
+            brick: shift(rgb(0x8b3a2a), d / 2),
+            brick_dark: shift(rgb(0x732d1b), d / 2),
+            roof: shift(rgb(0x5d7b6a), d / 2),
+            roof_hl: shift(rgb(0x6b8b78), d / 2),
+            frame: rgb(0x3a3028),
+            glass: shift(rgb(0x7ba4b5), d / 3),
+            glass_hl: rgb(0x8fb8c8),
+            iron: rgb(0x2d2d2d),
+            gold: rgb(0xc4a44a),
+            door: shift(rgb(0x4a3020), d / 3),
+        }
+    }
+}
+
+// ----------------------------------------------------------- texture utils --
+
+struct Img {
+    w: usize,
+    h: usize,
+    px: Vec<u8>,
+}
+
+impl Img {
+    fn new(w: usize, h: usize, c: [u8; 3]) -> Self {
+        let mut px = Vec::with_capacity(w * h * 4);
+        for _ in 0..w * h {
+            px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+        }
+        Img { w, h, px }
+    }
+    fn set(&mut self, x: i32, y: i32, c: [u8; 3]) {
+        if x < 0 || y < 0 || x >= self.w as i32 || y >= self.h as i32 {
+            return;
+        }
+        let i = ((y as usize) * self.w + x as usize) * 4;
+        self.px[i] = c[0];
+        self.px[i + 1] = c[1];
+        self.px[i + 2] = c[2];
+        self.px[i + 3] = 255;
+    }
+    fn rect(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, c: [u8; 3]) {
+        for y in y0..y1.max(y0) {
+            for x in x0..x1.max(x0) {
+                self.set(x, y, c);
+            }
+        }
+    }
+    fn line_h(&mut self, x0: i32, x1: i32, y: i32, c: [u8; 3]) {
+        for x in x0..x1.max(x0) {
+            self.set(x, y, c);
+        }
+    }
+    fn line_v(&mut self, x: i32, y0: i32, y1: i32, c: [u8; 3]) {
+        for y in y0..y1.max(y0) {
+            self.set(x, y, c);
+        }
+    }
+    fn noise(&mut self, r: &mut Rng, amp: i32) {
+        for i in 0..self.w * self.h {
+            let n = r.below((2 * amp + 1) as u32) as i32 - amp;
+            let o = i * 4;
+            for k in 0..3 {
+                self.px[o + k] = (self.px[o + k] as i32 + n).clamp(0, 255) as u8;
+            }
+        }
+    }
+}
+
+/// Horizontal rustication (stone courses) on any field colour.
+fn rusticate(img: &mut Img, base: [u8; 3], course: i32) {
+    let dark = shift(base, -58);
+    let light = shift(base, 30);
+    let mut y = course;
+    let mut off = 0;
+    while y < img.h as i32 {
+        img.line_h(0, img.w as i32, y, dark);
+        img.line_h(0, img.w as i32, y + 1, dark);
+        img.line_h(0, img.w as i32, y + 2, light);
+        img.line_h(0, img.w as i32, y + 3, light);
+        off ^= 24;
+        let mut x = off;
+        while x < img.w as i32 {
+            img.line_v(x, (y - course).max(0), y, dark);
+            img.line_v(x + 1, (y - course).max(0), y, dark);
+            x += 48;
+        }
+        y += course;
+    }
+}
+
+/// Draw one window into the tile (style: 0 plain, 1 sandrik, 2 arch,
+/// 3 basement grille, 4 none).
+fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
+    let w = img.w as i32;
+    let nl = shift(pal.wall_light, 22);
+    let edge = shift(base, -52);
+    let wx0 = 24;
+    let wx1 = w - 24; // 80 px = 1.25 m
+    let wy1 = img.h as i32 - 40; // sill 40 px above the floor line
+    let wy0 = match style {
+        0 => 62,
+        1 => 66,
+        2 => 58,
+        3 => img.h as i32 - 96,
+        _ => 62,
+    };
+    // nalidnik: bright band with a dark contour so it reads when zoomed out
+    if style != 3 {
+        img.rect(wx0 - 13, wy0 - 13, wx1 + 13, wy1 + 11, edge);
+        img.rect(wx0 - 11, wy0 - 11, wx1 + 11, wy1 + 9, nl);
+    }
+    // glass, gloss band, diagonal glint
+    img.rect(wx0, wy0, wx1, wy1, pal.glass);
+    let hl_x = wx0 + 12;
+    img.rect(hl_x, wy0, hl_x + 7, wy1, pal.glass_hl);
+    for k in 0..22 {
+        img.set(wx0 + 34 + k, wy0 + 30 - k, pal.glass_hl);
+        img.set(wx0 + 35 + k, wy0 + 30 - k, pal.glass_hl);
+    }
+    // frame + mullion + transom
+    let f = pal.frame;
+    img.rect(wx0, wy0, wx1, wy0 + 4, f);
+    img.rect(wx0, wy1 - 4, wx1, wy1, f);
+    img.rect(wx0, wy0, wx0 + 4, wy1, f);
+    img.rect(wx1 - 4, wy0, wx1, wy1, f);
+    let mid = (wx0 + wx1) / 2;
+    img.rect(mid - 2, wy0, mid + 2, wy1, f);
+    img.rect(wx0, wy0 + 34, wx1, wy0 + 38, f);
+    // sill: plate + drip shadow
+    img.rect(wx0 - 11, wy1, wx1 + 11, wy1 + 6, nl);
+    img.rect(wx0 - 11, wy1 + 6, wx1 + 11, wy1 + 9, edge);
+    if style == 1 {
+        // sandrik: white slab projecting past the nalidnik + shadow + consoles
+        img.rect(wx0 - 19, wy0 - 24, wx1 + 19, wy0 - 15, nl);
+        img.rect(wx0 - 19, wy0 - 15, wx1 + 19, wy0 - 10, edge);
+        img.rect(wx0 - 17, wy0 - 10, wx0 - 12, wy0 - 2, nl);
+        img.rect(wx1 + 12, wy0 - 10, wx1 + 17, wy0 - 2, nl);
+    }
+    if style == 2 {
+        // arch: round the top corners with stone wedges + keystone
+        for k in 0..12 {
+            let cut = ((12 - k) * 3) / 2;
+            img.rect(wx0, wy0 + k * 2, wx0 + 12 - cut, wy0 + k * 2 + 3, nl);
+            img.rect(wx1 - 12 + cut, wy0 + k * 2, wx1, wy0 + k * 2 + 3, nl);
+        }
+        img.rect(mid - 10, wy0 - 16, mid + 10, wy0 + 2, edge);
+        img.rect(mid - 8, wy0 - 14, mid + 8, wy0 + 2, nl);
+        img.rect(mid - 4, wy0 - 10, mid + 4, wy0, edge);
+    }
+    if style <= 2 {
+        // apron panel with a gold rosette under the sill
+        let ay0 = wy1 + 14;
+        img.rect(mid - 26, ay0, mid + 26, ay0 + 30, nl);
+        img.rect(mid - 22, ay0 + 4, mid + 22, ay0 + 26, shift(base, -8));
+        img.rect(mid - 3, ay0 + 9, mid + 3, ay0 + 21, pal.gold);
+        img.rect(mid - 8, ay0 + 13, mid + 8, ay0 + 17, pal.gold);
+    }
+    if style == 3 {
+        // basement grille bars
+        for k in 0..5 {
+            let x = wx0 + 8 + k * 12;
+            img.rect(x, wy0, x + 3, wy1, pal.iron);
+        }
+        img.rect(wx0, wy1 - 5, wx1, wy1, pal.iron);
+        img.rect(wx0, wy0, wx1, wy0 + 3, pal.iron);
+    }
+}
+
+/// One facade tile: field colour, optional rustication, optional window.
+fn tile_tex(
+    pal: &Palette,
+    base: [u8; 3],
+    win: Option<u32>,
+    rust_bg: bool,
+    r: &mut Rng,
+) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, base);
+    if rust_bg {
+        rusticate(&mut img, base, if base == pal.basement { 44 } else { 30 });
+    } else {
+        img.noise(r, 4);
+    }
+    if let Some(style) = win {
+        draw_window(&mut img, pal, base, style);
+    }
+    img.px
+}
+
+/// Entrance door: stone portal, two paneled leaves, arched radial transom,
+/// keystone, handle pair, lanterns on the reveals.
+fn door_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, pal.basement);
+    rusticate(&mut img, pal.basement, 44);
+    img.noise(r, 3);
+    let dx0 = 34;
+    let dx1 = TEX_W as i32 - 34; // 60 px = 0.95 m leaf pair
+    let dy1 = TEX_H as i32 - 16;
+    // stone portal
+    img.rect(dx0 - 12, 26, dx1 + 12, dy1 + 6, pal.wall_light);
+    img.rect(dx0 - 12, 26, dx0 - 6, dy1 + 6, pal.rust_dark);
+    // arched transom (semicircle by shrinking rows)
+    for k in 0..26 {
+        let cut = ((26 - k) as f32 * 0.62) as i32;
+        img.rect(dx0 + cut, 26 + k, dx1 - cut, 27 + k, pal.glass);
+    }
+    // radial glazing
+    let cx = (dx0 + dx1) / 2;
+    for ang in -4..=4i32 {
+        let mut x = cx;
+        let mut y = 50;
+        for _ in 0..10 {
+            img.set(x, y - 1, pal.frame);
+            img.set(x, y, pal.frame);
+            x += ang;
+            y -= 2;
+        }
+    }
+    img.rect(dx0, 48, dx1, 52, pal.frame);
+    // keystone
+    img.rect(cx - 8, 16, cx + 8, 30, pal.wall_light);
+    img.rect(cx - 4, 20, cx + 4, 28, pal.rust_dark);
+    // leaves
+    img.rect(dx0, 52, dx1, dy1, pal.door);
+    img.rect(cx - 2, 52, cx + 2, dy1, pal.frame);
+    for lx in [dx0 + 8, cx + 8] {
+        img.rect(lx, 60, lx + 18, 88, shift(pal.door, 14));
+        img.rect(lx, 96, lx + 18, 124, shift(pal.door, 14));
+        img.rect(lx + 2, 62, lx + 16, 86, shift(pal.door, -8));
+        img.rect(lx + 2, 98, lx + 16, 122, shift(pal.door, -8));
+    }
+    img.rect(cx - 10, 96, cx - 5, 104, pal.gold);
+    img.rect(cx + 5, 96, cx + 10, 104, pal.gold);
+    // lanterns beside the portal
+    for lx in [dx0 - 10, dx1 + 4] {
+        img.rect(lx, 56, lx + 6, 74, pal.iron);
+        img.rect(lx - 2, 64, lx + 8, 76, pal.gold);
+    }
+    img.px
+}
+
+fn roof_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, TEX_S, pal.roof);
+    img.noise(r, 5);
+    for x in (0..TEX_S as i32).step_by(24) {
+        img.line_v(x, 0, TEX_S as i32, shift(pal.roof, -18));
+        img.line_v(x + 1, 0, TEX_S as i32, pal.roof_hl);
+    }
+    img.line_h(0, TEX_S as i32, 4, pal.roof_hl);
+    img.px
+}
+
+fn brick_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, TEX_S, pal.brick);
+    img.noise(r, 6);
+    let mut y = 10;
+    let mut row = 0;
+    while y < TEX_S as i32 {
+        img.line_h(0, TEX_S as i32, y, pal.brick_dark);
+        let off = if row % 2 == 0 { 0 } else { 16 };
+        for x in (off..TEX_S as i32).step_by(32) {
+            img.line_v(x, y - 10, y, pal.brick_dark);
+        }
+        y += 10;
+        row += 1;
+    }
+    img.px
+}
+
+fn iron_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, TEX_S, pal.iron);
+    img.noise(r, 3);
+    img.px
+}
+
+/// Cast-iron balcony railing with an alpha cut-out: rails, balusters with a
+/// mid bulge, meander touches under the top rail. Rendered with the model
+/// shader's alpha test.
+fn railing_tex(pal: &Palette) -> Vec<u8> {
+    let h = 64usize;
+    let mut img = Img::new(TEX_S, h, [0, 0, 0]);
+    for i in 0..TEX_S * h {
+        img.px[i * 4 + 3] = 0;
+    }
+    let c = pal.iron;
+    fn put(img: &mut Img, x0: i32, y0: i32, x1: i32, y1: i32, col: [u8; 3]) {
+        for y in y0..y1 {
+            for x in x0..x1 {
+                if x >= 0 && y >= 0 && (x as usize) < img.w && (y as usize) < img.h {
+                    let i = ((y as usize) * img.w + x as usize) * 4;
+                    img.px[i] = col[0];
+                    img.px[i + 1] = col[1];
+                    img.px[i + 2] = col[2];
+                    img.px[i + 3] = 255;
+                }
+            }
+        }
+    }
+    put(&mut img, 0, 2, TEX_S as i32, 8, c);
+    put(&mut img, 0, 54, TEX_S as i32, 62, c);
+    for x in (6..TEX_S as i32).step_by(16) {
+        put(&mut img, x, 6, x + 4, 56, c);
+        put(&mut img, x - 2, 26, x + 6, 34, shift(c, 22));
+    }
+    for x in (0..TEX_S as i32).step_by(32) {
+        put(&mut img, x, 10, x + 10, 13, c);
+        put(&mut img, x + 10, 10, x + 13, 20, c);
+    }
+    img.px
+}
+
+fn band_tex(pal: &Palette) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, 32, pal.wall_light);
+    img.line_h(0, TEX_S as i32, 0, shift(pal.wall_light, -30));
+    img.line_h(0, TEX_S as i32, 20, shift(pal.wall_light, -20));
+    img.line_h(0, TEX_S as i32, 30, shift(pal.wall_light, -50));
+    img.px
+}
+
+fn dormer_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, TEX_S, pal.wall_light);
+    img.noise(r, 4);
+    // round window
+    let cx = TEX_S as i32 / 2;
+    for k in 0..22 {
+        for y in -22..22i32 {
+            if k * k + y * y <= 22 * 22 {
+                img.set(cx + k, 46 + y, pal.glass);
+                img.set(cx - k, 46 + y, pal.glass);
+            }
+        }
+    }
+    img.rect(cx - 3, 26, cx + 3, 66, pal.frame);
+    img.rect(cx - 20, 26, cx + 20, 30, pal.frame);
+    img.rect(cx - 20, 62, cx + 20, 66, pal.frame);
+    img.rect(0, 80, TEX_S as i32, 88, pal.wall_light);
+    img.rect(0, 78, TEX_S as i32, 80, shift(pal.wall_light, -30));
+    img.px
+}
+
+// ---------------------------------------------------------------- geometry --
+//
+// Quad winding used throughout: p0->p1 is edge u, p0->p2 edge v, normal
+// n = u x v must point away from the solid.
+
+struct Manor {
+    b: Builder,
+    pal: Palette,
+    w: f32,
+    d: f32,
+    heights: Vec<f32>,
+    y_band: Vec<f32>,
+    tiles: usize,
+    win_tiles: Vec<usize>,
+    door_tile: usize,
+}
+
+impl Manor {
+    fn wall_quad(&mut self, mat: u32, side: u8, t0: f32, t1: f32, y0: f32, y1: f32, x_or_z: f32) {
+        let p = match side {
+            // south (+z): u=+x
+            0 => [
+                [t0, y0, x_or_z],
+                [t1, y0, x_or_z],
+                [t1, y1, x_or_z],
+                [t0, y1, x_or_z],
+            ],
+            // north (-z): u=-x
+            1 => [
+                [t1, y0, x_or_z],
+                [t0, y0, x_or_z],
+                [t0, y1, x_or_z],
+                [t1, y1, x_or_z],
+            ],
+            // west (-x): u=+z
+            2 => [
+                [x_or_z, y0, t0],
+                [x_or_z, y0, t1],
+                [x_or_z, y1, t1],
+                [x_or_z, y1, t0],
+            ],
+            // east (+x): u=-z
+            _ => [
+                [x_or_z, y0, t1],
+                [x_or_z, y0, t0],
+                [x_or_z, y1, t0],
+                [x_or_z, y1, t1],
+            ],
+        };
+        let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+        self.b.quad(mat, p, uv);
+    }
+}
+
+/// Build one tenement house; returns the mesh plus its own palette textures.
+pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
+    let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
+    let pal = Palette::new(&mut r);
+
+    let tiles = [8usize, 10, 12][r.below(3) as usize]; // 16 / 20 / 24 m
+    let w = 2.0 * tiles as f32;
+    let d = [10.0f32, 11.0, 12.0][r.below(3) as usize];
+    let upper = 2 + r.below(3); // 2..4 upper floors → 4..6 storeys with basement
+    let mut heights = vec![2.6f32, 3.9];
+    for k in 0..upper {
+        heights.push(3.4 - 0.25 * k as f32);
+    }
+    let win_start = r.below(2) as usize;
+    let win_tiles: Vec<usize> = (win_start..tiles).step_by(2).collect();
+    let door_tile = win_tiles[win_tiles.len() / 2];
+
+    let mut m = Manor {
+        b: Builder::new(),
+        pal,
+        w,
+        d,
+        heights,
+        y_band: Vec::new(),
+        tiles,
+        win_tiles,
+        door_tile,
+    };
+    m.build(&mut r);
+    let texs = m.textures();
+    let mesh = m.b.finish(N_MATS);
+    (mesh, texs)
+}
+
+impl Manor {
+    fn build(&mut self, r: &mut Rng) {
+        let tiles = self.tiles;
+        let w = self.w;
+        let d = self.d;
+        let n_floors = self.heights.len();
+
+        // ---- walls, per floor, per 2 m tile ------------------------------
+        let mut y = 0.0f32;
+        for fi in 0..n_floors {
+            let fh = self.heights[fi];
+            let (mat_wall, mat_win) = match fi {
+                0 => (M_BASE, M_BASE_WIN),
+                1 => (
+                    M_RUST,
+                    if r.f() < 0.55 {
+                        M_WIN_SANDRIK
+                    } else {
+                        M_WIN_ARCH
+                    },
+                ),
+                _ => (M_WALL, M_WIN),
+            };
+            // south (front)
+            for t in 0..tiles {
+                let x0 = 2.0 * t as f32;
+                let mat = if fi == 0 && t == self.door_tile {
+                    M_DOOR
+                } else if self.win_tiles.contains(&t) && !(fi == 0 && t == self.door_tile) {
+                    if fi == 1 && t == self.door_tile {
+                        mat_wall // above the entrance keep it plain
+                    } else {
+                        mat_win
+                    }
+                } else {
+                    mat_wall
+                };
+                self.wall_quad(mat, 0, x0, x0 + 2.0, y, y + fh, d);
+            }
+            // north (back): windows on every other axis, plain
+            for t in 0..tiles {
+                let x0 = 2.0 * t as f32;
+                let mat = if self.win_tiles.contains(&t) {
+                    mat_win
+                } else {
+                    mat_wall
+                };
+                self.wall_quad(mat, 1, x0, x0 + 2.0, y, y + fh, 0.0);
+            }
+            // ends: a window near the middle of each floor
+            let dts = (d / 2.0).floor() as usize;
+            for t in 0..dts {
+                let z0 = 2.0 * t as f32;
+                let mat = if t == dts / 2 {
+                    mat_win
+                } else {
+                    mat_wall
+                };
+                self.wall_quad(mat, 2, z0, z0 + 2.0, y, y + fh, 0.0);
+                self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
+            }
+            y += fh;
+            self.y_band.push(y);
+        }
+        let y_wall_top = y;
+
+        // ---- string courses between floors + stepped crowning cornice -----
+        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32| {
+            let a = 0.0f32;
+            // south
+            b.quad(
+                M_BAND,
+                [
+                    [-a, yy - 0.10, d + out],
+                    [w + a, yy - 0.10, d + out],
+                    [w + a, yy + 0.14, d + out],
+                    [-a, yy + 0.14, d + out],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
+            );
+            // north
+            b.quad(
+                M_BAND,
+                [
+                    [w + a, yy - 0.10, -out],
+                    [-a, yy - 0.10, -out],
+                    [-a, yy + 0.14, -out],
+                    [w + a, yy + 0.14, -out],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
+            );
+            // west
+            b.quad(
+                M_BAND,
+                [
+                    [-out, yy - 0.10, -a],
+                    [-out, yy - 0.10, d + a],
+                    [-out, yy + 0.14, d + a],
+                    [-out, yy + 0.14, -a],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, 1.0], [0.0, 1.0]],
+            );
+            // east
+            b.quad(
+                M_BAND,
+                [
+                    [w + out, yy - 0.10, d + a],
+                    [w + out, yy - 0.10, -a],
+                    [w + out, yy + 0.14, -a],
+                    [w + out, yy + 0.14, d + a],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, 1.0], [0.0, 1.0]],
+            );
+        };
+        for k in 1..self.y_band.len() {
+            band(&mut self.b, self.y_band[k], 0.10, w, d);
+        }
+        // crowning cornice: two stepped bands overhanging the wall
+        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d);
+        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d);
+
+        // ---- balconies ----------------------------------------------------
+        let balcony_floor = if r.f() < 0.75 { Some(2usize) } else { None };
+        if let Some(bf) = balcony_floor {
+            if bf < n_floors {
+                let y0: f32 = self.heights[..bf].iter().sum();
+                for (wi, &wt) in self.win_tiles.iter().enumerate() {
+                    if wi % 2 == 1 && self.win_tiles.len() > 2 {
+                        continue;
+                    }
+                    if bf == 1 && wt == self.door_tile {
+                        continue;
+                    }
+                    let xc = 2.0 * wt as f32 + 1.0;
+                    let x0 = xc - 1.15;
+                    let x1 = xc + 1.15;
+                    let z_out = d + 0.95;
+                    // slab top
+                    self.b.quad(
+                        M_IRON,
+                        [
+                            [x0, y0 + 0.18, d],
+                            [x0, y0 + 0.18, z_out],
+                            [x1, y0 + 0.18, z_out],
+                            [x1, y0 + 0.18, d],
+                        ],
+                        [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                    );
+                    // slab underside
+                    self.b.quad(
+                        M_IRON,
+                        [
+                            [x0, y0 + 0.02, z_out],
+                            [x0, y0 + 0.02, d],
+                            [x1, y0 + 0.02, d],
+                            [x1, y0 + 0.02, z_out],
+                        ],
+                        [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                    );
+                    // slab front fascia
+                    self.b.quad(
+                        M_IRON,
+                        [
+                            [x0, y0 + 0.02, z_out],
+                            [x1, y0 + 0.02, z_out],
+                            [x1, y0 + 0.18, z_out],
+                            [x0, y0 + 0.18, z_out],
+                        ],
+                        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    );
+                    // corbels
+                    for cx_ in [x0 + 0.12, x1 - 0.12] {
+                        self.b.quad(
+                            M_IRON,
+                            [
+                                [cx_ - 0.06, y0 - 0.55, d],
+                                [cx_ + 0.06, y0 - 0.55, d],
+                                [cx_ + 0.06, y0 + 0.02, d + 0.75],
+                                [cx_ - 0.06, y0 + 0.02, d + 0.75],
+                            ],
+                            [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                        );
+                    }
+                    // railings (alpha texture): front + two sides
+                    let rh = 1.05f32;
+                    let rail = |b: &mut Builder, p: [[f32; 3]; 4], u: f32| {
+                        b.quad(M_RAILING, p, [[0.0, 0.0], [u, 0.0], [u, 1.0], [0.0, 1.0]]);
+                    };
+                    rail(
+                        &mut self.b,
+                        [
+                            [x0, y0 + 0.18, z_out],
+                            [x1, y0 + 0.18, z_out],
+                            [x1, y0 + 0.18 + rh, z_out],
+                            [x0, y0 + 0.18 + rh, z_out],
+                        ],
+                        1.4,
+                    );
+                    rail(
+                        &mut self.b,
+                        [
+                            [x0, y0 + 0.18, d],
+                            [x0, y0 + 0.18, z_out],
+                            [x0, y0 + 0.18 + rh, z_out],
+                            [x0, y0 + 0.18 + rh, d],
+                        ],
+                        0.6,
+                    );
+                    rail(
+                        &mut self.b,
+                        [
+                            [x1, y0 + 0.18, z_out],
+                            [x1, y0 + 0.18, d],
+                            [x1, y0 + 0.18 + rh, d],
+                            [x1, y0 + 0.18 + rh, z_out],
+                        ],
+                        0.6,
+                    );
+                }
+            }
+        }
+
+        // ---- porch: steps, canopy on brackets, lanterns -------------------
+        {
+            let dt = self.door_tile;
+            let xc = 2.0 * dt as f32 + 1.0;
+            // three steps rising to the door
+            for s in 0..3 {
+                let sw = 1.9 - 0.18 * s as f32;
+                let zh0 = d + 0.30 * (3 - s) as f32;
+                let zh1 = zh0 + 0.30;
+                let yh = 0.14 * (s + 1) as f32;
+                self.b.quad(
+                    M_BASE,
+                    [
+                        [xc - sw, yh, zh1],
+                        [xc + sw, yh, zh1],
+                        [xc + sw, yh + 0.16, zh1],
+                        [xc - sw, yh + 0.16, zh1],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
+            // canopy slab over the entrance + brackets
+            let can_y = self.heights[0] + 0.55;
+            self.b.quad(
+                M_BAND,
+                [
+                    [xc - 1.6, can_y + 0.14, d],
+                    [xc - 1.6, can_y + 0.14, d + 1.25],
+                    [xc + 1.6, can_y + 0.14, d + 1.25],
+                    [xc + 1.6, can_y + 0.14, d],
+                ],
+                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+            );
+            self.b.quad(
+                M_BAND,
+                [
+                    [xc - 1.6, can_y, d + 1.25],
+                    [xc + 1.6, can_y, d + 1.25],
+                    [xc + 1.6, can_y + 0.14, d + 1.25],
+                    [xc - 1.6, can_y + 0.14, d + 1.25],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            );
+            for bx in [xc - 1.3, xc + 1.3] {
+                self.b.quad(
+                    M_IRON,
+                    [
+                        [bx - 0.06, can_y - 0.85, d],
+                        [bx + 0.06, can_y - 0.85, d],
+                        [bx + 0.06, can_y, d + 0.9],
+                        [bx - 0.06, can_y, d + 0.9],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
+            // wall lanterns beside the door
+            for lx in [xc - 1.35, xc + 1.35] {
+                let ly = 2.2f32;
+                self.b.quad(
+                    M_IRON,
+                    [
+                        [lx - 0.09, ly - 0.2, d + 0.42],
+                        [lx + 0.09, ly - 0.2, d + 0.42],
+                        [lx + 0.09, ly + 0.2, d + 0.42],
+                        [lx - 0.09, ly + 0.2, d + 0.42],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
+        }
+
+        // ---- roof ---------------------------------------------------------
+        let rh = if r.f() < 0.5 { 3.6 } else { 4.2 };
+        let y1 = y_wall_top + rh;
+        let hipped = r.f() < 0.6;
+        let zm = d / 2.0;
+        let inset = if hipped { (d * 0.42).min(w * 0.28) } else { 0.0 };
+        let roof_uv = |len: f32, dep: f32| {
+            [
+                [0.0, 0.0],
+                [len / 2.0, 0.0],
+                [len / 2.0, dep / 2.0],
+                [0.0, dep / 2.0],
+            ]
+        };
+        if hipped {
+            // south slope
+            self.b.quad(
+                M_ROOF,
+                [
+                    [-0.25, y_wall_top, d + 0.35],
+                    [w + 0.25, y_wall_top, d + 0.35],
+                    [w - inset, y1, zm],
+                    [inset, y1, zm],
+                ],
+                roof_uv(w, d / 2.0),
+            );
+            // north slope
+            self.b.quad(
+                M_ROOF,
+                [
+                    [w + 0.25, y_wall_top, -0.35],
+                    [-0.25, y_wall_top, -0.35],
+                    [inset, y1, zm],
+                    [w - inset, y1, zm],
+                ],
+                roof_uv(w, d / 2.0),
+            );
+            // west hip
+            self.b.tri(
+                M_ROOF,
+                [
+                    [-0.25, y_wall_top, d + 0.35],
+                    [-0.25, y_wall_top, -0.35],
+                    [inset, y1, zm],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.6]],
+            );
+            // east hip
+            self.b.tri(
+                M_ROOF,
+                [
+                    [w + 0.25, y_wall_top, -0.35],
+                    [w + 0.25, y_wall_top, d + 0.35],
+                    [w - inset, y1, zm],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.6]],
+            );
+        } else {
+            // gable: two full slopes + gable walls at the ends
+            self.b.quad(
+                M_ROOF,
+                [
+                    [-0.25, y_wall_top, d + 0.35],
+                    [w + 0.25, y_wall_top, d + 0.35],
+                    [w + 0.25, y1, zm],
+                    [-0.25, y1, zm],
+                ],
+                roof_uv(w, d / 2.0),
+            );
+            self.b.quad(
+                M_ROOF,
+                [
+                    [w + 0.25, y_wall_top, -0.35],
+                    [-0.25, y_wall_top, -0.35],
+                    [-0.25, y1, zm],
+                    [w + 0.25, y1, zm],
+                ],
+                roof_uv(w, d / 2.0),
+            );
+            self.b.tri(
+                M_WALL,
+                [
+                    [-0.02, y_wall_top, -0.02],
+                    [-0.02, y_wall_top, d + 0.02],
+                    [-0.02, y1 - 0.15, zm],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.0]],
+            );
+            self.b.tri(
+                M_WALL,
+                [
+                    [w + 0.02, y_wall_top, d + 0.02],
+                    [w + 0.02, y_wall_top, -0.02],
+                    [w + 0.02, y1 - 0.15, zm],
+                ],
+                [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.0]],
+            );
+        }
+
+        // ---- chimneys ------------------------------------------------------
+        let chimneys = if n_floors <= 4 { 1 } else { 2 };
+        for c in 0..chimneys {
+            let cx = if chimneys == 1 {
+                w * 0.5
+            } else {
+                w * (0.28 + 0.44 * c as f32)
+            };
+            chimney(&mut self.b, cx, zm, y1 - 0.4, 1.7, 0.38);
+        }
+
+        // ---- dormers on the front slope -------------------------------------
+        {
+            let dormers = if tiles >= 10 { 3 } else { 2 };
+            for i in 0..dormers {
+                let dx = w * (i as f32 + 1.0) / (dormers as f32 + 1.0);
+                let t = 0.45f32;
+                let dz = (d + 0.35) - (d + 0.35 - zm) * t;
+                let dy = y_wall_top + rh * t;
+                dormer(&mut self.b, dx, dz, dy);
+            }
+        }
+
+        // ---- weather-vane on the ridge end ----------------------------------
+        if r.f() < 0.6 {
+            let vx = inset;
+            let vy0 = y1 - 0.3;
+            let vy1 = y1 + 1.6;
+            self.b.quad(
+                M_IRON,
+                [
+                    [vx - 0.04, vy0, zm - 0.04],
+                    [vx + 0.04, vy0, zm - 0.04],
+                    [vx + 0.04, vy1, zm - 0.04],
+                    [vx - 0.04, vy1, zm - 0.04],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 4.0], [0.0, 4.0]],
+            );
+            self.b.quad(
+                M_IRON,
+                [
+                    [vx, vy1 - 0.35, zm - 0.04],
+                    [vx, vy1 - 0.35, zm + 0.51],
+                    [vx, vy1 + 0.05, zm + 0.26],
+                    [vx, vy1 + 0.05, zm - 0.04],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [0.7, 1.0], [0.0, 1.0]],
+            );
+        }
+
+        // ---- drain pipes ----------------------------------------------------
+        for px_ in [0.30f32, w - 0.30] {
+            let py0 = 0.15;
+            let py1 = y_wall_top + 0.12;
+            let zc = d + 0.10;
+            let hh = 0.10;
+            // south face
+            self.b.quad(
+                M_IRON,
+                [
+                    [px_ - hh, py0, zc + hh],
+                    [px_ + hh, py0, zc + hh],
+                    [px_ + hh, py1, zc + hh],
+                    [px_ - hh, py1, zc + hh],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 8.0], [0.0, 8.0]],
+            );
+            // north face
+            self.b.quad(
+                M_IRON,
+                [
+                    [px_ + hh, py0, zc - hh],
+                    [px_ - hh, py0, zc - hh],
+                    [px_ - hh, py1, zc - hh],
+                    [px_ + hh, py1, zc - hh],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 8.0], [0.0, 8.0]],
+            );
+            // east face
+            self.b.quad(
+                M_IRON,
+                [
+                    [px_ + hh, py0, zc + hh],
+                    [px_ + hh, py0, zc - hh],
+                    [px_ + hh, py1, zc - hh],
+                    [px_ + hh, py1, zc + hh],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 8.0], [0.0, 8.0]],
+            );
+            // west face
+            self.b.quad(
+                M_IRON,
+                [
+                    [px_ - hh, py0, zc - hh],
+                    [px_ - hh, py0, zc + hh],
+                    [px_ - hh, py1, zc + hh],
+                    [px_ - hh, py1, zc - hh],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 8.0], [0.0, 8.0]],
+            );
+            // funnel
+            self.b.quad(
+                M_IRON,
+                [
+                    [px_ - 0.13, py1, zc + 0.02],
+                    [px_ + 0.13, py1, zc + 0.02],
+                    [px_ + 0.13, py1 + 0.3, zc + 0.02],
+                    [px_ - 0.13, py1 + 0.3, zc + 0.02],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            );
+        }
+
+        // ---- pavement strip along the front facade -----------------------------
+        {
+            let x0 = -1.5f32;
+            let x1 = w + 1.5;
+            let z0 = d + 0.05;
+            let z1 = d + 2.2;
+            let yy = 0.03f32;
+            self.b.quad(
+                M_BASE,
+                [
+                    [x0, yy, z1],
+                    [x1, yy, z1],
+                    [x1, yy, z0],
+                    [x0, yy, z0],
+                ],
+                [
+                    [0.0, 0.0],
+                    [(x1 - x0) / 2.0, 0.0],
+                    [(x1 - x0) / 2.0, 1.0],
+                    [0.0, 1.0],
+                ],
+            );
+        }
+
+        // ---- anchor plates on the facade --------------------------------------
+        for k in 0..n_floors.saturating_sub(1) {
+            let yy = (self.y_band[k] - 1.4).max(1.2);
+            for ax in [1.0f32, w - 1.0] {
+                self.b.quad(
+                    M_IRON,
+                    [
+                        [ax - 0.14, yy - 0.14, d + 0.03],
+                        [ax + 0.14, yy - 0.14, d + 0.03],
+                        [ax + 0.14, yy + 0.14, d + 0.03],
+                        [ax - 0.14, yy + 0.14, d + 0.03],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
+        }
+    }
+
+    /// All 14 house textures in material-slot order.
+    fn textures(&self) -> Vec<(u32, u32, Vec<u8>)> {
+        let pal = self.pal;
+        let mut rr = Rng::new(0x7E57_0000 ^ ((self.tiles as u64) << 8) ^ self.heights.len() as u64);
+        let wall = pal.wall;
+        let base = pal.basement;
+        vec![
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, false, &mut rr)), // 0 M_WALL
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, true, &mut rr)),  // 1 M_RUST
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(0), false, &mut rr)), // 2 M_WIN
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(1), true, &mut rr)), // 3 M_WIN_SANDRIK
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(2), true, &mut rr)), // 4 M_WIN_ARCH
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, None, true, &mut rr)), // 5 M_BASE
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, Some(3), true, &mut rr)), // 6 M_BASE_WIN
+            (TEX_W as u32, TEX_H as u32, door_tex(&pal, &mut rr)),                    // 7 M_DOOR
+            (TEX_S as u32, TEX_S as u32, roof_tex(&pal, &mut rr)),                    // 8 M_ROOF
+            (TEX_S as u32, TEX_S as u32, brick_tex(&pal, &mut rr)),                   // 9 M_BRICK
+            (TEX_S as u32, TEX_S as u32, iron_tex(&pal, &mut rr)),                    // 10 M_IRON
+            (TEX_S as u32, 32, band_tex(&pal)),                                       // 11 M_BAND
+            (TEX_S as u32, TEX_S as u32, dormer_tex(&pal, &mut rr)),                  // 12 M_DORMER
+            (TEX_S as u32, 64, railing_tex(&pal)),                                    // 13 M_RAILING (alpha)
+        ]
+    }
+}
+
+/// Brick chimney with a crown cap.
+fn chimney(b: &mut Builder, x: f32, z: f32, y0: f32, h: f32, a: f32) {
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let (x0, x1, z0, z1) = (x - a, x + a, z - a, z + a);
+    let y1 = y0 + h;
+    b.quad(M_BRICK, [[x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1]], uv);
+    b.quad(M_BRICK, [[x1, y0, z0], [x0, y0, z0], [x0, y1, z0], [x1, y1, z0]], uv);
+    b.quad(M_BRICK, [[x1, y0, z1], [x1, y0, z0], [x1, y1, z0], [x1, y1, z1]], uv);
+    b.quad(M_BRICK, [[x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0]], uv);
+    b.quad(M_BRICK, [[x0, y1, z0], [x0, y1, z1], [x1, y1, z1], [x1, y1, z0]], uv);
+    // crown cap
+    let c = a + 0.14;
+    let y2 = y1 + 0.22;
+    b.quad(
+        M_BRICK,
+        [
+            [x - c, y1, z + c],
+            [x + c, y1, z + c],
+            [x + c, y2, z + c],
+            [x - c, y2, z + c],
+        ],
+        uv,
+    );
+    b.quad(
+        M_BRICK,
+        [
+            [x + c, y1, z - c],
+            [x - c, y1, z - c],
+            [x - c, y2, z - c],
+            [x + c, y2, z - c],
+        ],
+        uv,
+    );
+    b.quad(
+        M_BRICK,
+        [
+            [x + c, y1, z + c],
+            [x + c, y1, z - c],
+            [x + c, y2, z - c],
+            [x + c, y2, z + c],
+        ],
+        uv,
+    );
+    b.quad(
+        M_BRICK,
+        [
+            [x - c, y1, z - c],
+            [x - c, y1, z + c],
+            [x - c, y2, z + c],
+            [x - c, y2, z - c],
+        ],
+        uv,
+    );
+    b.quad(
+        M_BRICK,
+        [
+            [x - c, y2, z - c],
+            [x - c, y2, z + c],
+            [x + c, y2, z + c],
+            [x + c, y2, z - c],
+        ],
+        uv,
+    );
+}
+
+/// Small dormer: body with a window, a little gabled roof.
+fn dormer(b: &mut Builder, x: f32, z: f32, y0: f32) {
+    let w = 0.55f32;
+    let dep = 0.5f32;
+    let h = 1.0f32;
+    let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    // front face with the dormer texture (round window)
+    b.quad(
+        M_DORMER,
+        [
+            [x - w, y0, z + dep],
+            [x + w, y0, z + dep],
+            [x + w, y0 + h, z + dep],
+            [x - w, y0 + h, z + dep],
+        ],
+        uv,
+    );
+    // sides
+    b.quad(
+        M_WALL,
+        [
+            [x - w, y0, z],
+            [x - w, y0, z + dep],
+            [x - w, y0 + h, z + dep],
+            [x - w, y0 + h, z],
+        ],
+        uv,
+    );
+    b.quad(
+        M_WALL,
+        [
+            [x + w, y0, z + dep],
+            [x + w, y0, z],
+            [x + w, y0 + h, z],
+            [x + w, y0 + h, z + dep],
+        ],
+        uv,
+    );
+    // little gable roof: front slope + two cheeks
+    let zc = z + dep / 2.0;
+    b.tri(
+        M_ROOF,
+        [
+            [x - w - 0.08, y0 + h, z + dep + 0.08],
+            [x + w + 0.08, y0 + h, z + dep + 0.08],
+            [x, y0 + h + 0.5, zc],
+        ],
+        [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+    );
+    b.tri(
+        M_ROOF,
+        [
+            [x - w - 0.08, y0 + h, z + dep + 0.08],
+            [x, y0 + h + 0.5, zc],
+            [x - w - 0.08, y0 + h, z - 0.02],
+        ],
+        [[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]],
+    );
+    b.tri(
+        M_ROOF,
+        [
+            [x + w + 0.08, y0 + h, z + dep + 0.08],
+            [x + w + 0.08, y0 + h, z - 0.02],
+            [x, y0 + h + 0.5, zc],
+        ],
+        [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+    );
+}

@@ -38,6 +38,7 @@ use std::io;
 use bytemuck::{Pod, Zeroable};
 
 pub mod model;
+pub mod piter;
 pub mod road;
 pub mod assets;
 pub mod procgen;
