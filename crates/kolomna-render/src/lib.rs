@@ -102,7 +102,8 @@ pub struct Params {
     pub pivot: f32,
     /// water plane height in mesh units — filled by TerrainRenderer::set_params
     pub _pad0: f32,
-    pub _pad1: f32,
+    /// camera tilt = sin(elevation); see Params docs
+    pub tilt: f32,
     pub _pad2: f32,
 }
 
@@ -117,7 +118,8 @@ struct Params {
     pivot: f32,
     // water plane height in mesh units (set by the renderer)
     water_z: f32,
-    pad1: f32,
+    /// camera tilt = sin(elevation): 0.5 = 2:1 iso, 1.0 = top-down, 0.0 = level
+    tilt: f32,
     pad2: f32,
 };
 @group(0) @binding(0) var<uniform> params: Params;
@@ -140,14 +142,16 @@ fn vs_main(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) w
     let ca = cos(params.angle);
     let sa = sin(params.angle);
     let rp = vec2<f32>(d.x * ca - d.y * sa, d.x * sa + d.y * ca) + vec2<f32>(params.pivot);
-    let iso = vec2<f32>((rp.x - rp.y) * 0.5, (rp.x + rp.y) * 0.25 - p.z * params.hz);
+    let iso = vec2<f32>((rp.x - rp.y) * 0.5, (rp.x + rp.y) * (0.5 * params.tilt) - p.z * params.hz);
     let scr = (iso - params.center) * params.scale;
     let ndc = vec2<f32>(scr.x / params.half.x, -scr.y / params.half.y);
     // True view depth: the iso camera looks along (1, 1, 0.5) in rotated mesh
     // space, so a surface is closer to the eye when dot(rp.xy + z*0.5) is
     // LARGER. Monotone along the whole view ray -> overlapping fragments get
     // distinct depths (no tie lottery -> no flicker, no water through slopes).
-    let dep = (rp.x + rp.y + p.z * 0.5) * (0.9 / (4.0 * params.pivot + 40.0));
+    let ce = sqrt(max(1.0 - params.tilt * params.tilt, 0.01));
+    let tk = params.tilt / ce;
+    let dep = (rp.x + rp.y + p.z * tk) * (0.9 / (4.0 * params.pivot + 40.0));
     o.pos = vec4<f32>(ndc.x, ndc.y, 0.95 - dep, 1.0);
     o.uv = uv;
     o.wpos = p;
@@ -859,10 +863,16 @@ impl TerrainRenderer {
 
 /// Default camera params that frame the whole grid (same framing as before).
 pub fn default_params(w: f32, h: f32, grid: f32, zspan: f32) -> Params {
-    let vspan = grid * 0.5 + zspan;
+    // debug hook so `--shot` can render tilt variants from the shell
+    let tilt = std::env::var("KOLOMNA_TILT")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
+    let vspan = grid * 0.5 * tilt + zspan;
     let scale = ((w - 60.0) / grid).min((h - 60.0) / vspan);
     Params {
-        center: [0.0, grid * 0.25 - zspan * 0.5],
+        center: [0.0, grid * 0.5 * tilt - zspan * 0.5],
         scale,
         hz: 1.0,
         half: [w / 2.0, h / 2.0],
@@ -870,7 +880,7 @@ pub fn default_params(w: f32, h: f32, grid: f32, zspan: f32) -> Params {
         time: 0.0,
         pivot: grid * 0.5,
         _pad0: 0.0,
-        _pad1: 0.0,
+        tilt: tilt,
         _pad2: 0.0,
     }
 }

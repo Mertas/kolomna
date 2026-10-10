@@ -37,7 +37,7 @@ const EDGE_MAX_PX_PER_S: f32 = 700.0;
 /// edge-scrolling activation margin (px)
 const EDGE_PX: f64 = 36.0;
 const ZOOM_MIN: f32 = 0.12;
-const ZOOM_MAX: f32 = 12.0;
+const ZOOM_MAX: f32 = 100.0;
 
 // ---------------------------------------------------------------- scene ----
 
@@ -214,8 +214,19 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
             spin: 0.0,
         });
     }
+    let tilt = std::env::var("KOLOMNA_TILT")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
     let view = scene.village.get(scene.village.len() / 2).map(|(_, _, p)| {
-        ([(p[0] - p[1]) * 0.5, (p[0] + p[1]) * 0.25 - p[2] - 0.4], 0.0)
+        (
+            [
+                (p[0] - p[1]) * 0.5,
+                (p[0] + p[1]) * (0.5 * tilt) - p[2] - 0.4,
+            ],
+            0.0,
+        )
     });
     let rgba = kolomna_render::model::render_scene_with_models(
         VIEW_W,
@@ -229,8 +240,8 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         scene.wl,
         view,
         &placed,
-        Some(&scene.road_mesh),
-        &scene.road_textures,
+        None,
+        &[],
     )?;
     write_png(out, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out}");
@@ -252,6 +263,12 @@ struct Camera {
     pivot: [f32; 2],
     /// grid side (cells) — pivot compensation needs it
     grid: f32,
+    /// camera tilt = sin(elevation): 0.5 = 2:1 iso, 1.0 = top-down,
+    /// 0.0 = straight ahead; vertical middle-drag drives it
+    tilt: f32,
+    tilt_target: f32,
+    /// last `tilt` the pivot compensation was applied at
+    tilt_applied: f32,
     /// smoothed pan velocity (screen px/s)
     vel: [f32; 2],
     /// seconds since start (water shimmer)
@@ -267,6 +284,9 @@ impl Camera {
             rot: 0.0,
             rot_target: 0.0,
             rot_applied: 0.0,
+            tilt: 0.5,
+            tilt_target: 0.5,
+            tilt_applied: 0.5,
             pivot: [grid * 0.5, grid * 0.5],
             grid,
             vel: [0.0; 2],
@@ -284,6 +304,12 @@ impl Camera {
 
     fn rotate_by(&mut self, delta: f32) {
         self.rot_target += delta;
+    }
+
+    /// Middle-drag up/down: 0.5 = the classic 2:1 iso view, up to 1.0
+    /// (straight down) and down to 0.0 (level, houses seen from the side).
+    fn tilt_by(&mut self, delta: f32) {
+        self.tilt_target = (self.tilt_target + delta).clamp(0.0, 1.0);
     }
 
     /// Pan by a screen-space mouse delta (px).
@@ -363,6 +389,14 @@ impl Camera {
             self.target[1] += (dd[0] + dd[1]) * 0.25;
             self.rot_applied = self.rot;
         }
+        // eased tilt; the pivot point keeps its screen spot while tilting
+        let kt = 1.0 - (-14.0 * dt).exp();
+        self.tilt += (self.tilt_target - self.tilt) * kt;
+        if (self.tilt - self.tilt_applied).abs() > 1e-6 {
+            let p = (self.pivot[0] + self.pivot[1]) * 0.5;
+            self.target[1] += p * (self.tilt - self.tilt_applied);
+            self.tilt_applied = self.tilt;
+        }
         self.time += dt;
     }
 
@@ -377,7 +411,7 @@ impl Camera {
             pivot: grid * 0.5,
             // the water plane height is filled by TerrainRenderer::set_params
             _pad0: 0.0,
-            _pad1: 0.0,
+            tilt: self.tilt,
             _pad2: 0.0,
         }
     }
@@ -407,7 +441,17 @@ impl Camera {
             let zmesh = (sample_h(sm, n, cx, cy) - mn) * ZSCALE;
             s = 2.0 * (b + zmesh);
         }
-        self.pivot = [(s + a).clamp(0.0, self.grid), (s - a).clamp(0.0, self.grid)];
+        // The ray inversion yields camera-rotated ("rp") coordinates, but the
+        // pivot compensation in `step` needs a world point: undo the yaw here,
+        // otherwise every rotation after the first orbits a wrong spot.
+        let rp = [s + a, s - a];
+        let c = self.grid * 0.5;
+        let (sr, cr) = self.rot.sin_cos();
+        let d = [rp[0] - c, rp[1] - c];
+        self.pivot = [
+            (c + d[0] * cr + d[1] * sr).clamp(0.0, self.grid),
+            (c - d[0] * sr + d[1] * cr).clamp(0.0, self.grid),
+        ];
     }
 }
 
@@ -590,7 +634,6 @@ impl Renderer {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
         self.terrain.set_params(&self.queue, &params);
-        self.road.set_params(&self.queue, &params);
         // camera quadrant -> house orientation index: the model rotates with
         // the camera in 90° steps (its rot is compensated by -angle in the
         // shader, so the picked facade always faces the screen)
@@ -656,7 +699,6 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
-            self.road.draw(&mut pass);
             self.models[k].draw(&mut pass);
             for r in &self.village {
                 r.draw(&mut pass);
@@ -834,6 +876,8 @@ impl ApplicationHandler for App {
                     if self.drag_rot && !self.shift {
                         if let Some(cam) = self.camera.as_mut() {
                             cam.rotate_by(dx * 0.007);
+                            // vertical drag = camera tilt (top-down <-> level)
+                            cam.tilt_by(dy as f32 * 0.0045);
                         }
                     }
                     if self.drag_pan || (self.drag_rot && self.shift) {

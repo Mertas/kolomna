@@ -31,7 +31,8 @@ struct Params {
     time: f32,
     pivot: f32,
     water_z: f32,
-    pad1: f32,
+    /// camera tilt = sin(elevation)
+    tilt: f32,
     pad2: f32,
 };
 struct ModelParams {
@@ -69,10 +70,12 @@ fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) 
     let ca = cos(params.angle);
     let sa = sin(params.angle);
     let rp = vec2<f32>(d.x * ca - d.y * sa, d.x * sa + d.y * ca) + vec2<f32>(params.pivot);
-    let iso = vec2<f32>((rp.x - rp.y) * 0.5, (rp.x + rp.y) * 0.25 - wz * params.hz);
+    let iso = vec2<f32>((rp.x - rp.y) * 0.5, (rp.x + rp.y) * (0.5 * params.tilt) - wz * params.hz);
     let scr = (iso - params.center) * params.scale;
     let ndc = vec2<f32>(scr.x / params.half.x, -scr.y / params.half.y);
-    let dep = (rp.x + rp.y + wz * 0.5) * (0.9 / (4.0 * params.pivot + 40.0));
+    let ce = sqrt(max(1.0 - params.tilt * params.tilt, 0.01));
+    let tk = params.tilt / ce;
+    let dep = (rp.x + rp.y + wz * tk) * (0.9 / (4.0 * params.pivot + 40.0));
     var o: VsOut;
     o.pos = vec4<f32>(ndc.x, ndc.y, 0.95 - dep, 1.0);
     o.uv = uv;
@@ -572,6 +575,12 @@ pub fn render_scene_with_models(
     let terrain = TerrainRenderer::new(&device, &queue, format, sample_count, layers, verts, mn, wl);
     let mut params = crate::default_params(w as f32, h as f32, grid, zspan);
     params.scale *= zoom;
+    if std::env::var("KOLOMNA_DEBUG").is_ok() {
+        eprintln!(
+            "params: center={:?} scale={:.3} tilt={:.3} grid={grid} zspan={zspan:.2} zoom={zoom}",
+            params.center, params.scale, params.tilt
+        );
+    }
     if let Some((center, angle)) = view {
         params.center = center;
         params.angle = angle;
