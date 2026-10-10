@@ -284,7 +284,7 @@ fn door_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     img.noise(r, 3);
     let dx0 = 34;
     let dx1 = TEX_W as i32 - 34; // 60 px = 0.95 m leaf pair
-    let dy1 = TEX_H as i32 - 16;
+    let dy1 = TEX_H as i32 - 10;
     // stone portal
     img.rect(dx0 - 12, 26, dx1 + 12, dy1 + 6, pal.wall_light);
     img.rect(dx0 - 12, 26, dx0 - 6, dy1 + 6, pal.rust_dark);
@@ -488,7 +488,7 @@ pub fn generate_manor(seed: u64) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
 
     let tiles = [8usize, 10, 12][r.below(3) as usize]; // 16 / 20 / 24 m
     let w = 2.0 * tiles as f32;
-    let d = [10.0f32, 11.0, 12.0][r.below(3) as usize];
+    let d = [10.0f32, 12.0][r.below(2) as usize];
     let upper = 2 + r.below(3); // 2..4 upper floors → 4..6 storeys with basement
     let mut heights = vec![2.6f32, 3.9];
     for k in 0..upper {
@@ -748,7 +748,7 @@ impl Manor {
                 let zh1 = zh0 + 0.30;
                 let yh = 0.14 * (s + 1) as f32;
                 self.b.quad(
-                    M_BASE,
+                    M_BAND,
                     [
                         [xc - sw, yh, zh1],
                         [xc + sw, yh, zh1],
@@ -794,14 +794,14 @@ impl Manor {
             }
             // wall lanterns beside the door
             for lx in [xc - 1.35, xc + 1.35] {
-                let ly = 2.2f32;
+                let ly = 2.5f32;
                 self.b.quad(
                     M_IRON,
                     [
-                        [lx - 0.09, ly - 0.2, d + 0.42],
-                        [lx + 0.09, ly - 0.2, d + 0.42],
-                        [lx + 0.09, ly + 0.2, d + 0.42],
-                        [lx - 0.09, ly + 0.2, d + 0.42],
+                        [lx - 0.14, ly - 0.28, d + 0.42],
+                        [lx + 0.14, ly - 0.28, d + 0.42],
+                        [lx + 0.14, ly + 0.28, d + 0.42],
+                        [lx - 0.14, ly + 0.28, d + 0.42],
                     ],
                     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                 );

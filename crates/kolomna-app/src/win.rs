@@ -16,8 +16,8 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kolomna_render::assets::{fsh_rgba_search, mesh3d_from_dat};
-use kolomna_render::model::{mesh_from_mesh3d, ModelMesh, ModelRenderer, PlacedModel};
+use kolomna_render::assets::fsh_rgba_search;
+use kolomna_render::model::{ModelMesh, ModelRenderer, PlacedModel};
 use kolomna_render::road::{build_road_mesh, load_road_tiles, RoadMesh, RoadRenderer};
 use kolomna_render::{
     Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, load_atlas,
@@ -58,13 +58,7 @@ pub struct Scene {
     /// road network from the save (16 m tiles)
     road_mesh: RoadMesh,
     road_textures: Vec<(u32, u32, Vec<u8>)>,
-    /// house models (Z5, R$ house family): four camera orientations — the
-    /// they swap as the view rotates by 90° steps
-    model_meshes: Vec<ModelMesh>,
-    model_texture_sets: Vec<Vec<(u32, u32, Vec<u8>)>>,
-    model_pos: [f32; 3],
-    model_rot: f32,
-    /// procedural village (Foundation-style houses) along the road
+    /// generated Petersburg tenements (mesh, textures, ground position)
     village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])>,
 }
 
@@ -96,28 +90,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     }
     println!("road textures: {}", road_textures.len());
 
-    // ---- house: all four Z5 orientations (0x00/0x10/0x20/0x30).
-    // buildings are four rotated copies; they swap when the camera
-    // rotates, so the visible facades always face the viewer
-    let s1 = sibling(dat, "data1.dat");
-    let mut model_meshes: Vec<ModelMesh> = Vec::new();
-    let mut model_texture_sets: Vec<Vec<(u32, u32, Vec<u8>)>> = Vec::new();
-    for inst in [0x00ad0400u32, 0x00ad0410, 0x00ad0420, 0x00ad0430] {
-        let mesh3d = mesh3d_from_dat(&s1, 0x5ad0e817, 0xbadb57f1, inst)?;
-        let mesh = mesh_from_mesh3d(&mesh3d);
-        let mut texs = Vec::new();
-        for id in &mesh.texture_ids {
-            texs.push(fsh_rgba_search(dat, *id)?);
-        }
-        println!(
-            "house {inst:08x}: {} verts, {} indices, tex {:08x?}",
-            mesh.verts.len(),
-            mesh.indices.len(),
-            mesh.texture_ids
-        );
-        model_meshes.push(mesh);
-        model_texture_sets.push(texs);
-    }
+    // (The 3DMD house family is retired from the scene — the focus is now the
+    // generated Petersburg tenements; the 3DMD parser stays for the examples.)
     let t = &tiles[tiles.len() / 2];
     let alt = (t.verts[0][1] + t.verts[2][1]) * 0.5;
     let model_pos = [
@@ -139,8 +113,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         model_pos[0], model_pos[1]
     );
 
-    // ---- a small procedural village (Foundation-style) along the road
-    let ptex = kolomna_render::procgen::textures();
+    // ---- the Petersburg street: only the freshly generated tenements
     let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3])> = Vec::new();
     let mut dx = t.verts[1][0] - t.verts[0][0];
     let mut dz = t.verts[1][2] - t.verts[0][2];
@@ -152,21 +125,9 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         let j = z.round().clamp(0.0, (n - 1) as f32) as usize;
         (sm[j * n + i] - mn) * ZSCALE
     };
-    for k in 0..6u32 {
-        let along = (k as f32 - 2.5) * 0.85;
-        let side = if k % 2 == 0 { 1.55 } else { -1.55 };
-        let gx = model_pos[0] + dx * along - dz * side;
-        let gz = model_pos[1] + dz * along + dx * side;
-        let hz2 = height_cell(gx, gz);
-        village.push((
-            kolomna_render::procgen::generate_house(9000 + k as u64 * 7),
-            ptex.clone(),
-            [gx, gz, hz2 + 0.02],
-        ));
-    }
     // ---- a street of Petersburg tenements (доходные дома, E:/My/Clicker) ----
-    for k in 0..3u32 {
-        let along = (k as f32 - 1.0) * 2.6;
+    for k in 0..4u32 {
+        let along = (k as f32 - 1.5) * 2.6;
         let side: f32 = -4.8;
         let gx = model_pos[0] + dx * along - dz * side;
         let gz = model_pos[1] + dz * along + dx * side;
@@ -174,10 +135,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         let (mesh, texs) = kolomna_render::piter::generate_manor(7100 + k as u64 * 31);
         village.push((mesh, texs, [gx, gz, hz2 + 0.02]));
     }
-    println!(
-        "village: {} houses (6 cottages + 3 Petersburg tenements)",
-        village.len()
-    );
+    println!("village: {} Petersburg tenements", village.len());
 
     Ok(Scene {
         base,
@@ -190,34 +148,15 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         n,
         road_mesh,
         road_textures,
-        model_meshes,
-        model_texture_sets,
-        model_pos,
-        model_rot: 0.0,
         village,
     })
-}
-
-/// Sibling archive in the same folder (data1.dat next to data2.dat).
-fn sibling(any_dat: &str, name: &str) -> String {
-    std::path::Path::new(any_dat)
-        .parent()
-        .map(|p| p.join(name).to_string_lossy().into_owned())
-        .unwrap_or_else(|| name.to_string())
 }
 
 /// Headless mode: render exactly one frame offscreen with the default camera
 /// (`zoom` scales the framing; 1.0 = whole grid) and write it as a PNG.
 pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     let scene = load_scene(city, dat)?;
-    let house = PlacedModel {
-        mesh: &scene.model_meshes[0],
-        textures: &scene.model_texture_sets[0],
-        pos: scene.model_pos,
-        rot: scene.model_rot,
-        spin: 1.0,
-    };
-    let mut placed = vec![house];
+    let mut placed = Vec::new();
     for (mesh, texs, pos) in &scene.village {
         placed.push(PlacedModel {
             mesh,
@@ -232,18 +171,31 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.5)
         .clamp(0.0, 1.0);
+    let angle = std::env::var("KOLOMNA_ANGLE")
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+        .unwrap_or(0.0);
     let view = scene
         .village
         .get(scene.village.len().saturating_sub(2))
         .map(|(_, _, p)| {
-        (
-            [
-                (p[0] - p[1]) * 0.5,
-                (p[0] + p[1]) * (0.5 * tilt) - p[2] - 0.4,
-            ],
-            0.0,
-        )
-    });
+            // the shader rotates world points about the grid centre before the
+            // iso projection — rotate the anchor the same way, or a frame with
+            // a non-zero angle aims at the wrong place (empty ground).
+            let c = scene.grid * 0.5;
+            let (sa, ca) = angle.sin_cos();
+            let d = [p[0] - c, p[1] - c];
+            let rx = c + d[0] * ca - d[1] * sa;
+            let rz = c + d[0] * sa + d[1] * ca;
+            (
+                [
+                    (rx - rz) * 0.5,
+                    // + ~half the tenement height: keeps a ~17 m house centred
+                    (rx + rz) * (0.5 * tilt) - p[2] - 0.55,
+                ],
+                angle,
+            )
+        });
     let rgba = kolomna_render::model::render_scene_with_models(
         VIEW_W,
         VIEW_H,
@@ -409,11 +361,18 @@ impl Camera {
             self.target[1] += (dd[0] + dd[1]) * (0.5 * t);
             self.rot_applied = self.rot;
         }
-        // eased tilt; the pivot point keeps its screen spot while tilting
+        // eased tilt; the view reclines about the ground point under the
+        // SCREEN CENTRE (the OrbitControls convention: the focus point keeps
+        // its screen spot). Anchoring on the click pivot instead made close
+        // views swing hard — any offset from the cursor got stretched by
+        // (x + y) * dtilt and the whole street flew off at high zoom.
         let kt = 1.0 - (-14.0 * dt).exp();
         self.tilt += (self.tilt_target - self.tilt) * kt;
         if (self.tilt - self.tilt_applied).abs() > 1e-6 {
-            let p = (self.pivot[0] + self.pivot[1]) * 0.5;
+            // sy = (x + y) * 0.5 * tilt - z  =>  the ground point held in the
+            // screen centre has (x + y) * 0.5 = target[1] / tilt
+            let t0 = self.tilt_applied.max(0.07);
+            let p = (self.target[1] / t0).clamp(-2.0 * self.grid, 2.0 * self.grid);
             self.target[1] += p * (self.tilt - self.tilt_applied);
             self.tilt_applied = self.tilt;
         }
@@ -539,7 +498,6 @@ struct Renderer {
     config: wgpu::SurfaceConfiguration,
     terrain: TerrainRenderer,
     road: RoadRenderer,
-    models: Vec<ModelRenderer>,
     village: Vec<ModelRenderer>,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -602,15 +560,6 @@ impl Renderer {
             &scene.road_mesh,
             &scene.road_textures,
         );
-        let models: Vec<ModelRenderer> = scene
-            .model_meshes
-            .iter()
-            .zip(scene.model_texture_sets.iter())
-            .map(|(mesh, texs)| {
-                ModelRenderer::new(&device, &queue, config.format, 4, mesh, texs)
-            })
-            .collect();
-
         let village: Vec<ModelRenderer> = scene
             .village
             .iter()
@@ -629,7 +578,6 @@ impl Renderer {
             config,
             terrain,
             road,
-            models,
             village,
             msaa_view,
             depth_view,
@@ -659,14 +607,6 @@ impl Renderer {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
         self.terrain.set_params(&self.queue, &params);
-        // camera quadrant -> house orientation index: the model rotates with
-        // the camera in 90° steps (its rot is compensated by -angle in the
-        // shader, so the picked facade always faces the screen)
-        let k = ((params.angle / std::f32::consts::FRAC_PI_2).round() as i64).rem_euclid(4)
-            as usize;
-        let m = &self.models[k];
-        m.set_params(&self.queue, &params);
-        m.set_placement(&self.queue, scene.model_pos, scene.model_rot, 1.0);
         for r in &self.village {
             r.set_params(&self.queue, &params);
         }
@@ -724,7 +664,6 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
-            self.models[k].draw(&mut pass);
             for r in &self.village {
                 r.draw(&mut pass);
             }
@@ -901,8 +840,13 @@ impl ApplicationHandler for App {
                     if self.drag_rot && !self.shift {
                         if let Some(cam) = self.camera.as_mut() {
                             cam.rotate_by(dx * 0.005);
-                            // vertical drag = camera tilt (top-down <-> level)
-                            cam.tilt_by(dy as f32 * 0.0020);
+                            // vertical drag = camera tilt (top-down <-> level);
+                            // the closer the camera, the softer the tilt — the
+                            // on-screen motion of any point scales with (x + y),
+                            // which explodes at high zoom (OrbitControls-style
+                            // zoom-dependent damping).
+                            let soft = (12.0 / cam.zoom).clamp(0.25, 1.0);
+                            cam.tilt_by(dy as f32 * 0.0020 * soft);
                         }
                     }
                     if self.drag_pan || (self.drag_rot && self.shift) {
