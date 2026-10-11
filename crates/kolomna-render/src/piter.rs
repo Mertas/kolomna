@@ -998,12 +998,61 @@ impl Manor {
         self.b.quad(mat, p, uv);
     }
 
+    /// Like [`wall_quad`] but with an explicit u range so sub-tile strips
+    /// (bay margins, piers) show the wall texture at its natural 2 m scale
+    /// instead of stretching the whole tile into the strip.
+    fn wall_quad_uv(
+        &mut self,
+        mat: u32,
+        side: u8,
+        t0: f32,
+        t1: f32,
+        y0: f32,
+        y1: f32,
+        x_or_z: f32,
+        u0: f32,
+        u1: f32,
+    ) {
+        let p = match side {
+            // south (+z): u=+x
+            0 => [
+                [t0, y0, x_or_z],
+                [t1, y0, x_or_z],
+                [t1, y1, x_or_z],
+                [t0, y1, x_or_z],
+            ],
+            // north (-z): u=-x
+            1 => [
+                [t1, y0, x_or_z],
+                [t0, y0, x_or_z],
+                [t0, y1, x_or_z],
+                [t1, y1, x_or_z],
+            ],
+            // west (-x): u=+z
+            2 => [
+                [x_or_z, y0, t0],
+                [x_or_z, y0, t1],
+                [x_or_z, y1, t1],
+                [x_or_z, y1, t0],
+            ],
+            // east (+x): u=-z
+            _ => [
+                [x_or_z, y0, t1],
+                [x_or_z, y0, t0],
+                [x_or_z, y1, t0],
+                [x_or_z, y1, t1],
+            ],
+        };
+        let uv = [[u0, 0.0], [u1, 0.0], [u1, 1.0], [u0, 1.0]];
+        self.b.quad(mat, p, uv);
+    }
+
     /// Bay windows (эркеры) flanking the entrance: the nearest free 4 m span
     /// on each side of the door zone becomes a projection of the upper floors
     /// (0.85 m deep) on rusticated cheeks, with a closed underside on three
     /// corbels and a small cornice cap just under the eaves. The built spans
     /// are recorded in `bay_x` so balconies stay off the bays.
-    fn erkers(&mut self) {
+    fn erkers(&mut self, r: &mut Rng) {
         let tiles = self.tiles;
         if tiles < 8 {
             return; // too narrow to flank the entrance with bays
@@ -1020,32 +1069,51 @@ impl Manor {
             }
             true
         };
+        // every wall tile the span [x0, x1) touches must be free
+        let fits = |x0: f32, x1: f32| -> bool {
+            let t0 = (x0 / 2.0).floor().max(0.0) as usize;
+            let t1 = ((x1 - 1e-3) / 2.0).floor() as usize;
+            t0 >= 1 && t1 + 1 < tiles && (t0..=t1).all(clear)
+        };
+        // bays flank the entrance flush against its jamb; the width is
+        // picked at random among the spans that fit, so narrow and wide
+        // bays mix along a facade (a wider bay takes two windows per
+        // floor, a narrow one — a single window)
         let mut bays: Vec<(f32, f32)> = Vec::new();
-        // nearest free 2-tile span left of the entrance, walking outward
-        // (spans may sit right next to the door tile — that is where bays
-        // belong; the arch and the corner keep their distance)
-        if dt >= 3 {
-            let mut t = dt - 2;
-            loop {
-                if clear(t) && clear(t + 1) {
-                    bays.push((2.0 * t as f32, 2.0 * (t + 2) as f32));
-                    break;
-                }
-                if t <= 1 {
-                    break;
-                }
-                t -= 1;
-            }
+        let widths = [6.4f32, 5.8, 5.2, 4.6, 4.0, 3.6];
+        let x_door = 2.0 * dt as f32;
+        // left of the entrance: the right edge sits flush on the door jamb
+        let cand: Vec<f32> = widths
+            .iter()
+            .copied()
+            .filter(|&bw| fits(x_door - bw, x_door))
+            .collect();
+        if !cand.is_empty() {
+            // half the time take the widest span that fits (those take two
+            // windows), the rest of the time any one — so both narrow and
+            // wide bays show up
+            let bw = if r.f() < 0.5 {
+                cand[0]
+            } else {
+                cand[r.below(cand.len() as u32) as usize]
+            };
+            bays.push((x_door - bw, x_door));
         }
-        // ... and on the right, one free tile to the corner
-        for t in dt + 1..=tiles.saturating_sub(3) {
-            if clear(t) && clear(t + 1) {
-                bays.push((2.0 * t as f32, 2.0 * (t + 2) as f32));
-                break;
-            }
+        // right of the entrance: the left edge sits flush on the right jamb
+        let xr = x_door + 2.0;
+        let cand: Vec<f32> = widths
+            .iter()
+            .copied()
+            .filter(|&bw| fits(xr, xr + bw))
+            .collect();
+        if !cand.is_empty() {
+            let bw = if r.f() < 0.5 {
+                cand[0]
+            } else {
+                cand[r.below(cand.len() as u32) as usize]
+            };
+            bays.push((xr, xr + bw));
         }
-        let dep = 0.85f32;
-        let zf = self.d + dep;
         let y0 = self.heights[0] + self.heights[1];
         let y_top: f32 = self.heights.iter().sum::<f32>() - 0.25; // under the eaves
         if y_top <= y0 + 0.8 || bays.is_empty() {
@@ -1058,18 +1126,42 @@ impl Manor {
         );
         let heights = self.heights.clone(); // avoid an immutable self borrow
         for &(bx0, bx1) in &bays {
-            // front: one window tile per 2 m per upper floor
+            // the bay depth varies a little from house to house
+            let dep = 0.75 + 0.1 * r.below(3) as f32;
+            let zf = self.d + dep;
+            // front: one window per floor on a narrow bay, two on a wide
+            // one; the margins and the pier between the windows show the
+            // wall texture at its natural 2 m scale
+            let bw = bx1 - bx0;
+            let two = bw >= 5.5;
+            let lo = bw - if two { 4.0 } else { 2.0 };
+            let (m, pier) = if two {
+                (lo / 4.0, lo / 2.0)
+            } else {
+                (lo / 2.0, 0.0)
+            };
             let mut y = 0.0f32;
             for (fi, fh) in heights.iter().enumerate() {
                 if fi >= 2 {
-                    let mwin = if fi == 2 { M_WIN_SANDRIK } else { M_WIN };
+                    let mwin = if fi == 2 && r.f() < 0.6 {
+                        M_WIN_SANDRIK
+                    } else {
+                        M_WIN
+                    };
                     let ye = (y + fh).min(y_top);
                     if ye > y + 0.05 {
-                        let mut x = bx0;
-                        while x < bx1 - 1e-3 {
-                            self.wall_quad(mwin, 0, x, x + 2.0, y, ye, zf);
-                            x += 2.0;
+                        let mut xx = bx0;
+                        self.wall_quad_uv(M_WALL, 0, xx, xx + m, y, ye, zf, 0.0, m / 2.0);
+                        xx += m;
+                        self.wall_quad_uv(mwin, 0, xx, xx + 2.0, y, ye, zf, 0.0, 1.0);
+                        xx += 2.0;
+                        if two {
+                            self.wall_quad_uv(M_WALL, 0, xx, xx + pier, y, ye, zf, 0.0, pier / 2.0);
+                            xx += pier;
+                            self.wall_quad_uv(mwin, 0, xx, xx + 2.0, y, ye, zf, 0.0, 1.0);
+                            xx += 2.0;
                         }
+                        self.wall_quad_uv(M_WALL, 0, xx, bx1, y, ye, zf, 0.0, (bx1 - xx) / 2.0);
                     }
                 }
                 y += fh;
@@ -1266,7 +1358,7 @@ impl Manor {
         // no porch, no bays on its street facade (user's rule)
         let no_parade = self.arch.is_some() && !self.roman;
         if self.bays && !self.roman && self.arch.is_none() {
-            self.erkers();
+            self.erkers(r);
         }
 
         // ---- walls, per floor, per 2 m tile ------------------------------
