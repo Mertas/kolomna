@@ -429,11 +429,38 @@ fn blob(b: &mut Builder, ctx: &Ctx, c: [f32; 3], r: f32, mat: u32, uvm: f32, rng
 
 fn tree(b: &mut Builder, ctx: &Ctx, u: f32, v: f32, s: f32, rng: &mut Rng) {
     let h = ctx.hh(u, v);
-    cyl(b, ctx, [u, v], 0.26 * s, 0.17 * s, h - 0.2, h + 2.3 * s, 7, M_BARK, 1.6);
-    blob(b, ctx, ctx.pt(u, v, h + 3.1 * s), 1.55 * s, M_LEAF, 3.0, rng);
-    let dx = rng.range(-0.5, 0.5) * s;
-    let dz = rng.range(-0.5, 0.5) * s;
-    blob(b, ctx, ctx.pt(u + dx, v + dz, h + 4.15 * s), 1.15 * s, M_LEAF, 3.0, rng);
+    // three crown types: broad linden, tall narrow, medium - all jittered
+    let variant = rng.below(3);
+    let trunk_top = match variant {
+        0 => 2.35,
+        1 => 3.05,
+        _ => 2.6,
+    };
+    cyl(b, ctx, [u, v], 0.27 * s, 0.16 * s, h - 0.2, h + trunk_top * s, 7, M_BARK, 1.6);
+    let base = h + trunk_top * s;
+    match variant {
+        0 => {
+            blob(b, ctx, ctx.pt(u, v, base + 0.85 * s), 1.62 * s, M_LEAF, 3.0, rng);
+            for _ in 0..2 {
+                let dx = rng.range(-0.8, 0.8) * s;
+                let dz = rng.range(-0.8, 0.8) * s;
+                let dzz = rng.range(-0.15, 0.35) * s;
+                blob(b, ctx, ctx.pt(u + dx, v + dz, base + 1.55 * s + dzz), 1.02 * s, M_LEAF, 3.0, rng);
+            }
+        }
+        1 => {
+            blob(b, ctx, ctx.pt(u, v, base + 1.15 * s), 1.32 * s, M_LEAF, 3.0, rng);
+            blob(b, ctx, ctx.pt(u, v, base + 2.30 * s), 1.08 * s, M_LEAF, 3.0, rng);
+            let dx = rng.range(-0.3, 0.3) * s;
+            blob(b, ctx, ctx.pt(u + dx, v, base + 3.20 * s), 0.72 * s, M_LEAF, 3.0, rng);
+        }
+        _ => {
+            blob(b, ctx, ctx.pt(u, v, base + 0.95 * s), 1.50 * s, M_LEAF, 3.0, rng);
+            let dx = rng.range(-0.55, 0.55) * s;
+            let dz = rng.range(-0.55, 0.55) * s;
+            blob(b, ctx, ctx.pt(u + dx, v + dz, base + 1.90 * s), 0.95 * s, M_LEAF, 3.0, rng);
+        }
+    }
 }
 
 fn hedge(b: &mut Builder, ctx: &Ctx, a: [f32; 2], e: [f32; 2], hgt: f32) {
@@ -457,35 +484,46 @@ fn bench(b: &mut Builder, ctx: &Ctx, p: [f32; 2], face: [f32; 2]) {
     let t = perp(face);
     let h = ctx.hh(p[0], p[1]);
     let q = |t_off: f32, f_off: f32| -> [f32; 2] { add(p, add(mul(t, t_off), mul(face, f_off))) };
-    // legs (iron)
+    // legs (iron): two ends + a middle support
+    for s in [-0.82f32, 0.0, 0.82] {
+        let w2 = if s == 0.0 { 0.34 } else { 0.5 };
+        obb(b, ctx, q(s - 0.03, -0.24), q(s + 0.03, 0.24), w2, h - 0.2, h + 0.44, M_IRON, 0.8);
+    }
     for s in [-0.82f32, 0.82] {
-        obb(b, ctx, q(s - 0.03, -0.24), q(s + 0.03, 0.24), 0.5, h - 0.2, h + 0.44, M_IRON, 0.8);
         // back posts
         obb(b, ctx, q(s - 0.03, 0.20), q(s + 0.03, 0.26), 0.1, h + 0.44, h + 1.0, M_IRON, 0.8);
     }
-    // seat slats (painted wood)
-    for f in [-0.19f32, -0.05, 0.09] {
-        obb(b, ctx, q(-0.9, f - 0.055), q(0.9, f + 0.055), 0.11, h + 0.44, h + 0.49, M_BENCH, 1.2);
+    // seat slats (painted wood), four planks with gaps
+    for f in [-0.195f32, -0.065, 0.065, 0.195] {
+        obb(b, ctx, q(-0.9, f - 0.052), q(0.9, f + 0.052), 0.104, h + 0.44, h + 0.49, M_BENCH, 1.2);
     }
-    // back slats
-    for (z0, z1) in [(0.68f32, 0.78f32), (0.86, 0.96)] {
+    // back slats (three)
+    for (z0, z1) in [(0.62f32, 0.70f32), (0.79, 0.87), (0.93, 1.0)] {
         obb(b, ctx, q(-0.9, 0.235), q(0.9, 0.295), 0.09, h + z0, h + z1, M_BENCH, 1.2);
     }
 }
 
 fn urn(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     let h = ctx.hh(p[0], p[1]);
-    obb(b, ctx, [p[0] - 0.14, p[1]], [p[0] + 0.14, p[1]], 0.28, h - 0.15, h + 0.30, M_IRON, 0.8);
-    cyl(b, ctx, p, 0.26, 0.30, h + 0.30, h + 0.34, 8, M_IRON, 0.8);
-    cyl(b, ctx, p, 0.30, 0.21, h + 0.34, h + 0.66, 8, M_IRON, 0.8);
-    cyl(b, ctx, p, 0.24, 0.26, h + 0.66, h + 0.76, 8, M_IRON, 0.8);
+    cyl(b, ctx, p, 0.17, 0.14, h - 0.15, h + 0.18, 8, M_IRON, 0.8);
+    cyl(b, ctx, p, 0.13, 0.10, h + 0.18, h + 0.34, 8, M_IRON, 0.8);
+    cyl(b, ctx, p, 0.27, 0.31, h + 0.34, h + 0.38, 10, M_IRON, 0.8);
+    cyl(b, ctx, p, 0.31, 0.20, h + 0.38, h + 0.68, 10, M_IRON, 0.8);
+    cyl(b, ctx, p, 0.23, 0.26, h + 0.68, h + 0.78, 10, M_IRON, 0.8);
+    // two small handles on the bowl
+    for s in [-1.0f32, 1.0] {
+        let q = [p[0] + s * 0.30, p[1]];
+        cyl(b, ctx, q, 0.045, 0.045, h + 0.40, h + 0.62, 5, M_IRON, 0.6);
+        cyl(b, ctx, [p[0] + s * 0.26, p[1]], 0.035, 0.035, h + 0.60, h + 0.66, 4, M_IRON, 0.5);
+    }
 }
 
 fn lantern(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     let h = ctx.hh(p[0], p[1]);
     obb(b, ctx, [p[0] - 0.19, p[1]], [p[0] + 0.19, p[1]], 0.38, h - 0.25, h + 0.42, M_GRANITE, 0.9);
-    cyl(b, ctx, p, 0.10, 0.07, h + 0.42, h + 2.45, 8, M_IRON, 1.0);
-    cyl(b, ctx, p, 0.13, 0.11, h + 2.45, h + 2.52, 8, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.10, 0.07, h + 0.42, h + 2.52, 8, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.155, 0.135, h + 1.30, h + 1.40, 8, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.135, 0.115, h + 2.52, h + 2.60, 8, M_IRON, 1.0);
     // glazed body
     let g = |j: usize| -> [f32; 3] {
         let a = j as f32 / 4.0 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_4;
@@ -501,17 +539,17 @@ fn lantern(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
         b.quad(
             M_LAMP,
             [
-                ctx.pt(q0[0], q0[1], h + 2.52),
-                ctx.pt(q1[0], q1[1], h + 2.52),
-                ctx.pt(q1[0], q1[1], h + 2.95),
-                ctx.pt(q0[0], q0[1], h + 2.95),
+                ctx.pt(q0[0], q0[1], h + 2.60),
+                ctx.pt(q1[0], q1[1], h + 2.60),
+                ctx.pt(q1[0], q1[1], h + 3.10),
+                ctx.pt(q0[0], q0[1], h + 3.10),
             ],
-            [[0.0, 0.0], [0.34, 0.0], [0.34, 0.43], [0.0, 0.43]],
+            [[0.0, 0.0], [0.34, 0.0], [0.34, 0.53], [0.0, 0.53]],
         );
     }
     // roof + finial
-    cyl(b, ctx, p, 0.24, 0.05, h + 2.95, h + 3.16, 4, M_IRON, 1.0);
-    blob(b, ctx, ctx.pt(p[0], p[1], h + 3.2), 0.06, M_IRON, 0.5, &mut Rng::new(7));
+    cyl(b, ctx, p, 0.26, 0.05, h + 3.10, h + 3.34, 4, M_IRON, 1.0);
+    blob(b, ctx, ctx.pt(p[0], p[1], h + 3.38), 0.06, M_IRON, 0.5, &mut Rng::new(7));
 }
 
 fn bust(b: &mut Builder, ctx: &Ctx, p: [f32; 2], face: [f32; 2]) {
@@ -845,6 +883,205 @@ fn fence_edge(b: &mut Builder, ctx: &Ctx, a: [f32; 2], e: [f32; 2], gate: Option
     }
 }
 
+// ------------------------------------------------------------------- layout ---
+
+/// Occupancy of the park plan: paths / hedges / the fence are bands
+/// (segments with a half-width), objects are discs. Every piece of furniture
+/// is placed only where `free` says so, so nothing can overlap a path, a
+/// hedge or already-placed furniture.
+struct Occ {
+    discs: Vec<([f32; 2], f32)>,
+    /// keep-clear zones: block furniture like discs, but they are allowed to
+    /// touch path bands (a clearing always opens onto its alley)
+    soft: Vec<bool>,
+    /// tall objects (lanterns, statues): a tree crown must not swallow them,
+    /// so trees alone keep this extra clearance
+    talls: Vec<([f32; 2], f32)>,
+    /// (a, e, half-width, is_path): paths and the fence are `true`, hedge
+    /// runs are `false` - hedges must not block each other, but nothing
+    /// may be placed on a path
+    segs: Vec<([f32; 2], [f32; 2], f32, bool)>,
+}
+
+impl Occ {
+    fn new() -> Self {
+        Self { discs: Vec::new(), soft: Vec::new(), talls: Vec::new(), segs: Vec::new() }
+    }
+    fn disc(&mut self, p: [f32; 2], r: f32) {
+        self.discs.push((p, r));
+        self.soft.push(false);
+    }
+    fn disc_soft(&mut self, p: [f32; 2], r: f32) {
+        self.discs.push((p, r));
+        self.soft.push(true);
+    }
+    fn seg(&mut self, a: [f32; 2], e: [f32; 2], hw: f32) {
+        self.segs.push((a, e, hw, true));
+    }
+    fn hedge_seg(&mut self, a: [f32; 2], e: [f32; 2], hw: f32) {
+        self.segs.push((a, e, hw, false));
+    }
+    fn dist_seg(p: [f32; 2], a: [f32; 2], e: [f32; 2]) -> f32 {
+        let d = sub(e, a);
+        let l2 = d[0] * d[0] + d[1] * d[1];
+        let t = if l2 > 1e-6 {
+            (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        (a[0] + d[0] * t - p[0]).hypot(a[1] + d[1] * t - p[1])
+    }
+    fn free(&self, p: [f32; 2], r: f32) -> bool {
+        for (q, rr) in &self.discs {
+            if (q[0] - p[0]).hypot(q[1] - p[1]) < rr + r {
+                return false;
+            }
+        }
+        for (a, e, hw, _) in &self.segs {
+            if Self::dist_seg(p, *a, *e) < hw + r {
+                return false;
+            }
+        }
+        true
+    }
+    /// Only the paths matter (hedges may touch each other but never a path)
+    fn free_of_paths(&self, p: [f32; 2], r: f32) -> bool {
+        for (a, e, hw, is_path) in &self.segs {
+            if *is_path && Self::dist_seg(p, *a, *e) < hw + r {
+                return false;
+            }
+        }
+        true
+    }
+    /// Independent re-check used as a self-test after the layout is done.
+    /// Returns (disc-disc, disc-band) overlap counts and prints a few samples.
+    fn violations(&self) -> (usize, usize) {
+        let mut vd = 0usize;
+        let mut vs = 0usize;
+        for i in 0..self.discs.len() {
+            for j in i + 1..self.discs.len() {
+                let (p, r) = self.discs[i];
+                let (q, s) = self.discs[j];
+                if (p[0] - q[0]).hypot(p[1] - q[1]) < r + s - 0.01 {
+                    vd += 1;
+                    if vd < 40 {
+                        eprintln!("  dd: ({:.1},{:.1})r{:.2} vs ({:.1},{:.1})r{:.2}", p[0], p[1], r, q[0], q[1], s);
+                    }
+                }
+            }
+            if self.soft[i] {
+                continue;
+            }
+            let (p, r) = self.discs[i];
+            for (a, e, hw, _) in &self.segs {
+                let q = {
+                    let d = sub(*e, *a);
+                    let l2 = d[0] * d[0] + d[1] * d[1];
+                    let t = if l2 > 1e-6 {
+                        (((p[0] - a[0]) * d[0] + (p[1] - a[1]) * d[1]) / l2).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    [a[0] + d[0] * t, a[1] + d[1] * t]
+                };
+                if (q[0] - p[0]).hypot(q[1] - p[1]) < hw + r - 0.01 {
+                    vs += 1;
+                    if vs < 40 {
+                        eprintln!("  ds: ({:.1},{:.1})r{:.2} vs ({:.1},{:.1})-({:.1},{:.1}) hw{:.2} gap{:.2}", p[0], p[1], r, a[0], a[1], e[0], e[1], hw, (q[0] - p[0]).hypot(q[1] - p[1]) - hw - r);
+                    }
+                }
+            }
+        }
+        (vd, vs)
+    }
+}
+
+/// Trees keep 3.8 m from each other (crowns must not merge) and never stand
+/// on a band. Returns true when placed.
+#[allow(clippy::too_many_arguments)]
+fn try_tree(
+    b: &mut Builder,
+    ctx: &Ctx,
+    occ: &mut Occ,
+    trees: &mut Vec<[f32; 2]>,
+    p: [f32; 2],
+    s: f32,
+    rng: &mut Rng,
+) -> bool {
+    if !occ.free(p, 0.9 * s) {
+        return false;
+    }
+    if trees.iter().any(|q| (q[0] - p[0]).hypot(q[1] - p[1]) < 3.8) {
+        return false;
+    }
+    if occ.talls.iter().any(|(q, r)| (q[0] - p[0]).hypot(q[1] - p[1]) < *r) {
+        return false;
+    }
+    tree(b, ctx, p[0], p[1], s, rng);
+    occ.disc(p, 0.9 * s);
+    trees.push(p);
+    true
+}
+
+fn try_lantern(b: &mut Builder, ctx: &Ctx, occ: &mut Occ, p: [f32; 2]) -> bool {
+    if !occ.free(p, 0.55) {
+        return false;
+    }
+    lantern(b, ctx, p);
+    occ.disc(p, 0.55);
+    occ.talls.push((p, 2.4));
+    true
+}
+
+fn try_bust(b: &mut Builder, ctx: &Ctx, occ: &mut Occ, p: [f32; 2], face: [f32; 2]) -> bool {
+    if !occ.free(p, 0.55) {
+        return false;
+    }
+    bust(b, ctx, p, face);
+    occ.disc(p, 0.55);
+    occ.talls.push((p, 1.8));
+    true
+}
+
+fn try_statue(b: &mut Builder, ctx: &Ctx, occ: &mut Occ, p: [f32; 2], face: [f32; 2]) -> bool {
+    if !occ.free(p, 1.35) {
+        return false;
+    }
+    statue(b, ctx, p, face);
+    occ.disc(p, 1.35);
+    occ.talls.push((p, 2.6));
+    true
+}
+
+fn try_vase(b: &mut Builder, ctx: &Ctx, occ: &mut Occ, p: [f32; 2]) -> bool {
+    if !occ.free(p, 1.3) {
+        return false;
+    }
+    big_vase(b, ctx, p);
+    occ.disc(p, 1.3);
+    true
+}
+
+/// A bench with its two urns as one unit: all three must fit or none is
+/// built. The whole unit occupies a single strip (the urns stand right at
+/// the bench ends, so separate discs would only fight the bench itself).
+fn try_bench_urns(b: &mut Builder, ctx: &Ctx, occ: &mut Occ, p: [f32; 2], face: [f32; 2]) -> bool {
+    let t = perp(face);
+    let unit_a = add(p, mul(t, 1.42));
+    let unit_e = add(p, mul(t, -1.42));
+    if !occ.free(p, 0.62)
+        || !occ.free(unit_a, 0.5)
+        || !occ.free(unit_e, 0.5)
+    {
+        return false;
+    }
+    bench(b, ctx, p, face);
+    urn(b, ctx, add(p, mul(t, 1.15)));
+    urn(b, ctx, add(p, mul(t, -1.15)));
+    occ.seg(unit_a, unit_e, 0.5);
+    true
+}
+
 // ------------------------------------------------------------------- build ---
 
 pub fn build_garden(
@@ -934,19 +1171,33 @@ pub fn build_garden(
         fence_edge(&mut b, &ctx, a, e, gates[k].as_ref(), &mut rng);
     }
 
-    // ---- gravel aprons outside the gates (toward the village and beyond)
+    // ---- fence + gate aprons as occupied bands
+    let mut occ = Occ::new();
+    for k in 0..poly.len() {
+        let a = poly[k];
+        let e = poly[(k + 1) % poly.len()];
+        occ.seg(a, e, 0.4);
+    }
+    let mut trees: Vec<[f32; 2]> = Vec::new();
+    let mut n_tree = 0usize;
+    let mut n_lamp = 0usize;
+    let mut n_bench = 0usize;
+    let mut n_bust = 0usize;
+    let mut n_statue = 0usize;
+    let mut n_vase = 0usize;
+
     for k in 0..poly.len() {
         if let Some(g) = &gates[k] {
             let a = poly[k];
             let e = poly[(k + 1) % poly.len()];
             let d = unit(sub(e, a));
-            let dir = d;
-            let outn = mul(perp(dir), -1.0); // exterior side (polygon CCW)
-            let gp = add(a, mul(dir, g.t));
+            let outn = mul(perp(d), -1.0); // exterior side (polygon CCW)
+            let gp = add(a, mul(d, g.t));
             let len = if g.w > 4.5 { 13.0 } else { 8.0 };
             let q0 = add(gp, mul(outn, 0.3));
             let q1 = add(gp, mul(outn, len));
             strip(&mut b, &ctx, q0, q1, 2.4);
+            occ.seg(q0, q1, 2.4);
         }
     }
 
@@ -954,6 +1205,7 @@ pub fn build_garden(
     let ring = shrink(&poly, RING_OFF);
     for k in 0..ring.len() {
         strip(&mut b, &ctx, ring[k], ring[(k + 1) % ring.len()], RING_HW);
+        occ.seg(ring[k], ring[(k + 1) % ring.len()], RING_HW);
     }
 
     // ---- main alley + cross alleys inside
@@ -963,6 +1215,7 @@ pub fn build_garden(
     let main_e = main_span.1 - 3.5;
     let u_mid = (main_a + main_e) * 0.5;
     strip(&mut b, &ctx, [main_a, c[1]], [main_e, c[1]], ALLEY_HW);
+    occ.seg([main_a, c[1]], [main_e, c[1]], ALLEY_HW);
 
     let mut v_lines: Vec<f32> = Vec::new();
     for dv in [-36.0f32, -18.0, 18.0, 36.0] {
@@ -970,6 +1223,7 @@ pub fn build_garden(
         for (a, e) in line_inside(&poly, true, c[1] + dv, c[0] - p.ru * 1.3, c[0] + p.ru * 1.3) {
             if e - a > 4.0 {
                 strip(&mut b, &ctx, [a + 1.0, c[1] + dv], [e - 1.0, c[1] + dv], PATH_HW);
+                occ.seg([a + 1.0, c[1] + dv], [e - 1.0, c[1] + dv], PATH_HW);
             }
         }
     }
@@ -979,92 +1233,129 @@ pub fn build_garden(
         for (a, e) in line_inside(&poly, false, u_mid + du, c[1] - p.rv * 1.3, c[1] + p.rv * 1.3) {
             if e - a > 4.0 {
                 strip(&mut b, &ctx, [u_mid + du, a + 1.0], [u_mid + du, e - 1.0], PATH_HW);
+                occ.seg([u_mid + du, a + 1.0], [u_mid + du, e - 1.0], PATH_HW);
             }
         }
     }
 
-    // ---- the central fountain clearing
-    gravel_disk(&mut b, &ctx, [u_mid, c[1]], 6.4, 18);
+    // ---- the central fountain clearing (the fountain is the only obstacle)
+    gravel_disk(&mut b, &ctx, [u_mid, c[1]], 5.2, 18);
     fountain_big(&mut b, &ctx, [u_mid, c[1]]);
+    occ.disc_soft([u_mid, c[1]], 4.8);
+    // four marble vases with a lantern behind each, on the diagonals
     for j in 0..4 {
         let a = j as f32 / 4.0 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_4;
-        let pv = [u_mid + a.cos() * 7.4, c[1] + a.sin() * 7.4];
-        big_vase(&mut b, &ctx, pv);
-        let pl = [u_mid + a.cos() * 8.8, c[1] + a.sin() * 8.8];
-        lantern(&mut b, &ctx, pl);
+        if try_vase(&mut b, &ctx, &mut occ, [u_mid + a.cos() * 7.4, c[1] + a.sin() * 7.4]) {
+            n_vase += 1;
+        }
+        if try_lantern(&mut b, &ctx, &mut occ, [u_mid + a.cos() * 8.8, c[1] + a.sin() * 8.8]) {
+            n_lamp += 1;
+        }
     }
 
-    // ---- busts along the main alley (the famous alley of busts)
-    let mut k = 0;
+    // ---- statues flanking the main alley (first: busts and trees avoid them)
+    for du in [-30.0f32, -14.0, 14.0, 30.0] {
+        let s = if du < 0.0 { -1.0 } else { 1.0 };
+        let p2 = [u_mid + du, c[1] + s * 4.4];
+        let d2 = sub([u_mid, c[1]], p2);
+        if try_statue(&mut b, &ctx, &mut occ, p2, unit(d2)) {
+            n_statue += 1;
+        }
+    }
+
+    // ---- busts along both sides of the main alley (the alley of busts),
+    //      each looking across at the alley
     let mut ub = main_a + 9.0;
     while ub < main_e - 9.0 {
         if (ub - u_mid).abs() > 8.5 {
-            let side = if k % 2 == 0 { 1.0 } else { -1.0 };
-            bust(&mut b, &ctx, [ub, c[1] + side * 3.6], [0.0, -side]);
+            for side in [-1.0f32, 1.0] {
+                let p2 = [ub, c[1] + side * 3.6];
+                if try_bust(&mut b, &ctx, &mut occ, p2, [0.0, -side]) {
+                    n_bust += 1;
+                }
+            }
         }
         ub += 8.5;
-        k += 1;
     }
 
     // ---- trees + lanterns alternating along the main alley
     let mut u0 = main_a + 6.0;
     while u0 < main_e - 6.0 {
-        if (u0 - u_mid).abs() > 8.5 {
-            for s in [-5.3f32, 5.3] {
-                if u0 <= main_e - 6.0 {
-                    tree(&mut b, &ctx, u0, c[1] + s, rng.range(0.85, 1.25), &mut rng);
-                }
-                if u0 + 2.75 < main_e - 6.0 {
-                    lantern(&mut b, &ctx, [u0 + 2.75, c[1] + s]);
-                }
+        for s in [-5.6f32, 5.6] {
+            if try_tree(&mut b, &ctx, &mut occ, &mut trees, [u0, c[1] + s], rng.range(0.85, 1.2), &mut rng) {
+                n_tree += 1;
+            }
+        }
+        for s in [-5.0f32, 5.0] {
+            if try_lantern(&mut b, &ctx, &mut occ, [u0 + 2.75, c[1] + s]) {
+                n_lamp += 1;
             }
         }
         u0 += 5.5;
     }
 
-    // ---- statues flanking the main alley
-    for du in [-30.0f32, -14.0, 14.0, 30.0] {
-        let s = if du < 0.0 { -1.0 } else { 1.0 };
-        let p2 = [u_mid + du, c[1] + s * 4.4];
-        let d2 = sub([u_mid, c[1]], p2);
-        statue(&mut b, &ctx, p2, unit(d2));
-    }
-
-    // ---- benches along the main alley, facing it, with urns
-    let mut ub = main_a + 12.0;
+    // ---- benches with urns along the main alley, exactly between the busts
+    let mut ub = main_a + 13.25;
     while ub < main_e - 12.0 {
         if (ub - u_mid).abs() > 9.5 {
             for s in [-1.0f32, 1.0] {
-                let p2 = [ub, c[1] + s * 4.15];
-                bench(&mut b, &ctx, p2, [0.0, -s]);
-                urn(&mut b, &ctx, [ub - 1.15, c[1] + s * 4.15]);
-                urn(&mut b, &ctx, [ub + 1.15, c[1] + s * 4.15]);
+                for off in [0.0f32, 2.2, -2.2] {
+                    let p2 = [ub + off, c[1] + s * 4.6];
+                    if try_bench_urns(&mut b, &ctx, &mut occ, p2, [0.0, -s]) {
+                        n_bench += 1;
+                        break;
+                    }
+                }
             }
         }
-        ub += 11.0;
+        ub += 8.5;
     }
 
-    // ---- lanterns at every alley crossing
+    // ---- lanterns at every alley crossing: the first free corner wins
     for &vl in &v_lines {
         for &ul in &u_lines {
             if main_a + 4.0 < ul && ul < main_e - 4.0 {
-                lantern(&mut b, &ctx, [ul + 2.6, vl + 2.6]);
+                for (sx, sy) in [(1.0f32, 1.0f32), (-1.0, 1.0), (1.0, -1.0), (-1.0, -1.0)] {
+                    let pc = [ul + sx * 2.85, vl + sy * 2.85];
+                    if try_lantern(&mut b, &ctx, &mut occ, pc) {
+                        n_lamp += 1;
+                        break;
+                    }
+                }
             }
-        }
-    }
-    // small fountains on the four crossings next to the centre
-    for du in [-22.0f32, 22.0] {
-        for dv in [-18.0f32, 18.0] {
-            let pf = [u_mid + du, c[1] + dv];
-            if (pf[0] - main_a > 5.0) && (main_e - pf[0] > 5.0) {
-                // keep it off the paths: only when the crossing carries no path
-                let _ = pf;
-            }
-            let _ = dv;
         }
     }
 
-    // ---- benches + trees along the perimeter alley
+    // ---- trees along the fence (between the grille and the ring alley)
+    let mut acc_t = 4.0f32;
+    let mut seg_t = 0usize;
+    loop {
+        let a = poly[seg_t];
+        let e = poly[(seg_t + 1) % poly.len()];
+        let d = sub(e, a);
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if acc_t <= l {
+            let t = acc_t / l;
+            let p2 = add(a, mul(d, t));
+            let dir = unit(d);
+            let inw = perp(dir);
+            let pin = add(p2, mul(inw, 1.75));
+            if point_in_poly(&shrunk15, pin)
+                && try_tree(&mut b, &ctx, &mut occ, &mut trees, pin, rng.range(0.70, 0.90), &mut rng)
+            {
+                n_tree += 1;
+            }
+            acc_t += 8.5;
+        } else {
+            acc_t -= l;
+            seg_t += 1;
+            if seg_t >= poly.len() {
+                break;
+            }
+        }
+    }
+
+    // ---- benches + urns along the perimeter alley, backs to the fence
     let ring_n = ring.len();
     let mut acc = 6.0f32;
     let mut seg_i = 0usize;
@@ -1078,14 +1369,16 @@ pub fn build_garden(
             let p2 = add(a, mul(d, t));
             let dir = unit(d);
             let inw = perp(dir);
-            // bench just outside the ring path, facing the garden
-            let pb = add(p2, mul(inw, -(RING_HW + 0.75)));
-            if point_in_poly(&shrunk15, pb) {
-                bench(&mut b, &ctx, pb, inw);
-                urn(&mut b, &ctx, add(pb, add(mul(dir, 1.15), mul(inw, -0.4))));
-                urn(&mut b, &ctx, add(pb, add(mul(dir, -1.15), mul(inw, -0.4))));
+            for off in [0.0f32, 2.6, -2.6] {
+                let t2 = (acc + off) / l;
+                let q2 = add(a, mul(d, t2));
+                let pb = add(q2, mul(inw, -(RING_HW + 1.0)));
+                if point_in_poly(&shrunk15, pb) && try_bench_urns(&mut b, &ctx, &mut occ, pb, inw) {
+                    n_bench += 1;
+                    break;
+                }
             }
-            acc += 16.0;
+            acc += 9.5;
         } else {
             acc -= l;
             seg_i += 1;
@@ -1114,7 +1407,8 @@ pub fn build_garden(
             if !corners.iter().all(|q| point_in_poly(&shrunk6, *q)) {
                 continue;
             }
-            // clipped hedges around the cell
+            // clipped hedges: every side is inset 2 m from the cell corners
+            // (open corners at the crossings) with one random mid-side gap
             let gap_side = rng.below(4) as usize;
             let sides = [
                 ([u0c, v0c], [u1c, v0c]),
@@ -1122,57 +1416,73 @@ pub fn build_garden(
                 ([u1c, v1c], [u0c, v1c]),
                 ([u0c, v1c], [u0c, v0c]),
             ];
+            let inset = 2.0f32;
             for (si, (sa, se)) in sides.iter().enumerate() {
                 let d = sub(*se, *sa);
                 let l = (d[0] * d[0] + d[1] * d[1]).sqrt();
-                let nseg = (l / 2.9).ceil().max(1.0) as usize;
+                if l < 2.0 * inset + 1.5 {
+                    continue;
+                }
+                let t0 = inset / l;
+                let t1 = 1.0 - inset / l;
                 let hgt = rng.range(1.02, 1.24);
+                let mid_t = rng.range(0.42, 0.58);
+                let nseg = ((t1 - t0) * l / 2.9).ceil().max(1.0) as usize;
                 for q in 0..nseg {
-                    let frac_mid = (q as f32 + 0.5) / nseg as f32;
-                    if si == gap_side && q == nseg / 2 && frac_mid > 0.35 && frac_mid < 0.65 {
+                    let ta = t0 + (t1 - t0) * q as f32 / nseg as f32;
+                    let te = t0 + (t1 - t0) * (q + 1) as f32 / nseg as f32;
+                    if si == gap_side && ta < mid_t && te > mid_t {
                         continue;
                     }
-                    let ta = q as f32 / nseg as f32;
-                    let te = (q + 1) as f32 / nseg as f32;
                     let a2 = add(*sa, mul(d, ta));
                     let e2 = add(*sa, mul(d, te));
+                    // sample the whole block: a path (e.g. a ring chamfer)
+                    // must not clip it anywhere
+                    let ok = (0..=4).all(|si| {
+                        let f = si as f32 / 4.0;
+                        let q = add(a2, mul(sub(e2, a2), f));
+                        occ.free_of_paths(q, 0.45)
+                    });
+                    if !ok {
+                        continue;
+                    }
                     hedge(&mut b, &ctx, a2, e2, hgt);
+                    occ.hedge_seg(a2, e2, 0.45);
                 }
             }
             // centre feature
             let cc = [u_mid + (iu as f32 + 0.5) * 22.0, c[1] + (iv as f32 + 0.5) * 18.0];
             let feature = rng.f();
-            let mut keep_clear = f32::MAX;
             if feature < 0.30 {
-                big_vase(&mut b, &ctx, cc);
-                keep_clear = 3.0;
+                if try_vase(&mut b, &ctx, &mut occ, cc) {
+                    n_vase += 1;
+                }
             } else if feature < 0.55 {
-                fountain_small(&mut b, &ctx, cc);
-                gravel_disk(&mut b, &ctx, cc, 3.0, 12);
-                keep_clear = 4.0;
+                if occ.free(cc, 3.35) {
+                    fountain_small(&mut b, &ctx, cc);
+                    gravel_disk(&mut b, &ctx, cc, 3.0, 12);
+                    occ.disc_soft(cc, 3.3);
+                }
             } else if feature < 0.72 {
                 let fd = [rng.range(-1.0, 1.0), rng.range(-1.0, 1.0)];
-                statue(&mut b, &ctx, cc, unit(fd));
-                keep_clear = 3.0;
+                if try_statue(&mut b, &ctx, &mut occ, cc, unit(fd)) {
+                    n_statue += 1;
+                }
             }
-            // trees inside the cell
-            let cnt = 2 + rng.below(4) as usize;
-            let mut placed: Vec<[f32; 2]> = Vec::new();
+            // trees inside the cell (never on the hedges or the feature)
+            let cnt = 1 + rng.below(3) as usize;
+            let mut placed_n = 0usize;
             let mut tries = 0;
-            while placed.len() < cnt && tries < 40 {
+            while placed_n < cnt && tries < 40 {
                 tries += 1;
                 let q = [
-                    rng.range(u0c + 1.6, u1c - 1.6),
-                    rng.range(v0c + 1.6, v1c - 1.6),
+                    rng.range(u0c + 1.8, u1c - 1.8),
+                    rng.range(v0c + 1.8, v1c - 1.8),
                 ];
-                if (q[0] - cc[0]).hypot(q[1] - cc[1]) < keep_clear {
-                    continue;
+                if try_tree(&mut b, &ctx, &mut occ, &mut trees, q, rng.range(0.9, 1.25), &mut rng) {
+                    placed_n += 1;
+                    n_tree += 1;
                 }
-                if placed.iter().any(|w| (w[0] - q[0]).hypot(w[1] - q[1]) < 4.0) {
-                    continue;
-                }
-                placed.push(q);
-                tree(&mut b, &ctx, q[0], q[1], rng.range(0.9, 1.3), &mut rng);
             }
         }
     }
@@ -1186,17 +1496,29 @@ pub fn build_garden(
             let inw = perp(d);
             let gp = add(a, mul(d, g.t));
             let pin = add(gp, mul(inw, 6.0));
-            lantern(&mut b, &ctx, add(pin, mul(d, 3.2)));
-            lantern(&mut b, &ctx, add(pin, mul(d, -3.2)));
+            if try_lantern(&mut b, &ctx, &mut occ, add(pin, mul(d, 3.2))) {
+                n_lamp += 1;
+            }
+            if try_lantern(&mut b, &ctx, &mut occ, add(pin, mul(d, -3.2))) {
+                n_lamp += 1;
+            }
             if g.w > 4.5 {
-                let pv1 = add(gp, add(mul(inw, 7.5), mul(d, 4.6)));
-                let pv2 = add(gp, add(mul(inw, 7.5), mul(d, -4.6)));
-                big_vase(&mut b, &ctx, pv1);
-                big_vase(&mut b, &ctx, pv2);
+                if try_vase(&mut b, &ctx, &mut occ, add(gp, add(mul(inw, 7.5), mul(d, 4.6)))) {
+                    n_vase += 1;
+                }
+                if try_vase(&mut b, &ctx, &mut occ, add(gp, add(mul(inw, 7.5), mul(d, -4.6)))) {
+                    n_vase += 1;
+                }
             }
         }
     }
 
+    let (ov_dd, ov_ds) = occ.violations();
+    eprintln!(
+        "garden layout: {} trees, {} lanterns, {} benches, {} busts, {} statues, {} vases; {} bands, {} discs, overlaps dd {} ds {}",
+        n_tree, n_lamp, n_bench, n_bust, n_statue, n_vase,
+        occ.segs.len(), occ.discs.len(), ov_dd, ov_ds
+    );
     let mut mesh = b.finish(N_MATS);
     mesh.water_slots = vec![M_WATER, M_JET, M_SHEET];
     (mesh, textures())
