@@ -79,11 +79,18 @@ pub struct Scene {
     village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
     /// index of the courtyard-boundary overlay inside `village`
     plan_idx: usize,
+    /// index of the drawn-roads mesh inside `village` (editor commits)
+    roads_idx: Option<usize>,
     /// camera focus for `--shot` (the middle block's anchor house)
     focus: [f32; 3],
 }
 
-pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<dyn Error>> {
+pub fn load_scene(
+    city: &str,
+    dat: &str,
+    user: &UserPlan,
+    skip_proc: bool,
+) -> Result<Scene, Box<dyn Error>> {
     let mut terrain = load_terrain(city)?;
     let n = grid_side(&terrain);
     if n * n != terrain.len() {
@@ -153,6 +160,7 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
     let nvec = [-dz, dx]; // road normal
     let eu = [dx, dz]; // along the street
     let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)> = Vec::new();
+    let mut roads_idx: Option<usize> = None;
     let mut report: Vec<(f32, f32, f32)> = Vec::new(); // w, d, fall
 
     let depth = 12.0f32; // one depth for the whole block: rows close exactly
@@ -219,8 +227,9 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
     let mut blk_edges: Vec<(f32, f32, f32)> = Vec::new(); // per block: u_min, u_max, v_max
-    for blk in 0..(10 + user.blocks.len()) as u64 {
-        let usr = blk >= 10; // a courtyard drawn in the editor
+    let n_proc = if skip_proc { 0 } else { 10 };
+    for blk in 0..(n_proc + user.blocks.len()) as u64 {
+        let usr = blk >= n_proc as u64; // a courtyard drawn in the editor
         let s: f32 = if usr { 1.0 } else if blk % 2 == 0 { 1.0 } else { -1.0 };
         let u_off = if usr { 0.0 } else { ((blk / 2) as f32 - 2.0) * 56.0 };
         let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
@@ -233,7 +242,7 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
         // in this same plan frame — so the very same path fills it.
         let mut q: [[f32; 2]; 4];
         if usr {
-            q = user.blocks[(blk - 10) as usize];
+            q = user.blocks[(blk - n_proc as u64) as usize];
         } else {
             let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
             let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
@@ -490,7 +499,7 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
     // between block columns: asphalt roadway, granite kerbs, tiled
     // sidewalks, a dashed centre line and zebra crossings — all conforming
     // to the terrain. Pushed as one world-space mesh (like the overlay).
-    {
+    if !skip_proc {
         let mut cols = [[f32::INFINITY, f32::NEG_INFINITY, 0.0f32]; 5];
         for (b, &(l, r, vm)) in blk_edges.iter().enumerate() {
             let col = b / 2;
@@ -569,6 +578,7 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
             let (rmesh, rtexs) =
                 kolomna_render::streets::build_roads(&h_at, anchor, mn, eu, nvec, &user.roads);
             println!("drawn roads: {} chain(s)", user.roads.len());
+            roads_idx = Some(village.len());
             village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
         }
         // ---- the editor's parks: the drawn contour is the outline
@@ -652,8 +662,13 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
             }
         }
     }
-    let plan_idx = village.len();
-    village.push((bld.finish(1), vec![(256u32, 1u32, pal_px)], [0.0, 0.0, 0.0], 0.0));
+    let plan_idx = if skip_proc {
+        0
+    } else {
+        let i = village.len();
+        village.push((bld.finish(1), vec![(256u32, 1u32, pal_px)], [0.0, 0.0, 0.0], 0.0));
+        i
+    };
     let focus = focus.unwrap_or([anchor[0], anchor[1], 0.0]);
 
     Ok(Scene {
@@ -672,6 +687,7 @@ pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<d
         road_textures,
         village,
         plan_idx,
+        roads_idx,
         focus,
     })
 }
@@ -698,7 +714,7 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
     } else {
         UserPlan::default()
     };
-    let scene = load_scene(city, dat, &user)?;
+    let scene = load_scene(city, dat, &user, false)?;
     let mut placed = Vec::new();
     for (mesh, texs, pos, rot) in &scene.village {
         placed.push(PlacedModel {
@@ -1042,6 +1058,8 @@ struct Renderer {
     village: Vec<ModelRenderer>,
     /// index of the courtyard boundary overlay inside `village`
     plan_idx: usize,
+    /// index of the drawn-roads mesh inside `village`
+    roads_idx: Option<usize>,
     /// the editor's in-progress sketch (drawn over the ground)
     preview: Option<ModelRenderer>,
     ui: UiRenderer,
@@ -1127,6 +1145,7 @@ impl Renderer {
             road,
             village,
             plan_idx: scene.plan_idx,
+            roads_idx: scene.roads_idx,
             preview: None,
             ui,
             msaa_view,
@@ -1155,6 +1174,56 @@ impl Renderer {
             r.set_placement(&self.queue, [0.0, 0.0, 0.0], 0.0, 0.0);
             r
         });
+    }
+
+    /// Swap in a freshly generated village (the editor's commits): the
+    /// device, surface and pipelines all stay — only the model renderers
+    /// and the overlay index are rebuilt.  (Recreating the whole renderer
+    /// would create a second surface on the same window, which wgpu 30
+    /// rejects with "Invalid surface".)
+    fn rebuild_village(&mut self, scene: &Scene) {
+        self.village = scene
+            .village
+            .iter()
+            .map(|(mesh, texs, pos, rot)| {
+                let r = ModelRenderer::new(&self.device, &self.queue, self.config.format, 4, mesh, texs);
+                r.set_placement(&self.queue, *pos, *rot, 0.0);
+                r
+            })
+            .collect();
+        self.plan_idx = scene.plan_idx;
+        self.roads_idx = scene.roads_idx;
+    }
+
+    /// Append a freshly generated model to the drawn village (the editor's
+    /// commits) — returns its index for later replacement.
+    fn add_village_mesh(
+        &mut self,
+        mesh: kolomna_render::model::ModelMesh,
+        texs: Vec<(u32, u32, Vec<u8>)>,
+        pos: [f32; 3],
+        rot: f32,
+    ) -> usize {
+        let r = ModelRenderer::new(&self.device, &self.queue, self.config.format, 4, &mesh, &texs);
+        r.set_placement(&self.queue, pos, rot, 0.0);
+        self.village.push(r);
+        self.village.len() - 1
+    }
+
+    /// Swap one drawn entry — the roads mesh is rebuilt on every road
+    /// commit, so it must not pile up.
+    fn replace_village_mesh(
+        &mut self,
+        idx: usize,
+        mesh: kolomna_render::model::ModelMesh,
+        texs: Vec<(u32, u32, Vec<u8>)>,
+    ) {
+        if idx < self.village.len() {
+            let r =
+                ModelRenderer::new(&self.device, &self.queue, self.config.format, 4, &mesh, &texs);
+            r.set_placement(&self.queue, [0.0, 0.0, 0.0], 0.0, 0.0);
+            self.village[idx] = r;
+        }
     }
 
     /// zoom=1 world->screen scale for the current window size.
@@ -1511,7 +1580,7 @@ impl ApplicationHandler for App {
                 std::process::exit(1);
             }
         };
-        let scene = match load_scene(&self.city, &self.dat, &self.user) {
+        let scene = match load_scene(&self.city, &self.dat, &self.user, false) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1543,6 +1612,39 @@ impl ApplicationHandler for App {
         self.window = Some(window);
         self.last_frame = Instant::now();
         self.update_title();
+
+        // self-driving editor test (KOLOMNA_EDIT_TEST=1): draw and commit
+        // in the real windowed path without a mouse, then exit
+        if std::env::var("KOLOMNA_EDIT_TEST").is_ok() {
+            println!("selftest: road commit ...");
+            self.set_tool(1);
+            self.pts = vec![[-600.0, -600.0], [600.0, 600.0]];
+            self.commit();
+            println!("selftest: road commit OK");
+            println!("selftest: road commit 2 (replacement path) ...");
+            self.pts = vec![[-200.0, 200.0], [0.0, 260.0]];
+            self.commit();
+            println!("selftest: road commit 2 OK");
+            println!("selftest: courtyard commit ...");
+            self.set_tool(2);
+            self.pts = vec![[310.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]];
+            self.commit();
+            println!("selftest: courtyard commit OK");
+            println!("selftest: park commit ...");
+            self.set_tool(3);
+            self.pts = vec![
+                [150.0, 90.0],
+                [220.0, 95.0],
+                [235.0, 150.0],
+                [200.0, 195.0],
+                [140.0, 180.0],
+                [125.0, 130.0],
+            ];
+            self.commit();
+            println!("selftest: park commit OK");
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            std::process::exit(0);
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1971,42 +2073,128 @@ impl App {
         if made {
             self.pts.clear();
             self.refresh_preview();
-            self.reload();
+            // every commit generates only its own addition
+            match self.tool {
+                1 => self.commit_roads(),
+                3 => self.commit_park(),
+                2 => self.commit_quarter(),
+                _ => {}
+            }
         }
     }
 
-    /// Rebuild the whole scene (save parse included) around the committed
-    /// drawing and swap the renderer in; the camera stays where it was.
-    fn reload(&mut self) {
+    /// The scene's cell-space height sampler (what the generators take).
+    fn scene_h_at(scene: &Scene) -> impl Fn(f32, f32) -> f32 + '_ {
+        let n = scene.n;
+        move |x: f32, z: f32| {
+            sample_h(&scene.sm, n, x.clamp(0.0, (n - 1) as f32), z.clamp(0.0, (n - 1) as f32))
+        }
+    }
+
+    /// Rebuild only the drawn-roads mesh over the committed chains.
+    fn commit_roads(&mut self) {
         let t0 = Instant::now();
-        let scene = match load_scene(&self.city, &self.dat, &self.user) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("перестройка сцены не удалась: {e}");
-                return;
-            }
+        let (mesh, texs) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            kolomna_render::streets::build_roads(
+                &h_at,
+                scene.anchor,
+                scene.mn,
+                scene.eu,
+                scene.nvec,
+                &self.user.roads,
+            )
         };
-        let window = match self.window.as_ref() {
-            Some(w) => w.clone(),
+        if let Some(r) = self.renderer.as_mut() {
+            match r.roads_idx {
+                Some(ix) => r.replace_village_mesh(ix, mesh, texs),
+                None => {
+                    let ix = r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
+                    r.roads_idx = Some(ix);
+                }
+            }
+        }
+        println!(
+            "дороги перестроены за {:.2} с ({} цепочек)",
+            t0.elapsed().as_secs_f32(),
+            self.user.roads.len()
+        );
+    }
+
+    /// Append only the park that was just committed.
+    fn commit_park(&mut self) {
+        let t0 = Instant::now();
+        let (mesh, texs) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let park = match self.user.parks.last() {
+                Some(p) => p,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            kolomna_render::summer_garden::build_garden(
+                &h_at,
+                scene.anchor,
+                scene.mn,
+                scene.eu,
+                scene.nvec,
+                &kolomna_render::summer_garden::Params {
+                    centre: [0.0, 0.0],
+                    ru: 0.0,
+                    rv: 0.0,
+                    seed: 0xD00D_0000 + self.user.parks.len() as u64,
+                    outline: park.clone(),
+                },
+            )
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
+        }
+        println!(
+            "парк добавлен за {:.2} с (всего парков {})",
+            t0.elapsed().as_secs_f32(),
+            self.user.parks.len()
+        );
+    }
+
+    /// Append only the courtyard that was just committed: the scene builder
+    /// runs with the procedural city skipped, so it generates nothing but
+    /// the new block (the save parse stays, it is a fraction of a second).
+    fn commit_quarter(&mut self) {
+        let t0 = Instant::now();
+        let q = match self.user.blocks.last() {
+            Some(q) => *q,
             None => return,
         };
-        let mut renderer = match Renderer::new(window, &scene) {
-            Ok(r) => r,
+        let user = UserPlan {
+            roads: Vec::new(),
+            blocks: vec![q],
+            parks: Vec::new(),
+        };
+        let scene = match load_scene(&self.city, &self.dat, &user, true) {
+            Ok(s) => s,
             Err(e) => {
-                eprintln!("перестройка рендера не удалась: {e}");
+                eprintln!("постройка квартала не удалась: {e}");
                 return;
             }
         };
-        let mesh = preview_mesh(&scene, &self.pts);
-        renderer.set_preview(mesh);
-        self.scene = Some(scene);
-        self.renderer = Some(renderer);
+        let n = scene.village.len();
+        if let Some(r) = self.renderer.as_mut() {
+            for (mesh, texs, pos, rot) in scene.village {
+                r.add_village_mesh(mesh, texs, pos, rot);
+            }
+        }
         println!(
-            "сцена перестроена за {:.2} с: дорог {}, кварталов {}, парков {}",
+            "квартал добавлен за {:.2} с ({} элементов, всего кварталов {})",
             t0.elapsed().as_secs_f32(),
-            self.user.roads.len(),
-            self.user.blocks.len(),
-            self.user.parks.len()
+            n,
+            self.user.blocks.len()
         );
     }
 }
