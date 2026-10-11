@@ -81,6 +81,10 @@ pub struct Scene {
     plan_idx: usize,
     /// index of the drawn-roads mesh inside `village` (editor commits)
     roads_idx: Option<usize>,
+    /// index of the grid-streets mesh inside `village` (junction rebuilds)
+    streets_idx: usize,
+    /// the street-grid layout: junction trims and road snapping use it
+    net: kolomna_render::streets::Params,
     /// camera focus for `--shot` (the middle block's anchor house)
     focus: [f32; 3],
 }
@@ -561,6 +565,8 @@ pub fn load_scene(
     // between block columns: asphalt roadway, granite kerbs, tiled
     // sidewalks, a dashed centre line and zebra crossings — all conforming
     // to the terrain. Pushed as one world-space mesh (like the overlay).
+    let mut net = kolomna_render::streets::Params::default();
+    let mut streets_idx = usize::MAX;
     if !skip_proc {
         let mut cols = [[f32::INFINITY, f32::NEG_INFINITY, 0.0f32]; 5];
         for (b, &(l, r, vm)) in blk_edges.iter().enumerate() {
@@ -599,19 +605,17 @@ pub fn load_scene(
                 .collect::<Vec<_>>()
                 .join(", ")
         );
-        let (rmesh, rtexs) = kolomna_render::streets::build_streets(
-            &h_at,
-            anchor,
-            mn,
-            eu,
-            nvec,
-            &kolomna_render::streets::Params {
-                main_t0,
-                main_t1,
-                cross_half,
-                cross,
-            },
-        );
+        net = kolomna_render::streets::Params {
+            main_t0,
+            main_t1,
+            cross_half,
+            cross,
+        };
+        // the drawn roads are already known: their junctions cut the grid
+        let cuts = kolomna_render::streets::net_cuts(&net, &user.roads);
+        let (rmesh, rtexs) =
+            kolomna_render::streets::build_streets(&h_at, anchor, mn, eu, nvec, &net, &cuts);
+        streets_idx = village.len();
         village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
 
         // ---- the Summer Garden beyond the east end of the street ----------
@@ -640,9 +644,11 @@ pub fn load_scene(
     // procedural city is skipped ("user drawings only" preview mode)
     {
         // ---- the editor's roads: free chains with the street cross-section
+        // (junctions trim kerbs / walks / furniture and extend T-attachments)
         if !user.roads.is_empty() {
-            let (rmesh, rtexs) =
-                kolomna_render::streets::build_roads(&h_at, anchor, mn, eu, nvec, &user.roads);
+            let (rmesh, rtexs) = kolomna_render::streets::build_roads(
+                &h_at, anchor, mn, eu, nvec, &user.roads, &net,
+            );
             println!("drawn roads: {} chain(s)", user.roads.len());
             roads_idx = Some(village.len());
             village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
@@ -754,6 +760,8 @@ pub fn load_scene(
         village,
         plan_idx,
         roads_idx,
+        streets_idx,
+        net,
         focus,
     })
 }
@@ -766,7 +774,12 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
     // chain, a courtyard quad and a park contour, all in plan coords
     let user = if std::env::var("KOLOMNA_PLAN_DEMO").is_ok() {
         UserPlan {
-            roads: vec![vec![[-40.0, 130.0], [40.0, 150.0], [108.0, 125.0], [95.0, 55.0]]],
+            roads: vec![
+                vec![[-40.0, 130.0], [40.0, 150.0], [108.0, 125.0], [95.0, 55.0]],
+                // a diagonal crossing the main street and the first chain:
+                // junction test coverage inside the demo
+                vec![[-30.0, -30.0], [30.0, 30.0]],
+            ],
             blocks: vec![[[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]]],
             parks: vec![vec![
                 [150.0, 90.0],
@@ -1980,6 +1993,8 @@ struct App {
     pts: Vec<[f32; 2]>,
     /// editor: everything committed this session
     user: UserPlan,
+    /// last live-preview road point (throttles per-cursor rebuilds)
+    last_live: Option<[f32; 2]>,
 }
 
 impl ApplicationHandler for App {
@@ -2028,8 +2043,9 @@ impl ApplicationHandler for App {
         println!("  WASD/стрелки — перенос · Q/E — поворот 90° · R — сброс · Esc — выход");
         println!("  кнопки слева вверху — Границы · Камера · Дороги · Кварталы · Парки");
         println!("  РЕДАКТОР: 1 камера · 2 дороги · 3 кварталы · 4 парки");
-        println!("            ЛКМ — точка · ПКМ — отменить фигуру · Backspace — убрать точку");
-        println!("            Enter — закончить (дороги: ≥2 точек, кварталы: 4, парки: ≥3) · Esc — выйти из режима");
+        println!("            ДОРОГИ: ЛКМ — точка, дорога строится сразу (превью за мышью, снап к дорогам)");
+        println!("                    ПКМ/Backspace — убрать точку · Esc — закончить дорогу · Esc ещё — выйти из режима");
+        println!("            кварталы/парки: ЛКМ — точка · ПКМ — отменить фигуру · Enter — закончить · Esc — выйти");
         self.camera = Some(Camera::new(scene.grid, scene.zspan));
         self.scene = Some(scene);
         self.renderer = Some(renderer);
@@ -2049,6 +2065,85 @@ impl ApplicationHandler for App {
             self.pts = vec![[-200.0, 200.0], [0.0, 260.0]];
             self.commit();
             println!("selftest: road commit 2 OK");
+            println!("selftest: road commit 3 (T-attachment onto road 1) ...");
+            self.pts = vec![[240.0, 30.0], [100.0, 100.0]];
+            self.commit();
+            println!("selftest: road commit 3 OK");
+            {
+                let np = self
+                    .scene
+                    .as_ref()
+                    .map(|s| s.net.clone())
+                    .unwrap_or_default();
+                let cuts = kolomna_render::streets::net_cuts(&np, &self.user.roads);
+                println!(
+                    "selftest: junctions {} event(s), {} attachment(s), main cuts {:?}",
+                    cuts.events, cuts.attaches, cuts.main
+                );
+                assert!(cuts.events > 0, "no junction events were produced");
+                assert!(cuts.attaches > 0, "no T-attachments were produced");
+                assert!(!cuts.main.is_empty(), "no main-street cuts were produced");
+                // mesh-level check: no kerb / walk geometry may survive inside
+                // the junction boxes, the asphalt union must cover them
+                let scene = self.scene.as_ref().unwrap();
+                let h_at = Self::scene_h_at(scene);
+                let (mesh, _) = kolomna_render::streets::build_roads(
+                    &h_at,
+                    scene.anchor,
+                    scene.mn,
+                    scene.eu,
+                    scene.nvec,
+                    &self.user.roads,
+                    &scene.net,
+                );
+                let boxes = [(0.0f32, 0.0f32, 4.5f32), (100.0, 100.0, 4.5f32)];
+                let mut bad = 0usize;
+                let mut asph = 0usize;
+                for part in &mesh.parts {
+                    let kerbish = part.texture == 1 || part.texture == 2;
+                    let is_a = part.texture == 0;
+                    if !kerbish && !is_a {
+                        continue;
+                    }
+                    let i0 = part.first_index as usize;
+                    let i1 = i0 + part.index_count as usize;
+                    for k in i0..i1 {
+                        let vx = mesh.verts[mesh.indices[k] as usize].pos;
+                        let w = [
+                            vx[0] - scene.anchor[0] * 16.0,
+                            vx[2] - scene.anchor[1] * 16.0,
+                        ];
+                        let uu = w[0] * scene.eu[0] + w[1] * scene.eu[1];
+                        let vv = w[0] * scene.nvec[0] + w[1] * scene.nvec[1];
+                        for &(bu, bv, bh) in &boxes {
+                            if (uu - bu).abs() < bh && (vv - bv).abs() < bh {
+                                if kerbish {
+                                    bad += 1;
+                                } else {
+                                    asph += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                println!(
+                    "selftest: junction boxes kerb/walk verts {}, asphalt verts {}",
+                    bad, asph
+                );
+                assert_eq!(bad, 0, "kerb/walk geometry inside a junction box");
+                assert!(asph > 0, "no asphalt inside a junction box");
+                // snap probe: a point near road 1 lands on its centreline
+                let sp = self.road_snap_point([50.0, 52.0]);
+                println!(
+                    "selftest: snap probe (50.0, 52.0) -> ({:.2}, {:.2})",
+                    sp[0], sp[1]
+                );
+                assert!(
+                    (sp[1] - sp[0]).abs() < 0.3,
+                    "snap did not land on road 1's centreline"
+                );
+            }
+            println!("selftest: junctions OK");
             println!("selftest: courtyard commit ...");
             self.set_tool(2);
             self.pts = vec![[310.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]];
@@ -2094,6 +2189,21 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
+                                if self.tool == 1 {
+                                    // roads: Esc ends the chain (the mode
+                                    // stays); another Esc then exits
+                                    if self.pts.len() >= 2 {
+                                        self.user.roads.push(std::mem::take(&mut self.pts));
+                                        self.after_road_commit();
+                                    } else if !self.pts.is_empty() {
+                                        self.pts.clear();
+                                        self.refresh_preview();
+                                    } else {
+                                        self.tool = 0;
+                                        self.refresh_preview();
+                                    }
+                                    return;
+                                }
                                 if self.tool != 0 || !self.pts.is_empty() {
                                     self.tool = 0;
                                     self.pts.clear();
@@ -2198,18 +2308,30 @@ impl ApplicationHandler for App {
                                 return; // a button click is not a pan
                             }
                         }
-                        // editor: left adds a point, right cancels the shape
+                        // editor: left adds a point (roads snap to the
+                        // nearest road), right drops the last one (roads) or
+                        // cancels the shape (blocks, parks)
                         if self.tool != 0 {
                             if let Some((px, py)) = self.cursor {
                                 if button == MouseButton::Left && pressed {
                                     if let Some(p) = self.screen_to_plan(px, py) {
-                                        if !(self.tool == 2 && self.pts.len() >= 4) {
+                                        if self.tool == 1 {
+                                            let p = self.road_snap_point(p);
+                                            self.pts.push(p);
+                                            self.last_live = Some(p);
+                                            self.refresh_preview();
+                                        } else if !(self.tool == 2 && self.pts.len() >= 4) {
                                             self.pts.push(p);
                                             self.refresh_preview();
                                         }
                                     }
                                 } else if button == MouseButton::Right && pressed {
-                                    if !self.pts.is_empty() {
+                                    if self.tool == 1 {
+                                        if !self.pts.is_empty() {
+                                            self.pts.pop();
+                                            self.refresh_preview();
+                                        }
+                                    } else if !self.pts.is_empty() {
                                         self.pts.clear();
                                         self.refresh_preview();
                                     }
@@ -2254,6 +2376,24 @@ impl ApplicationHandler for App {
                     }
                 }
                 self.cursor = Some(pos);
+                // roads: the live preview follows the cursor (throttled to
+                // one rebuild per ~0.6 m of cursor travel)
+                if self.tool == 1 && !self.pts.is_empty() {
+                    if let Some(p) = self.road_cursor_pt() {
+                        let far = self
+                            .last_live
+                            .map(|q| {
+                                let dx = p[0] - q[0];
+                                let dy = p[1] - q[1];
+                                dx * dx + dy * dy > 0.36
+                            })
+                            .unwrap_or(true);
+                        if far {
+                            self.last_live = Some(p);
+                            self.refresh_roads_live();
+                        }
+                    }
+                }
             }
             WindowEvent::Resized(size) => {
                 self.win_size = (size.width as f64, size.height as f64);
@@ -2430,7 +2570,14 @@ impl App {
     }
 
     /// Rebuild the sketch + refresh the title (called after every edit).
+    /// Roads draw as real geometry (live preview); the other tools keep the
+    /// orange ribbon sketch.
     fn refresh_preview(&mut self) {
+        if self.tool == 1 {
+            self.refresh_roads_live();
+            self.update_title();
+            return;
+        }
         let mesh = if let (Some(s), Some(_)) = (self.scene.as_ref(), self.renderer.as_ref()) {
             preview_mesh(s, &self.pts)
         } else {
@@ -2442,16 +2589,186 @@ impl App {
         self.update_title();
     }
 
+    /// Plan point of the cursor, snapped to the nearest road it reaches.
+    fn road_cursor_pt(&self) -> Option<[f32; 2]> {
+        let (px, py) = self.cursor?;
+        let p = self.screen_to_plan(px, py)?;
+        Some(self.road_snap_point(p))
+    }
+
+    /// Snap a plan point onto the nearest road centreline once the road
+    /// corridors would touch — the reach grows with the road widths.
+    /// Committed chains and the procedural grid both attract the point.
+    fn road_snap_point(&self, p: [f32; 2]) -> [f32; 2] {
+        let scene = match self.scene.as_ref() {
+            Some(s) => s,
+            None => return p,
+        };
+        let hw = 6.5f32;
+        let mut best: Option<([f32; 2], f32)> = None;
+        let consider = |q: [f32; 2], d: f32, reach: f32, best: &mut Option<([f32; 2], f32)>| {
+            if d < reach && best.map(|b| d < b.1).unwrap_or(true) {
+                *best = Some((q, d));
+            }
+        };
+        for ch in &self.user.roads {
+            if ch.len() >= 2 {
+                let (q, d) = kolomna_render::streets::near_poly(ch, p);
+                consider(q, d, hw + hw + 1.0, &mut best);
+            }
+        }
+        let net = &scene.net;
+        if net.main_t1 > net.main_t0 + 1.0 {
+            let main = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
+            let (q, d) = kolomna_render::streets::near_poly(&main, p);
+            consider(q, d, hw + hw + 1.0, &mut best);
+        }
+        for &(uc, _cr, cw) in &net.cross {
+            for half in [
+                [[uc, 3.5], [uc, net.cross_half]],
+                [[uc, -net.cross_half], [uc, -3.5]],
+            ] {
+                let (q, d) = kolomna_render::streets::near_poly(&half, p);
+                consider(q, d, hw + cw + 1.0, &mut best);
+            }
+        }
+        best.map(|(q, _)| q).unwrap_or(p)
+    }
+
+    /// The chains as they are on screen: committed roads + the chain being
+    /// drawn, with its rubber-band point under the cursor.
+    fn road_chains_live(&self) -> Vec<Vec<[f32; 2]>> {
+        let mut v = self.user.roads.clone();
+        if self.tool == 1 && !self.pts.is_empty() {
+            let mut ch = self.pts.clone();
+            if let Some(p) = self.road_cursor_pt() {
+                let l = ch[ch.len() - 1];
+                let dx = p[0] - l[0];
+                let dy = p[1] - l[1];
+                if dx * dx + dy * dy > 0.09 {
+                    ch.push(p);
+                }
+            }
+            v.push(ch);
+        }
+        v
+    }
+
+    /// Live rebuild of the drawn-roads mesh (fast path: no save re-parse).
+    fn refresh_roads_live(&mut self) {
+        let chains = self.road_chains_live();
+        let (mesh, texs) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            kolomna_render::streets::build_roads(
+                &h_at,
+                scene.anchor,
+                scene.mn,
+                scene.eu,
+                scene.nvec,
+                &chains,
+                &scene.net,
+            )
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            match r.roads_idx {
+                Some(ix) => r.replace_village_mesh(ix, mesh, texs),
+                None => {
+                    let ix = r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
+                    r.roads_idx = Some(ix);
+                }
+            }
+        }
+    }
+
+    /// Once a chain is settled: rebuild the roads mesh and, when the chain
+    /// reached the grid, re-cut the grid streets at the junctions.
+    fn after_road_commit(&mut self) {
+        self.last_live = None;
+        self.refresh_roads_live();
+        if self.chains_near_grid() {
+            self.rebuild_streets();
+        }
+        println!("дороги перестроены ({} цепочек)", self.user.roads.len());
+    }
+
+    /// Rough test: does any drawn chain reach the procedural grid?
+    fn chains_near_grid(&self) -> bool {
+        let scene = match self.scene.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        let net = &scene.net;
+        if net.main_t1 <= net.main_t0 + 1.0 && net.cross.is_empty() {
+            return false;
+        }
+        for ch in &self.user.roads {
+            for p in ch {
+                if net.main_t1 > net.main_t0 + 1.0 && p[1].abs() < 14.0 {
+                    return true;
+                }
+                for &(uc, _, _) in &net.cross {
+                    if (p[0] - uc).abs() < 14.0 && p[1].abs() < net.cross_half + 14.0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Rebuild the grid streets with the current chains' junction cuts.
+    fn rebuild_streets(&mut self) {
+        let t0 = Instant::now();
+        let ix = match self.scene.as_ref() {
+            Some(s) if s.streets_idx != usize::MAX => s.streets_idx,
+            _ => return,
+        };
+        let (mesh, texs) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            let cuts = kolomna_render::streets::net_cuts(&scene.net, &self.user.roads);
+            kolomna_render::streets::build_streets(
+                &h_at,
+                scene.anchor,
+                scene.mn,
+                scene.eu,
+                scene.nvec,
+                &scene.net,
+                &cuts,
+            )
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.replace_village_mesh(ix, mesh, texs);
+        }
+        println!(
+            "улицы перестроены за {:.2} с (перекрёстки)",
+            t0.elapsed().as_secs_f32()
+        );
+    }
+
     fn set_tool(&mut self, t: u8) {
+        // leaving the road tool settles the chain that is being drawn
+        if self.tool == 1 && t != 1 && self.pts.len() >= 2 {
+            self.user.roads.push(std::mem::take(&mut self.pts));
+            self.after_road_commit();
+        }
         self.tool = t;
         self.pts.clear();
+        self.last_live = None;
         self.refresh_preview();
     }
 
     /// The one-line hint shown both in the window title and the status bar.
     fn hint_text(&self) -> &'static str {
         match self.tool {
-            1 => "ДОРОГИ: ЛКМ точка · Enter — готово · ПКМ — отмена",
+            1 => "ДОРОГИ: ЛКМ точка (снап к дорогам) · ПКМ убрать · Esc закончить",
             2 => "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
             3 => "ПАРКИ: клики по контуру · Enter — готово · ПКМ — отмена",
             _ => "ЛКМ — обзор · кнопки вверху: дороги · кварталы · парки · B — границы дворов",
@@ -2470,12 +2787,14 @@ impl App {
         let mut made = false;
         match self.tool {
             1 => {
+                // Enter settles the chain exactly like Esc (the mode stays)
                 if self.pts.len() >= 2 {
-                    self.user.roads.push(self.pts.clone());
-                    made = true;
+                    self.user.roads.push(std::mem::take(&mut self.pts));
+                    self.after_road_commit();
                 } else {
-                    println!("дорога: нужно хотя бы 2 точки");
+                    println!("дорога: нужно хотя бы 2 точки (Esc — закончить)");
                 }
+                return;
             }
             2 => {
                 if self.pts.len() == 4 {
@@ -2520,7 +2839,6 @@ impl App {
             self.refresh_preview();
             // every commit generates only its own addition
             match self.tool {
-                1 => self.commit_roads(),
                 3 => self.commit_park(),
                 2 => self.commit_quarter(),
                 _ => {}
@@ -2534,40 +2852,6 @@ impl App {
         move |x: f32, z: f32| {
             sample_h(&scene.sm, n, x.clamp(0.0, (n - 1) as f32), z.clamp(0.0, (n - 1) as f32))
         }
-    }
-
-    /// Rebuild only the drawn-roads mesh over the committed chains.
-    fn commit_roads(&mut self) {
-        let t0 = Instant::now();
-        let (mesh, texs) = {
-            let scene = match self.scene.as_ref() {
-                Some(s) => s,
-                None => return,
-            };
-            let h_at = Self::scene_h_at(scene);
-            kolomna_render::streets::build_roads(
-                &h_at,
-                scene.anchor,
-                scene.mn,
-                scene.eu,
-                scene.nvec,
-                &self.user.roads,
-            )
-        };
-        if let Some(r) = self.renderer.as_mut() {
-            match r.roads_idx {
-                Some(ix) => r.replace_village_mesh(ix, mesh, texs),
-                None => {
-                    let ix = r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
-                    r.roads_idx = Some(ix);
-                }
-            }
-        }
-        println!(
-            "дороги перестроены за {:.2} с ({} цепочек)",
-            t0.elapsed().as_secs_f32(),
-            self.user.roads.len()
-        );
     }
 
     /// Append only the park that was just committed.
@@ -2679,6 +2963,7 @@ pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
         tool: 0,
         pts: Vec::new(),
         user: UserPlan::default(),
+        last_live: None,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

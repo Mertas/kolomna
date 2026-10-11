@@ -29,6 +29,7 @@ const KERB_H: f32 = 0.15; // kerb / sidewalk step above the roadway
 const KERB_W: f32 = 0.15;
 const STEP: f32 = 1.5; // cross-section spacing, m
 
+#[derive(Clone, Default)]
 pub struct Params {
     pub main_t0: f32,
     pub main_t1: f32,
@@ -284,6 +285,7 @@ pub fn build_streets(
     eu: [f32; 2],
     nvec: [f32; 2],
     p: &Params,
+    cuts: &NetCuts,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
     let ctx = Ctx {
         h_at,
@@ -298,15 +300,30 @@ pub fn build_streets(
     // ---- main street: the roadway runs through, kerbs and sidewalks
     // break at every cross lane
     seg(&mut b, &ctx, p.main_t0, p.main_t1, true, 0.0, hr, hw, true, false, false);
-    let mut cuts = p.cross.clone();
-    cuts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    // junctions: the cross lanes AND every drawn-road junction interrupt the
+    // kerbs, sidewalks and furniture along the main street; interruptions
+    // that sit close together merge into one junction zone
+    let lane_cuts = merge_intervals(
+        p.cross
+            .iter()
+            .map(|&(uc, _, cw)| (uc - cw - 0.05, uc + cw + 0.05))
+            .collect(),
+        0.2,
+    );
+    let mut all_cuts = lane_cuts.clone();
+    all_cuts.extend(cuts.main.iter().copied());
+    all_cuts = merge_intervals(all_cuts, 0.6);
     let mut ranges: Vec<(f32, f32)> = Vec::new();
     let mut prev = p.main_t0;
-    for &(uc, _, cw) in &cuts {
-        ranges.push((prev, uc - cw - 0.05));
-        prev = uc + cw + 0.05;
+    for &(a, e) in &all_cuts {
+        if a > prev + 0.3 {
+            ranges.push((prev, a));
+        }
+        prev = prev.max(e);
     }
-    ranges.push((prev, p.main_t1));
+    if p.main_t1 > prev + 0.3 {
+        ranges.push((prev, p.main_t1));
+    }
     for (ri, &(a, e)) in ranges.iter().enumerate() {
         if e - a > 0.5 {
             seg(&mut b, &ctx, a, e, true, 0.0, hr, hw, false, true, true);
@@ -317,15 +334,44 @@ pub fn build_streets(
     // ---- cross lanes through the gaps between block columns (each sized to
     // the gap it runs through)
     for (uci, &(uc, cr, cw)) in p.cross.iter().enumerate() {
-        for (t0, t1) in [(3.5, p.cross_half), (-p.cross_half, -3.5)] {
-            if t1 > t0 + 0.5 {
-                seg(&mut b, &ctx, t0, t1, false, uc, cr, cw, true, true, false);
+        // drawn-road junctions interrupt this lane's kerbs / walks / furniture
+        let lc = merge_intervals(
+            cuts.lanes[uci]
+                .iter()
+                .map(|&(a, e)| (a - 0.35, e + 0.35))
+                .collect(),
+            0.6,
+        );
+        let sub = |lo: f32, hi: f32| -> Vec<(f32, f32)> {
+            let mut out = Vec::new();
+            let mut prev = lo;
+            for &(a, e) in &lc {
+                if a > prev + 0.2 && prev < hi {
+                    out.push((prev, a.min(hi)));
+                }
+                prev = prev.max(e);
             }
-            furniture_axis(&mut b, &ctx, 0x6200 + uci as u32 + (t0 > 0.0) as u32 * 64, false, t0, t1, uc, cr, cw);
+            if hi > prev + 0.2 {
+                out.push((prev, hi));
+            }
+            out
+        };
+        for (k, (t0, t1)) in [(3.5f32, p.cross_half), (-p.cross_half, -3.5)]
+            .into_iter()
+            .enumerate()
+        {
+            for (a, e) in sub(t0, t1) {
+                if e - a > 0.5 {
+                    seg(&mut b, &ctx, a, e, false, uc, cr, cw, true, true, false);
+                }
+                furniture_axis(&mut b, &ctx, 0x6200 + uci as u32 + k as u32 * 64, false, a, e, uc, cr, cw);
+            }
         }
         for (t0, t1) in [(6.5, p.cross_half), (-p.cross_half, -6.5)] {
-            if t1 > t0 + 0.5 {
-                seg(&mut b, &ctx, t0, t1, false, uc, cr, cw, false, false, true);
+            for (a, e) in sub(t0, t1) {
+                if e - a > 0.5 {
+                    seg(&mut b, &ctx, a, e, false, uc, cr, cw, false, false, true);
+                }
             }
         }
     }
@@ -336,7 +382,11 @@ pub fn build_streets(
         let clear = p
             .cross
             .iter()
-            .all(|&(uc, _, _)| s + 3.0 < uc - 10.0 || s > uc + 10.0);
+            .all(|&(uc, _, _)| s + 3.0 < uc - 10.0 || s > uc + 10.0)
+            && cuts
+                .main
+                .iter()
+                .all(|&(z0, z1)| s + 3.0 < z0 - 2.0 || s > z1 + 2.0);
         if clear {
             stripe(
                 &mut b, &ctx, true, 0.0, hr, hw, s, s + 3.0, -0.125, 0.125,
@@ -831,6 +881,7 @@ fn street_furniture(
     len: f32,
     get: &dyn Fn(f32, f32) -> ([f32; 2], f32, [f32; 2], [f32; 2]),
     corners: &[f32],
+    blocked: &dyn Fn([f32; 2]) -> bool,
 ) {
     if len < 14.0 {
         return;
@@ -876,6 +927,11 @@ fn street_furniture(
             && corners.iter().all(|&c| (ss - c).abs() > 3.0);
         if clear {
             let (p, z, along, outw) = get(ss, side * (x + (ja - 0.5) * 0.5));
+            if blocked(p) {
+                s += step + ja * 1.1;
+                i += 1;
+                continue;
+            }
             let variant = j ^ hash2(i ^ 0x77, seed);
             match item {
                 0 => {
@@ -921,7 +977,258 @@ fn furniture_axis(
         let sec = section(ctx, u_along, t, c, hr, hw);
         ([u, v], sec.h0 + KERB_H, along, outw)
     };
-    street_furniture(b, ctx, seed, hr, hw, len, &get, &[]);
+    street_furniture(b, ctx, seed, hr, hw, len, &get, &[], &|_| false);
+}
+
+// ------------------------------------------------------------ junctions --
+
+/// The cuts the junctions impose on the procedural grid + stats.
+#[derive(Clone, Default)]
+pub struct NetCuts {
+    /// main-street axis intervals (u, metres)
+    pub main: Vec<(f32, f32)>,
+    /// per cross lane: intervals along v (metres)
+    pub lanes: Vec<Vec<(f32, f32)>>,
+    /// crossings + attachments found (self-test counters)
+    pub events: usize,
+    /// chain free ends that sit on another way
+    pub attaches: usize,
+}
+
+enum WKind {
+    Chain(usize),
+    Main,
+    Lane(usize),
+}
+
+/// A way of the junction network: a plan polyline plus its half-widths.
+struct JWay<'a> {
+    pts: &'a [[f32; 2]],
+    hr: f32,
+    hw: f32,
+    kind: WKind,
+}
+
+/// Proper segment intersection: returns the point and the parameters.
+fn seg_int(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> Option<([f32; 2], f32, f32)> {
+    let da = vsub(a1, a0);
+    let db = vsub(b1, b0);
+    let den = da[0] * db[1] - da[1] * db[0];
+    if den.abs() < 1e-6 {
+        return None;
+    }
+    let d = vsub(b0, a0);
+    let t = (d[0] * db[1] - d[1] * db[0]) / den;
+    let u = (d[0] * da[1] - d[1] * da[0]) / den;
+    if !(-0.001..=1.001).contains(&t) || !(-0.001..=1.001).contains(&u) {
+        return None;
+    }
+    Some((vadd(a0, vmul(da, t)), t, u))
+}
+
+/// Intersection of two infinite lines (point + direction).
+fn line_int2(p: [f32; 2], d: [f32; 2], q: [f32; 2], e: [f32; 2]) -> Option<[f32; 2]> {
+    let den = d[0] * e[1] - d[1] * e[0];
+    if den.abs() < 1e-6 {
+        return None;
+    }
+    let r = vsub(q, p);
+    let t = (r[0] * e[1] - r[1] * e[0]) / den;
+    Some(vadd(p, vmul(d, t)))
+}
+
+/// Nearest point on a polyline and its distance.
+pub fn near_poly(pts: &[[f32; 2]], p: [f32; 2]) -> ([f32; 2], f32) {
+    let mut best = (p, f32::MAX);
+    for k in 0..pts.len().saturating_sub(1) {
+        let a = pts[k];
+        let ab = vsub(pts[k + 1], a);
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if l2 < 1e-9 {
+            continue;
+        }
+        let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0);
+        let q = vadd(a, vmul(ab, t));
+        let d = vlen(vsub(p, q));
+        if d < best.1 {
+            best = (q, d);
+        }
+    }
+    best
+}
+
+/// Direction of the polyline segment nearest to p.
+fn dir_at(pts: &[[f32; 2]], p: [f32; 2]) -> [f32; 2] {
+    let mut best = (f32::MAX, [1.0f32, 0.0]);
+    for k in 0..pts.len().saturating_sub(1) {
+        let a = pts[k];
+        let ab = vsub(pts[k + 1], a);
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if l2 < 1e-9 {
+            continue;
+        }
+        let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0);
+        let q = vadd(a, vmul(ab, t));
+        let d = vlen(vsub(p, q));
+        if d < best.0 {
+            best = (d, vunit(ab));
+        }
+    }
+    best.1
+}
+
+/// Point p pulled back toward q so it stays within `max` metres of q along d.
+fn clamp_along(q: [f32; 2], d: [f32; 2], p: [f32; 2], max: f32) -> [f32; 2] {
+    let r = vsub(p, q);
+    let t = r[0] * d[0] + r[1] * d[1];
+    let tc = t.clamp(-max, max);
+    vadd(q, vmul(d, tc))
+}
+
+/// Sort + union intervals closer than `gap`.
+fn merge_intervals(mut v: Vec<(f32, f32)>, gap: f32) -> Vec<(f32, f32)> {
+    v.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut out: Vec<(f32, f32)> = Vec::new();
+    for (a, b) in v {
+        if let Some(l) = out.last_mut() {
+            if a <= l.1 + gap {
+                l.1 = l.1.max(b);
+                continue;
+            }
+        }
+        out.push((a, b));
+    }
+    out
+}
+
+/// The walk-line of one way crosses the roadway edges of the other: between
+/// the two intersection points the kerb + sidewalk of the first way vanish.
+fn emit_chords(
+    own: &JWay,
+    other: &JWay,
+    q: [f32; 2],
+    do_: [f32; 2],
+    db_: [f32; 2],
+    out: &mut Vec<([f32; 2], [f32; 2])>,
+) {
+    for side in [1.0f32, -1.0] {
+        let no = vperp(do_);
+        let wl = vadd(q, vmul(no, side * own.hw));
+        let nb = vperp(db_);
+        let e1 = vadd(q, vmul(nb, other.hr));
+        let e2 = vsub(q, vmul(nb, other.hr));
+        if let (Some(p1), Some(p2)) = (
+            line_int2(wl, do_, e1, db_),
+            line_int2(wl, do_, e2, db_),
+        ) {
+            out.push((clamp_along(q, do_, p1, 27.0), clamp_along(q, do_, p2, 27.0)));
+        }
+    }
+}
+
+/// For every pair of ways (at least one a drawn chain) the walk lines of
+/// the grid ways are cut where the other's roadway edges cross them: the
+/// kerbs, sidewalks and furniture of the main street / lanes break there.
+/// Nearby interruptions merge into one junction.  The drawn chains keep
+/// clear of the network geometrically inside `build_roads`.
+pub fn net_cuts(p: &Params, chains: &[Vec<[f32; 2]>]) -> NetCuts {
+    let (hr, hw) = (3.5f32, 6.5f32);
+    let mut cuts = NetCuts {
+        main: Vec::new(),
+        lanes: vec![Vec::new(); p.cross.len()],
+        events: 0,
+        attaches: 0,
+    };
+    let main_pts = [[p.main_t0, 0.0], [p.main_t1, 0.0]];
+    let mut lane_pts: Vec<[[f32; 2]; 2]> = Vec::new();
+    for &(uc, _cr, _cw) in &p.cross {
+        lane_pts.push([[uc, 3.5], [uc, p.cross_half.max(3.6)]]);
+        lane_pts.push([[uc, -p.cross_half.max(3.6)], [uc, -3.5]]);
+    }
+    let mut ways: Vec<JWay> = Vec::new();
+    for (ci, ch) in chains.iter().enumerate() {
+        if ch.len() >= 2 {
+            ways.push(JWay { pts: ch, hr, hw, kind: WKind::Chain(ci) });
+        }
+    }
+    if p.main_t1 > p.main_t0 + 1.0 {
+        ways.push(JWay { pts: &main_pts, hr, hw, kind: WKind::Main });
+    }
+    for k in 0..lane_pts.len() {
+        let lw = p.cross[k / 2];
+        ways.push(JWay { pts: &lane_pts[k], hr: lw.1, hw: lw.2, kind: WKind::Lane(k / 2) });
+    }
+    for i in 0..ways.len() {
+        for j in (i + 1)..ways.len() {
+            if !matches!(ways[i].kind, WKind::Chain(_)) && !matches!(ways[j].kind, WKind::Chain(_)) {
+                continue;
+            }
+            let (a, b) = (&ways[i], &ways[j]);
+            let mut events: Vec<[f32; 2]> = Vec::new();
+            for t in 0..b.pts.len() - 1 {
+                for s in 0..a.pts.len() - 1 {
+                    if let Some((q, _ta, _tb)) = seg_int(a.pts[s], a.pts[s + 1], b.pts[t], b.pts[t + 1]) {
+                        events.push(q);
+                    }
+                }
+            }
+            for (w, o) in [(i, j), (j, i)] {
+                if !matches!(ways[w].kind, WKind::Chain(_)) {
+                    continue;
+                }
+                let endn = ways[w].pts.len() - 1;
+                for k in [0usize, endn] {
+                    let ep = ways[w].pts[k];
+                    let (np, d) = near_poly(ways[o].pts, ep);
+                    if d <= 0.45 {
+                        cuts.attaches += 1;
+                        events.push(np);
+                    }
+                }
+            }
+            cuts.events += events.len();
+            for q in &events {
+                let da = dir_at(a.pts, *q);
+                let db = dir_at(b.pts, *q);
+                for (own, other, d1, d2) in [(a, b, da, db), (b, a, db, da)] {
+                    let mut ch = Vec::new();
+                    emit_chords(own, other, *q, d1, d2, &mut ch);
+                    match own.kind {
+                        WKind::Chain(_) => {}
+                        WKind::Main => {
+                            // both sides cut over one interval (the grid
+                            // breaks kerb + walk across the whole junction)
+                            let mut lo = f32::MAX;
+                            let mut hi = f32::MIN;
+                            for (q1, q2) in ch {
+                                lo = lo.min(q1[0].min(q2[0]));
+                                hi = hi.max(q1[0].max(q2[0]));
+                            }
+                            if lo < hi {
+                                cuts.main.push((lo - 0.35, hi + 0.35));
+                            }
+                        }
+                        WKind::Lane(li) => {
+                            let mut lo = f32::MAX;
+                            let mut hi = f32::MIN;
+                            for (q1, q2) in ch {
+                                lo = lo.min(q1[1].min(q2[1]));
+                                hi = hi.max(q1[1].max(q2[1]));
+                            }
+                            if lo < hi {
+                                cuts.lanes[li].push((lo - 0.35, hi + 0.35));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cuts.main = merge_intervals(cuts.main, 0.5);
+    for l in cuts.lanes.iter_mut() {
+        *l = merge_intervals(std::mem::take(l), 0.5);
+    }
+    cuts
 }
 
 /// Editor-drawn road chains: the street cross-section swept along a
@@ -934,6 +1241,7 @@ pub fn build_roads(
     eu: [f32; 2],
     nvec: [f32; 2],
     chains: &[Vec<[f32; 2]>],
+    net: &Params,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
     let ctx = Ctx { h_at, anchor, mn, eu, nvec };
     let mut b = Builder::new();
@@ -955,7 +1263,71 @@ pub fn build_roads(
         if ch.len() < 2 {
             continue;
         }
-        let (path, corners) = smooth_chain(ch, 9.0);
+        // the ways this chain must keep clear of: every other chain, the
+        // main street and the cross lanes (raw polylines + half-widths)
+        let mut main_pts = [[0.0f32, 0.0], [0.0, 0.0]];
+        if net.main_t1 > net.main_t0 + 1.0 {
+            main_pts = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
+        }
+        let mut lane_pts: Vec<[[f32; 2]; 2]> = Vec::new();
+        for &(uc, _cr, _cw) in &net.cross {
+            lane_pts.push([[uc, 3.5], [uc, net.cross_half.max(3.6)]]);
+            lane_pts.push([[uc, -net.cross_half.max(3.6)], [uc, -3.5]]);
+        }
+        let mut clearers: Vec<(&[[f32; 2]], f32, f32)> = Vec::new();
+        for (oj, och) in chains.iter().enumerate() {
+            if oj != ci && och.len() >= 2 {
+                clearers.push((och, hr, hw));
+            }
+        }
+        if net.main_t1 > net.main_t0 + 1.0 {
+            clearers.push((&main_pts, hr, hw));
+        }
+        for (k, lp) in lane_pts.iter().enumerate() {
+            let lw = net.cross[k / 2];
+            clearers.push((lp, lw.1, lw.2));
+        }
+        // T-attachments: a free end sitting on another way extends the slab
+        // across that roadway (the point is appended before smoothing)
+        let mut raw: Vec<[f32; 2]> = ch.to_vec();
+        {
+            let endn = raw.len() - 1;
+            let mut ext = [0.0f32; 2];
+            for isp in [true, false] {
+                let k = if isp { 0 } else { endn };
+                let ep = raw[k];
+                for &(opts, ohr, _ohw) in &clearers {
+                    let (np, d) = near_poly(opts, ep);
+                    if d > 0.45 {
+                        continue;
+                    }
+                    let dird = if isp {
+                        vmul(vunit(vsub(raw[1], raw[0])), -1.0)
+                    } else {
+                        vunit(vsub(raw[endn], raw[endn - 1]))
+                    };
+                    let db = dir_at(opts, np);
+                    let sn = (dird[0] * db[1] - dird[1] * db[0]).abs().max(0.34);
+                    let e = ((ohr + 0.3) / sn).clamp(2.0, 16.0);
+                    if isp {
+                        ext[0] = ext[0].max(e);
+                    } else {
+                        ext[1] = ext[1].max(e);
+                    }
+                }
+            }
+            if ext[0] > 0.05 {
+                let d0 = vunit(vsub(raw[1], raw[0]));
+                raw.insert(0, vsub(raw[0], vmul(d0, ext[0])));
+            }
+            if ext[1] > 0.05 {
+                let n0 = raw.len();
+                let d1 = vunit(vsub(raw[n0 - 1], raw[n0 - 2]));
+                let e1 = vadd(raw[n0 - 1], vmul(d1, ext[1]));
+                raw.push(e1);
+            }
+        }
+        let (path, corners) = smooth_chain(&raw, 9.0);
         if path.len() < 2 {
             continue;
         }
@@ -964,12 +1336,30 @@ pub fn build_roads(
             continue;
         }
         let total = stns[stns.len() - 1].s;
+        // a sidewalk band (kerb + walk of one side) dies where it would run
+        // into another way's corridor; the roadway slab never dies
+        let blocked = |p: [f32; 2], m: f32| -> bool {
+            clearers
+                .iter()
+                .any(|&(opts, _ohr, ohw)| near_poly(opts, p).1 < ohw + m)
+        };
+        let band_hit = |s0: &St, s1: &St, x0: f32, x1: f32| -> bool {
+            for (st, x) in [(s0, x0), (s0, x1), (s1, x0), (s1, x1)] {
+                let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
+                if blocked(q, 0.0) {
+                    return true;
+                }
+            }
+            false
+        };
         for j in 0..stns.len() - 1 {
             let (a, e) = (&stns[j], &stns[j + 1]);
             let st3 = |st: &St, x: f32, z: f32| -> [f32; 3] {
                 let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
                 ctx.pt(q[0], q[1], z)
             };
+            let kp = !band_hit(a, e, hr, hw);
+            let kn = !band_hit(a, e, -hw, -hr);
             // roadway slab
             quad_up(
                 &mut b,
@@ -977,21 +1367,28 @@ pub fn build_roads(
                 [st3(a, -hr, a.h0), st3(e, -hr, e.h0), st3(e, hr, e.h0), st3(a, hr, a.h0)],
                 [[a.s / 4.0, 0.0], [e.s / 4.0, 0.0], [e.s / 4.0, 1.0], [a.s / 4.0, 1.0]],
             );
-            // kerb tops
-            quad_up(
-                &mut b,
-                M_KERB,
-                [st3(a, hr, a.h0 + KERB_H), st3(e, hr, e.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(a, hr + KERB_W, a.h0 + KERB_H)],
-                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
-            );
-            quad_up(
-                &mut b,
-                M_KERB,
-                [st3(a, -hr - KERB_W, a.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(e, -hr, e.h0 + KERB_H), st3(a, -hr, a.h0 + KERB_H)],
-                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
-            );
+            // kerb tops (they stop at every junction)
+            if kp {
+                quad_up(
+                    &mut b,
+                    M_KERB,
+                    [st3(a, hr, a.h0 + KERB_H), st3(e, hr, e.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(a, hr + KERB_W, a.h0 + KERB_H)],
+                    [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+                );
+            }
+            if kn {
+                quad_up(
+                    &mut b,
+                    M_KERB,
+                    [st3(a, -hr - KERB_W, a.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(e, -hr, e.h0 + KERB_H), st3(a, -hr, a.h0 + KERB_H)],
+                    [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+                );
+            }
             // kerb faces toward the roadway
             for sx in [hr, -hr] {
+                if (sx > 0.0 && !kp) || (sx < 0.0 && !kn) {
+                    continue;
+                }
                 let p = [
                     st3(a, sx, a.h0 + KERB_H),
                     st3(e, sx, e.h0 + KERB_H),
@@ -1006,20 +1403,27 @@ pub fn build_roads(
                 }
             }
             // sidewalks, flush with the kerb tops
-            quad_up(
-                &mut b,
-                M_WALK,
-                [st3(a, hr + KERB_W, a.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(e, hw, e.h0 + KERB_H), st3(a, hw, a.h0 + KERB_H)],
-                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
-            );
-            quad_up(
-                &mut b,
-                M_WALK,
-                [st3(a, -hw, a.h0 + KERB_H), st3(e, -hw, e.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(a, -hr - KERB_W, a.h0 + KERB_H)],
-                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
-            );
+            if kp {
+                quad_up(
+                    &mut b,
+                    M_WALK,
+                    [st3(a, hr + KERB_W, a.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(e, hw, e.h0 + KERB_H), st3(a, hw, a.h0 + KERB_H)],
+                    [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+                );
+            }
+            if kn {
+                quad_up(
+                    &mut b,
+                    M_WALK,
+                    [st3(a, -hw, a.h0 + KERB_H), st3(e, -hw, e.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(a, -hr - KERB_W, a.h0 + KERB_H)],
+                    [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+                );
+            }
             // outer edges drop to their own local ground
             for sx in [hw, -hw] {
+                if (sx > 0.0 && !kp) || (sx < 0.0 && !kn) {
+                    continue;
+                }
                 let gb = |s: &St| {
                     let q = [s.p[0] + s.n[0] * sx, s.p[1] + s.n[1] * sx];
                     ctx.hh(q[0], q[1]) - 0.5
@@ -1051,6 +1455,10 @@ pub fn build_roads(
                 let s1 = sd + 3.0 * (k + 1) as f32 / steps as f32;
                 let a = st_at(&stns, s0);
                 let e = st_at(&stns, s1);
+                let mid = [(a.p[0] + e.p[0]) * 0.5, (a.p[1] + e.p[1]) * 0.5];
+                if blocked(mid, 2.0) {
+                    continue;
+                }
                 quad_up(
                     &mut b,
                     M_PAINT,
@@ -1067,7 +1475,17 @@ pub fn build_roads(
             let along = [-st.n[1], st.n[0]];
             (pos, st.h0 + KERB_H, along, st.n)
         };
-        street_furniture(&mut b, &ctx, 0x5700 + ci as u32, hr, hw, total, &get, &corners);
+        street_furniture(
+            &mut b,
+            &ctx,
+            0x5700 + ci as u32,
+            hr,
+            hw,
+            total,
+            &get,
+            &corners,
+            &|q: [f32; 2]| blocked(q, 0.6),
+        );
     }
     (b.finish(12), textures())
 }
