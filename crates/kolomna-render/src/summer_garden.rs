@@ -41,11 +41,15 @@ const PATH_HW: f32 = 1.5; // cross alley half-width
 const ALLEY_HW: f32 = 2.2; // main alley half-width
 
 pub struct Params {
-    /// park centre in plan coords
+    /// park centre in plan coords (built-in outline only)
     pub centre: [f32; 2],
     pub ru: f32,
     pub rv: f32,
     pub seed: u64,
+    /// user-drawn outline (plan coords): when it has >= 3 points it
+    /// replaces the built-in jittered ellipse and becomes the very shape
+    /// of the park — the fence, ring and bosquets all follow it
+    pub outline: Vec<[f32; 2]>,
 }
 
 struct Ctx<'a> {
@@ -1095,23 +1099,54 @@ pub fn build_garden(
     let ctx = Ctx { h_at, anchor, mn, eu, nvec };
     let mut b = Builder::new();
     let mut rng = Rng::new(p.seed);
-    let c = p.centre;
 
-    // ---- the irregular outline: 9 jittered vertices around the ellipse
-    let nv = 9;
-    let mut poly: Vec<[f32; 2]> = Vec::with_capacity(nv);
-    for k in 0..nv {
-        let a = k as f32 / nv as f32 * std::f32::consts::TAU + rng.range(-0.05, 0.05);
-        let ru = p.ru * rng.range(0.80, 1.14);
-        let rv = p.rv * rng.range(0.80, 1.14);
-        poly.push([c[0] + a.cos() * ru, c[1] + a.sin() * rv]);
+    // ---- the outline: either the built-in irregular 9-gon around the
+    // ellipse (the Summer Garden) or the user-drawn contour (the editor),
+    // which becomes the very shape of the park
+    let (c, poly): ([f32; 2], Vec<[f32; 2]>) = if p.outline.len() >= 3 {
+        let mut ps = p.outline.clone();
+        let np = ps.len() as f32;
+        let mut c0 = [0.0f32, 0.0];
+        for q in &ps {
+            c0[0] += q[0];
+            c0[1] += q[1];
+        }
+        let c0 = [c0[0] / np, c0[1] / np];
+        // CCW: the inward normals must face the park
+        let mut ar = 0.0f32;
+        for k in 0..ps.len() {
+            let a = ps[k];
+            let e = ps[(k + 1) % ps.len()];
+            ar += a[0] * e[1] - e[0] * a[1];
+        }
+        if ar < 0.0 {
+            ps.reverse();
+        }
+        (c0, ps)
+    } else {
+        let nv = 9;
+        let mut ps: Vec<[f32; 2]> = Vec::with_capacity(nv);
+        for k in 0..nv {
+            let a = k as f32 / nv as f32 * std::f32::consts::TAU + rng.range(-0.05, 0.05);
+            let ru = p.ru * rng.range(0.80, 1.14);
+            let rv = p.rv * rng.range(0.80, 1.14);
+            ps.push([p.centre[0] + a.cos() * ru, p.centre[1] + a.sin() * rv]);
+        }
+        (p.centre, ps)
+    };
+    // outline extents: they drive the gate targets and the alley spans
+    let mut ru_e = 0.0f32;
+    let mut rv_e = 0.0f32;
+    for q in &poly {
+        ru_e = ru_e.max((q[0] - c[0]).abs());
+        rv_e = rv_e.max((q[1] - c[1]).abs());
     }
     let shrunk6 = shrink(&poly, 6.0);
     let shrunk15 = shrink(&poly, 1.5);
 
     // ---- gates: nearest edges to the west and north targets
-    let target_main = [c[0] - p.ru, c[1]];
-    let target_north = [c[0], c[1] + p.rv];
+    let target_main = [c[0] - ru_e, c[1]];
+    let target_north = [c[0], c[1] + rv_e];
     let mut gates: Vec<Option<Gate>> = vec![None; poly.len()];
     let mut best = (f32::MAX, 0usize, 0.5f32);
     for k in 0..poly.len() {
@@ -1209,7 +1244,7 @@ pub fn build_garden(
     }
 
     // ---- main alley + cross alleys inside
-    let main_iv = line_inside(&poly, true, c[1], c[0] - p.ru * 1.3, c[0] + p.ru * 1.3);
+    let main_iv = line_inside(&poly, true, c[1], c[0] - ru_e * 1.3, c[0] + ru_e * 1.3);
     let main_span = main_iv.first().copied().unwrap_or((c[0] - 10.0, c[0] + 10.0));
     let main_a = main_span.0 + 3.5;
     let main_e = main_span.1 - 3.5;
@@ -1220,7 +1255,7 @@ pub fn build_garden(
     let mut v_lines: Vec<f32> = Vec::new();
     for dv in [-36.0f32, -18.0, 18.0, 36.0] {
         v_lines.push(c[1] + dv);
-        for (a, e) in line_inside(&poly, true, c[1] + dv, c[0] - p.ru * 1.3, c[0] + p.ru * 1.3) {
+        for (a, e) in line_inside(&poly, true, c[1] + dv, c[0] - ru_e * 1.3, c[0] + ru_e * 1.3) {
             if e - a > 4.0 {
                 strip(&mut b, &ctx, [a + 1.0, c[1] + dv], [e - 1.0, c[1] + dv], PATH_HW);
                 occ.seg([a + 1.0, c[1] + dv], [e - 1.0, c[1] + dv], PATH_HW);
@@ -1230,7 +1265,7 @@ pub fn build_garden(
     let mut u_lines: Vec<f32> = Vec::new();
     for du in [-44.0f32, -22.0, 22.0, 44.0] {
         u_lines.push(u_mid + du);
-        for (a, e) in line_inside(&poly, false, u_mid + du, c[1] - p.rv * 1.3, c[1] + p.rv * 1.3) {
+        for (a, e) in line_inside(&poly, false, u_mid + du, c[1] - rv_e * 1.3, c[1] + rv_e * 1.3) {
             if e - a > 4.0 {
                 strip(&mut b, &ctx, [u_mid + du, a + 1.0], [u_mid + du, e - 1.0], PATH_HW);
                 occ.seg([u_mid + du, a + 1.0], [u_mid + du, e - 1.0], PATH_HW);

@@ -41,6 +41,19 @@ const ZOOM_MAX: f32 = 100.0;
 
 // ---------------------------------------------------------------- scene ----
 
+/// The editor's drawing: free road chains, four-click courtyard quads and
+/// park outlines, all in plan coordinates (metres in the scene's eu/nvec
+/// frame).  Session-only — nothing is persisted, by design.
+#[derive(Default)]
+pub struct UserPlan {
+    /// road chains: click-to-click polylines
+    pub roads: Vec<Vec<[f32; 2]>>,
+    /// courtyards: exactly four clicks (CCW in plan)
+    pub blocks: Vec<[[f32; 2]; 4]>,
+    /// parks: >= 3 contour clicks (CCW in plan)
+    pub parks: Vec<Vec<[f32; 2]>>,
+}
+
 pub struct Scene {
     base: Vec<Vertex>,
     atlas: Vec<u8>,
@@ -55,6 +68,10 @@ pub struct Scene {
     sm: Vec<f32>,
     /// grid side length of `sm`
     n: usize,
+    /// plan frame: cell coords of plan (0,0) and its orthonormal axes
+    anchor: [f32; 2],
+    eu: [f32; 2],
+    nvec: [f32; 2],
     /// road network from the save (16 m tiles)
     road_mesh: RoadMesh,
     road_textures: Vec<(u32, u32, Vec<u8>)>,
@@ -66,7 +83,7 @@ pub struct Scene {
     focus: [f32; 3],
 }
 
-pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
+pub fn load_scene(city: &str, dat: &str, user: &UserPlan) -> Result<Scene, Box<dyn Error>> {
     let mut terrain = load_terrain(city)?;
     let n = grid_side(&terrain);
     if n * n != terrain.len() {
@@ -202,32 +219,42 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
     let mut blk_edges: Vec<(f32, f32, f32)> = Vec::new(); // per block: u_min, u_max, v_max
-    for blk in 0..10u64 {
-        let s: f32 = if blk % 2 == 0 { 1.0 } else { -1.0 }; // which side of the road
-        let u_off = ((blk / 2) as f32 - 2.0) * 56.0;
-        let seed_b = 9000 + blk * 131;
+    for blk in 0..(10 + user.blocks.len()) as u64 {
+        let usr = blk >= 10; // a courtyard drawn in the editor
+        let s: f32 = if usr { 1.0 } else if blk % 2 == 0 { 1.0 } else { -1.0 };
+        let u_off = if usr { 0.0 } else { ((blk / 2) as f32 - 2.0) * 56.0 };
+        let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
         let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
 
         // the block plan: an irregular quad (frame: a along the street, b
         // inward), every vertex jittered — never a neat rectangle; the
-        // footprint varies per block so the variants differ
-        let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
-        let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
-        let mut q = [
-            [u_off - a_half, setback],
-            [u_off + a_half, setback],
-            [u_off + a_half - 5.0, setback + b_len],
-            [u_off - a_half + 5.0, setback + b_len],
-        ];
-        for p in q.iter_mut() {
-            p[0] += (rng.f() - 0.5) * 9.0;
-            p[1] += (rng.f() - 0.5) * 7.0;
+        // footprint varies per block so the variants differ.  A user block
+        // (blk >= 10) arrives exactly as the editor drew it — already CCW
+        // in this same plan frame — so the very same path fills it.
+        let mut q: [[f32; 2]; 4];
+        if usr {
+            q = user.blocks[(blk - 10) as usize];
+        } else {
+            let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
+            let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
+            q = [
+                [u_off - a_half, setback],
+                [u_off + a_half, setback],
+                [u_off + a_half - 5.0, setback + b_len],
+                [u_off - a_half + 5.0, setback + b_len],
+            ];
+            for p in q.iter_mut() {
+                p[0] += (rng.f() - 0.5) * 9.0;
+                p[1] += (rng.f() - 0.5) * 7.0;
+            }
         }
-        blk_edges.push((
-            q[0][0].min(q[3][0]),
-            q[1][0].max(q[2][0]),
-            q[2][1].max(q[3][1]),
-        ));
+        if !usr {
+            blk_edges.push((
+                q[0][0].min(q[3][0]),
+                q[1][0].max(q[2][0]),
+                q[2][1].max(q[3][1]),
+            ));
+        }
         // side i runs q[i] -> q[i+1]: unit tangent, inward normal, length
         let side = |q: &[[f32; 2]; 4], i: usize| -> ([f32; 2], [f32; 2], f32) {
             let a = q[i];
@@ -531,10 +558,38 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 ru: 60.0,
                 rv: 46.0,
                 seed: 0x5EED_6A2D,
+                outline: Vec::new(),
             },
         );
         println!("summer garden: fence around an irregular outline, 2 gates");
         village.push((gmesh, gtexs, [0.0, 0.0, 0.0], 0.0));
+
+        // ---- the editor's roads: free chains with the street cross-section
+        if !user.roads.is_empty() {
+            let (rmesh, rtexs) =
+                kolomna_render::streets::build_roads(&h_at, anchor, mn, eu, nvec, &user.roads);
+            println!("drawn roads: {} chain(s)", user.roads.len());
+            village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
+        }
+        // ---- the editor's parks: the drawn contour is the outline
+        for (pi, park) in user.parks.iter().enumerate() {
+            let (pmesh, ptexs) = kolomna_render::summer_garden::build_garden(
+                &h_at,
+                anchor,
+                mn,
+                eu,
+                nvec,
+                &kolomna_render::summer_garden::Params {
+                    centre: [0.0, 0.0],
+                    ru: 0.0,
+                    rv: 0.0,
+                    seed: 0xD00D_0000 + pi as u64,
+                    outline: park.clone(),
+                },
+            );
+            println!("drawn park {}: {} outline points", pi + 1, park.len());
+            village.push((pmesh, ptexs, [0.0, 0.0, 0.0], 0.0));
+        }
     }
 
     for (i, (w, d, dh)) in report.iter().enumerate() {
@@ -610,6 +665,9 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         wl,
         sm,
         n,
+        anchor,
+        eu,
+        nvec,
         road_mesh,
         road_textures,
         village,
@@ -621,7 +679,26 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
 /// Headless mode: render exactly one frame offscreen with the default camera
 /// (`zoom` scales the framing; 1.0 = whole grid) and write it as a PNG.
 pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
-    let scene = load_scene(city, dat)?;
+    // hidden headless test hatch (KOLOMNA_PLAN_DEMO=1): a demo drawing so
+    // the editor's generators can be exercised without a mouse — a road
+    // chain, a courtyard quad and a park contour, all in plan coords
+    let user = if std::env::var("KOLOMNA_PLAN_DEMO").is_ok() {
+        UserPlan {
+            roads: vec![vec![[-40.0, 130.0], [40.0, 150.0], [108.0, 125.0]]],
+            blocks: vec![[[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]]],
+            parks: vec![vec![
+                [150.0, 90.0],
+                [220.0, 95.0],
+                [235.0, 150.0],
+                [200.0, 195.0],
+                [140.0, 180.0],
+                [125.0, 130.0],
+            ]],
+        }
+    } else {
+        UserPlan::default()
+    };
+    let scene = load_scene(city, dat, &user)?;
     let mut placed = Vec::new();
     for (mesh, texs, pos, rot) in &scene.village {
         placed.push(PlacedModel {
@@ -965,6 +1042,8 @@ struct Renderer {
     village: Vec<ModelRenderer>,
     /// index of the courtyard boundary overlay inside `village`
     plan_idx: usize,
+    /// the editor's in-progress sketch (drawn over the ground)
+    preview: Option<ModelRenderer>,
     ui: UiRenderer,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -1048,10 +1127,34 @@ impl Renderer {
             road,
             village,
             plan_idx: scene.plan_idx,
+            preview: None,
             ui,
             msaa_view,
             depth_view,
         })
+    }
+
+    /// The editor's in-progress sketch: a flat orange ribbon over the
+    /// ground (None clears it).
+    fn set_preview(&mut self, mesh: Option<kolomna_render::model::ModelMesh>) {
+        self.preview = mesh.map(|m| {
+            let tex: Vec<u8> = [255u8, 150, 40, 255]
+                .iter()
+                .copied()
+                .cycle()
+                .take(4 * 4 * 4)
+                .collect();
+            let r = ModelRenderer::new(
+                &self.device,
+                &self.queue,
+                self.config.format,
+                4,
+                &m,
+                &[(4u32, 4u32, tex)],
+            );
+            r.set_placement(&self.queue, [0.0, 0.0, 0.0], 0.0, 0.0);
+            r
+        });
     }
 
     /// zoom=1 world->screen scale for the current window size.
@@ -1085,6 +1188,9 @@ impl Renderer {
         self.terrain.set_params(&self.queue, &params);
         for r in &self.village {
             r.set_params(&self.queue, &params);
+        }
+        if let Some(p) = &self.preview {
+            p.set_params(&self.queue, &params);
         }
 
         let frame = match self.surface.get_current_texture() {
@@ -1145,6 +1251,9 @@ impl Renderer {
                     continue; // courtyard boundaries hidden
                 }
                 r.draw(&mut pass);
+            }
+            if let Some(p) = &self.preview {
+                p.draw(&mut pass);
             }
             self.ui.draw(&self.queue, &mut pass, w, h, hover_btn, show_plans);
         }
@@ -1372,6 +1481,12 @@ struct App {
     /// courtyard boundary overlay (button / key B)
     show_plans: bool,
     hover_btn: bool,
+    /// editor: 0 camera, 1 roads, 2 courtyards, 3 parks
+    tool: u8,
+    /// editor: the in-progress shape (plan coords)
+    pts: Vec<[f32; 2]>,
+    /// editor: everything committed this session
+    user: UserPlan,
 }
 
 impl ApplicationHandler for App {
@@ -1396,7 +1511,7 @@ impl ApplicationHandler for App {
                 std::process::exit(1);
             }
         };
-        let scene = match load_scene(&self.city, &self.dat) {
+        let scene = match load_scene(&self.city, &self.dat, &self.user) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1419,11 +1534,15 @@ impl ApplicationHandler for App {
         println!("  края окна            — навигация (карта едет, если мышь у края)");
         println!("  WASD/стрелки — перенос · Q/E — поворот 90° · R — сброс · Esc — выход");
         println!("  B / кнопка слева вверху — границы дворов (вкл/выкл)");
+        println!("  РЕДАКТОР: 1 камера · 2 дороги · 3 кварталы · 4 парки");
+        println!("            ЛКМ — точка · ПКМ — отменить фигуру · Backspace — убрать точку");
+        println!("            Enter — закончить (дороги: ≥2 точек, кварталы: 4, парки: ≥3) · Esc — выйти из режима");
         self.camera = Some(Camera::new(scene.grid, scene.zspan));
         self.scene = Some(scene);
         self.renderer = Some(renderer);
         self.window = Some(window);
         self.last_frame = Instant::now();
+        self.update_title();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1437,10 +1556,30 @@ impl ApplicationHandler for App {
                     match event.state {
                         ElementState::Pressed => {
                             if code == KeyCode::Escape {
-                                event_loop.exit();
+                                if self.tool != 0 || !self.pts.is_empty() {
+                                    self.tool = 0;
+                                    self.pts.clear();
+                                    self.refresh_preview();
+                                } else {
+                                    event_loop.exit();
+                                }
                                 return;
                             }
                             if !event.repeat {
+                                match code {
+                                    KeyCode::Digit1 => self.set_tool(0),
+                                    KeyCode::Digit2 => self.set_tool(1),
+                                    KeyCode::Digit3 => self.set_tool(2),
+                                    KeyCode::Digit4 => self.set_tool(3),
+                                    KeyCode::Enter | KeyCode::NumpadEnter => self.commit(),
+                                    KeyCode::Backspace => {
+                                        if !self.pts.is_empty() {
+                                            self.pts.pop();
+                                            self.refresh_preview();
+                                        }
+                                    }
+                                    _ => {}
+                                }
                                 if code == KeyCode::KeyB {
                                     self.show_plans = !self.show_plans;
                                 }
@@ -1518,6 +1657,25 @@ impl ApplicationHandler for App {
                         {
                             self.show_plans = !self.show_plans;
                             return; // a button click is not a pan
+                        }
+                        // editor: left adds a point, right cancels the shape
+                        if self.tool != 0 {
+                            if let Some((px, py)) = self.cursor {
+                                if button == MouseButton::Left && pressed {
+                                    if let Some(p) = self.screen_to_plan(px, py) {
+                                        if !(self.tool == 2 && self.pts.len() >= 4) {
+                                            self.pts.push(p);
+                                            self.refresh_preview();
+                                        }
+                                    }
+                                } else if button == MouseButton::Right && pressed {
+                                    if !self.pts.is_empty() {
+                                        self.pts.clear();
+                                        self.refresh_preview();
+                                    }
+                                }
+                            }
+                            return; // no map panning while a tool is active
                         }
                         self.drag_pan = pressed;
                     }
@@ -1619,6 +1777,240 @@ impl ApplicationHandler for App {
     }
 }
 
+/// The editor's in-progress sketch: a flat orange ribbon 0.30 m over the
+/// ground with a marker at every point (one flat texture, no lighting
+/// detail needed).
+fn preview_mesh(scene: &Scene, pts: &[[f32; 2]]) -> Option<kolomna_render::model::ModelMesh> {
+    if pts.is_empty() {
+        return None;
+    }
+    let mut b = kolomna_render::procgen::Builder::new();
+    let at = |u: f32, v: f32| -> [f32; 3] {
+        let w = [
+            scene.eu[0] * u + scene.nvec[0] * v,
+            scene.eu[1] * u + scene.nvec[1] * v,
+        ];
+        let h = sample_h(
+            &scene.sm,
+            scene.n,
+            scene.anchor[0] + w[0] / 16.0,
+            scene.anchor[1] + w[1] / 16.0,
+        ) - scene.mn
+            + 0.30;
+        [
+            scene.anchor[0] * 16.0 + w[0],
+            h,
+            scene.anchor[1] * 16.0 + w[1],
+        ]
+    };
+    let quad_up = |b: &mut kolomna_render::procgen::Builder, mut p: [[f32; 3]; 4]| {
+        let cz =
+            (p[1][0] - p[0][0]) * (p[2][1] - p[1][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[1][0]);
+        if cz < 0.0 {
+            p = [p[3], p[2], p[1], p[0]];
+        }
+        b.quad(0, p, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+    };
+    for w in pts.windows(2) {
+        let d = [w[1][0] - w[0][0], w[1][1] - w[0][1]];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-3);
+        let dir = [d[0] / l, d[1] / l];
+        let per = [-dir[1] * 0.7, dir[0] * 0.7];
+        let p = [
+            at(w[0][0] - per[0], w[0][1] - per[1]),
+            at(w[1][0] - per[0], w[1][1] - per[1]),
+            at(w[1][0] + per[0], w[1][1] + per[1]),
+            at(w[0][0] + per[0], w[0][1] + per[1]),
+        ];
+        quad_up(&mut b, p);
+    }
+    let m = 1.6f32;
+    for q in pts {
+        let p = [
+            at(q[0] - m, q[1] - m),
+            at(q[0] + m, q[1] - m),
+            at(q[0] + m, q[1] + m),
+            at(q[0] - m, q[1] + m),
+        ];
+        quad_up(&mut b, p);
+    }
+    Some(b.finish(1))
+}
+
+/// Positive (CCW) winding in the plan frame; the block filler and the park
+/// outline both expect it, so a right-to-left drawing works as well.
+fn fix_ccw(pts: &mut [[f32; 2]]) {
+    let mut ar = 0.0f32;
+    for k in 0..pts.len() {
+        let a = pts[k];
+        let e = pts[(k + 1) % pts.len()];
+        ar += a[0] * e[1] - e[0] * a[1];
+    }
+    if ar < 0.0 {
+        pts.reverse();
+    }
+}
+
+impl App {
+    /// Plan coordinates (metres in the scene's eu/nvec frame) under a
+    /// screen point: the same ray inversion the rotation pivot uses, then
+    /// the cell -> plan transform.
+    fn screen_to_plan(&self, px: f64, py: f64) -> Option<[f32; 2]> {
+        let scene = self.scene.as_ref()?;
+        let cam = self.camera.as_ref()?;
+        let renderer = self.renderer.as_ref()?;
+        let scale = (renderer.base_scale(scene) * cam.zoom).max(1e-3);
+        let a = cam.target[0] + (px as f32 - self.win_size.0 as f32 * 0.5) / scale;
+        let b = cam.target[1] + (py as f32 - self.win_size.1 as f32 * 0.5) / scale;
+        let t = cam.tilt.clamp(0.07, 1.0);
+        let smax = 2.0 * cam.grid;
+        let mut s = (b / t).clamp(0.0, smax);
+        for _ in 0..20 {
+            let cx = (s + a).clamp(0.0, cam.grid);
+            let cy = (s - a).clamp(0.0, cam.grid);
+            let zmesh = (sample_h(&scene.sm, scene.n, cx, cy) - scene.mn) * ZSCALE;
+            s = ((b + zmesh) / t).clamp(0.0, smax);
+        }
+        let rp = [s + a, s - a];
+        let c = cam.grid * 0.5;
+        let (sr, cr) = cam.rot.sin_cos();
+        let d = [rp[0] - c, rp[1] - c];
+        let cell = [c + d[0] * cr + d[1] * sr, c - d[0] * sr + d[1] * cr];
+        let rel = [
+            (cell[0] - scene.anchor[0]) * 16.0,
+            (cell[1] - scene.anchor[1]) * 16.0,
+        ];
+        Some([
+            rel[0] * scene.eu[0] + rel[1] * scene.eu[1],
+            rel[0] * scene.nvec[0] + rel[1] * scene.nvec[1],
+        ])
+    }
+
+    /// Rebuild the sketch + refresh the title (called after every edit).
+    fn refresh_preview(&mut self) {
+        let mesh = if let (Some(s), Some(_)) = (self.scene.as_ref(), self.renderer.as_ref()) {
+            preview_mesh(s, &self.pts)
+        } else {
+            None
+        };
+        if let Some(r) = self.renderer.as_mut() {
+            r.set_preview(mesh);
+        }
+        self.update_title();
+    }
+
+    fn set_tool(&mut self, t: u8) {
+        self.tool = t;
+        self.pts.clear();
+        self.refresh_preview();
+    }
+
+    fn update_title(&self) {
+        let hint = match self.tool {
+            1 => "ДОРОГИ: ЛКМ точка · Enter — готово · ПКМ — отмена",
+            2 => "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
+            3 => "ПАРКИ: клики по контуру · Enter — готово · ПКМ — отмена",
+            _ => "1 камера · 2 дороги · 3 кварталы · 4 парки · B — границы дворов",
+        };
+        if let Some(w) = self.window.as_ref() {
+            w.set_title(&format!("Kolomna — {hint}"));
+        }
+    }
+
+    /// Commit the in-progress shape: roads >= 2 points, courtyards exactly
+    /// 4, parks >= 3 (and at least 20 m across).  Then the scene is rebuilt.
+    fn commit(&mut self) {
+        let mut made = false;
+        match self.tool {
+            1 => {
+                if self.pts.len() >= 2 {
+                    self.user.roads.push(self.pts.clone());
+                    made = true;
+                } else {
+                    println!("дорога: нужно хотя бы 2 точки");
+                }
+            }
+            2 => {
+                if self.pts.len() == 4 {
+                    let mut q = self.pts.clone();
+                    fix_ccw(&mut q);
+                    self.user.blocks.push([q[0], q[1], q[2], q[3]]);
+                    made = true;
+                } else {
+                    println!("квартал: нужно ровно 4 клика (сейчас {})", self.pts.len());
+                }
+            }
+            3 => {
+                if self.pts.len() >= 3 {
+                    let mut q = self.pts.clone();
+                    fix_ccw(&mut q);
+                    let (mut u0, mut u1, mut v0, mut v1) =
+                        (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                    for p in &q {
+                        u0 = u0.min(p[0]);
+                        u1 = u1.max(p[0]);
+                        v0 = v0.min(p[1]);
+                        v1 = v1.max(p[1]);
+                    }
+                    if (u1 - u0).min(v1 - v0) < 20.0 {
+                        println!(
+                            "парк: маловат ({:.0}x{:.0} м) — нужно хотя бы 20 м по каждой стороне",
+                            u1 - u0,
+                            v1 - v0
+                        );
+                    } else {
+                        self.user.parks.push(q);
+                        made = true;
+                    }
+                } else {
+                    println!("парк: нужно хотя бы 3 точки контура");
+                }
+            }
+            _ => {}
+        }
+        if made {
+            self.pts.clear();
+            self.refresh_preview();
+            self.reload();
+        }
+    }
+
+    /// Rebuild the whole scene (save parse included) around the committed
+    /// drawing and swap the renderer in; the camera stays where it was.
+    fn reload(&mut self) {
+        let t0 = Instant::now();
+        let scene = match load_scene(&self.city, &self.dat, &self.user) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("перестройка сцены не удалась: {e}");
+                return;
+            }
+        };
+        let window = match self.window.as_ref() {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        let mut renderer = match Renderer::new(window, &scene) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("перестройка рендера не удалась: {e}");
+                return;
+            }
+        };
+        let mesh = preview_mesh(&scene, &self.pts);
+        renderer.set_preview(mesh);
+        self.scene = Some(scene);
+        self.renderer = Some(renderer);
+        println!(
+            "сцена перестроена за {:.2} с: дорог {}, кварталов {}, парков {}",
+            t0.elapsed().as_secs_f32(),
+            self.user.roads.len(),
+            self.user.blocks.len(),
+            self.user.parks.len()
+        );
+    }
+}
+
 /// Interactive mode: open a window and run the event loop until the user quits.
 pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
@@ -1642,6 +2034,9 @@ pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
         frames: 0,
         show_plans: true,
         hover_btn: false,
+        tool: 0,
+        pts: Vec::new(),
+        user: UserPlan::default(),
     };
     event_loop.run_app(&mut app)?;
     Ok(())

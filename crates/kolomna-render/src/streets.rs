@@ -450,6 +450,180 @@ fn tex_paint() -> (u32, u32, Vec<u8>) {
     (256, 256, v)
 }
 
+/// User-drawn roads (the editor): free chains of plan points. Every
+/// segment gets the same cross-section as the main street — a 7 m
+/// roadway, granite kerbs and tiled sidewalks — sampled on the same
+/// smoothed height field, so a drawn road conforms to the terrain exactly
+/// like the procedural one. Consecutive segments overlap ~3.4 m at
+/// internal nodes (corners close up); free ends keep only a small stub.
+pub fn build_roads(
+    h_at: &dyn Fn(f32, f32) -> f32,
+    anchor: [f32; 2],
+    mn: f32,
+    eu: [f32; 2],
+    nvec: [f32; 2],
+    chains: &[Vec<[f32; 2]>],
+) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
+    let ctx = Ctx { h_at, anchor, mn, eu, nvec };
+    let mut b = Builder::new();
+    let (hr, hw) = (3.5f32, 6.5f32);
+
+    // top-facing quad with the winding forced so its normal points up
+    let quad_up = |b: &mut Builder, mat: u32, mut p: [[f32; 3]; 4], uv: [[f32; 2]; 4]| {
+        let cz = (p[1][0] - p[0][0]) * (p[2][1] - p[1][1]) - (p[1][1] - p[0][1]) * (p[2][0] - p[1][0]);
+        if cz < 0.0 {
+            p = [p[3], p[2], p[1], p[0]];
+            let uv = [uv[3], uv[2], uv[1], uv[0]];
+            b.quad(mat, p, uv);
+        } else {
+            b.quad(mat, p, uv);
+        }
+    };
+
+    for ch in chains {
+        if ch.len() < 2 {
+            continue;
+        }
+        for k in 0..ch.len() - 1 {
+            let p0 = ch[k];
+            let p1 = ch[k + 1];
+            let d = [p1[0] - p0[0], p1[1] - p0[1]];
+            let l0 = (d[0] * d[0] + d[1] * d[1]).sqrt();
+            if l0 < 0.6 {
+                continue;
+            }
+            let dir = [d[0] / l0, d[1] / l0];
+            let per = [-dir[1], dir[0]];
+            let e_a = if k == 0 { 0.4 } else { 3.4 };
+            let e_b = if k + 2 == ch.len() { 0.4 } else { 3.4 };
+            let (t0, t1) = (-e_a, l0 + e_b);
+            let g_at = |t: f32, x: f32| -> [f32; 2] {
+                [p0[0] + dir[0] * t + per[0] * x, p0[1] + dir[1] * t + per[1] * x]
+            };
+            let ns = ((t1 - t0) / STEP).ceil().max(1.0) as usize;
+            let secs: Vec<Sec> = (0..=ns)
+                .map(|i| {
+                    let t = t0 + (t1 - t0) * i as f32 / ns as f32;
+                    let mut hm = f32::MIN;
+                    let mut hn = f32::MAX;
+                    for a in [0.0f32, hr, -hr, hw, -hw] {
+                        let q = g_at(t, a);
+                        let h = ctx.hh(q[0], q[1]);
+                        hm = hm.max(h);
+                        hn = hn.min(h);
+                    }
+                    Sec { t, h0: hm + ROAD_H, hn }
+                })
+                .collect();
+            let g3 = |s: &Sec, x: f32, z: f32| -> [f32; 3] {
+                let q = g_at(s.t, x);
+                ctx.pt(q[0], q[1], z)
+            };
+            for j in 0..ns {
+                let (a, e) = (&secs[j], &secs[j + 1]);
+                // roadway slab
+                quad_up(
+                    &mut b,
+                    M_ASPHALT,
+                    [g3(a, -hr, a.h0), g3(e, -hr, e.h0), g3(e, hr, e.h0), g3(a, hr, a.h0)],
+                    [[a.t / 4.0, 0.0], [e.t / 4.0, 0.0], [e.t / 4.0, 1.0], [a.t / 4.0, 1.0]],
+                );
+                // kerb tops
+                quad_up(
+                    &mut b,
+                    M_KERB,
+                    [
+                        g3(a, hr, a.h0 + KERB_H),
+                        g3(e, hr, e.h0 + KERB_H),
+                        g3(e, hr + KERB_W, e.h0 + KERB_H),
+                        g3(a, hr + KERB_W, a.h0 + KERB_H),
+                    ],
+                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
+                );
+                quad_up(
+                    &mut b,
+                    M_KERB,
+                    [
+                        g3(a, -hr - KERB_W, a.h0 + KERB_H),
+                        g3(e, -hr - KERB_W, e.h0 + KERB_H),
+                        g3(e, -hr, e.h0 + KERB_H),
+                        g3(a, -hr, a.h0 + KERB_H),
+                    ],
+                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
+                );
+                // kerb faces toward the roadway
+                for sx in [hr, -hr] {
+                    let p = [
+                        g3(a, sx, a.h0 + KERB_H),
+                        g3(e, sx, e.h0 + KERB_H),
+                        g3(e, sx, e.hn - 0.5),
+                        g3(a, sx, a.hn - 0.5),
+                    ];
+                    let uv = [
+                        [a.t / 2.0, 1.0],
+                        [e.t / 2.0, 1.0],
+                        [e.t / 2.0, 0.0],
+                        [a.t / 2.0, 0.0],
+                    ];
+                    if sx < 0.0 {
+                        b.quad(M_KERB, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
+                    } else {
+                        b.quad(M_KERB, p, uv);
+                    }
+                }
+                // sidewalks, flush with the kerb tops
+                quad_up(
+                    &mut b,
+                    M_WALK,
+                    [
+                        g3(a, hr + KERB_W, a.h0 + KERB_H),
+                        g3(e, hr + KERB_W, e.h0 + KERB_H),
+                        g3(e, hw, e.h0 + KERB_H),
+                        g3(a, hw, a.h0 + KERB_H),
+                    ],
+                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
+                );
+                quad_up(
+                    &mut b,
+                    M_WALK,
+                    [
+                        g3(a, -hw, a.h0 + KERB_H),
+                        g3(e, -hw, e.h0 + KERB_H),
+                        g3(e, -hr - KERB_W, e.h0 + KERB_H),
+                        g3(a, -hr - KERB_W, a.h0 + KERB_H),
+                    ],
+                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
+                );
+                // outer edges drop to their own local ground
+                for sx in [hw, -hw] {
+                    let gb = |s: &Sec| {
+                        let q = g_at(s.t, sx);
+                        ctx.hh(q[0], q[1]) - 0.5
+                    };
+                    let p = [
+                        g3(a, sx, a.h0 + KERB_H),
+                        g3(e, sx, e.h0 + KERB_H),
+                        g3(e, sx, gb(e)),
+                        g3(a, sx, gb(a)),
+                    ];
+                    let uv = [
+                        [a.t / 2.0, 0.9],
+                        [e.t / 2.0, 0.9],
+                        [e.t / 2.0, 0.0],
+                        [a.t / 2.0, 0.0],
+                    ];
+                    if sx < 0.0 {
+                        b.quad(M_WALK, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
+                    } else {
+                        b.quad(M_WALK, p, uv);
+                    }
+                }
+            }
+        }
+    }
+    (b.finish(4), textures())
+}
+
 fn textures() -> Vec<(u32, u32, Vec<u8>)> {
     vec![tex_asphalt(), tex_kerb(), tex_walk(), tex_paint()]
 }
