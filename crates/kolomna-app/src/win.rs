@@ -236,12 +236,22 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
 
         // place one house: its plan quad c (block frame, metres) + requested
         // size; the mesh is generated, seated and mapped onto the quad
-        let mut place =
-            |w_slot: f32, d_slot: f32, c: [[f32; 2]; 4], arch: bool, corner: bool, seed: u64| {
-                let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
-                let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
-                let (mut mesh, texs, wa, da, archr) =
-                    kolomna_render::piter::generate_manor(seed, arch, Some((req_w, req_d)), corner);
+        let mut place = |w_slot: f32,
+                         d_slot: f32,
+                         c: [[f32; 2]; 4],
+                         arch: bool,
+                         corner: bool,
+                         roman: bool,
+                         seed: u64| {
+            let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
+            let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
+            let (mut mesh, texs, wa, da, archr) = kolomna_render::piter::generate_manor(
+                seed,
+                arch,
+                Some((req_w, req_d)),
+                corner,
+                roman,
+            );
                 // block frame -> world metres relative to the placement anchor
                 let to_wm = |p: [f32; 2]| -> [f32; 2] {
                     [
@@ -303,16 +313,47 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             let run = lens[i] - wings[i][1] - wings[inx][0];
             let widths = plan_widths(&mut rng, run);
             let k = widths.len();
-            // carriage arches: in the STREET row (side 0), never the first or
-            // last piece (those are the trapezoids next to the corner houses)
+            // The STREET row (side 0) must open at least one carriage arch
+            // into the yard, and its widest facade gets the Roman portico
+            // house. Both are chosen by width so they always fit.
             let mut archj = vec![false; k];
+            let mut romanj = vec![false; k];
             if i == 0 {
-                if k >= 2 {
-                    archj[(k - 1) / 2] = true;
+                let mut order: Vec<usize> = (0..k).collect();
+                order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
+                let rom = order.iter().copied().find(|&j| widths[j] >= 14.0);
+                if let Some(r) = rom {
+                    romanj[r] = true;
+                }
+                // the arch goes to ANOTHER piece whenever one exists: the
+                // generator keeps it off the portico, but a gate next to the
+                // parade entrance reads better (and needs tiles >= 12 m)
+                let rest: Vec<usize> = (0..k).filter(|&j| Some(j) != rom).collect();
+                let pick = rest
+                    .iter()
+                    .copied()
+                    .find(|&j| widths[j] >= 12.0)
+                    .or(rom)
+                    .or_else(|| {
+                        rest.iter()
+                            .copied()
+                            .max_by(|&a, &b| widths[a].partial_cmp(&widths[b]).unwrap())
+                    })
+                    .or(Some(order[0]));
+                if let Some(j) = pick {
+                    archj[j] = true;
                 }
                 if blk == 0 && k >= 3 {
-                    archj[0] = true;
+                    for &j in &order {
+                        if !archj[j] && widths[j] >= 12.0 {
+                            archj[j] = true; // a second arch in the first block
+                            break;
+                        }
+                    }
                 }
+                let ap: Vec<usize> = (0..k).filter(|&j| archj[j]).collect();
+                let rp: Vec<usize> = (0..k).filter(|&j| romanj[j]).collect();
+                println!("block {blk} street row: arches at {ap:?}, roman at {rp:?} (k={k})");
             }
             let (_, inn, _) = side(&q, i);
             let mut a0 = a_start;
@@ -338,6 +379,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                     c,
                     archj[j],
                     false,
+                    romanj[j],
                     seed_b + 1000 + 97 * i as u64 + 31 * j as u64,
                 );
                 a0 = a1;
@@ -350,7 +392,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             let pl_pt = on_side(&q, ip, lens[ip] - u_b);
             let pf_pt = on_side(&q, i, u_a);
             let c = [vv[i], pl_pt, pf_pt, q[i]];
-            place(u_a, u_b, c, false, true, seed_b + 500 + i as u64);
+            place(u_a, u_b, c, false, true, false, seed_b + 500 + i as u64);
         }
     }
     for (i, (w, d, dh)) in report.iter().enumerate() {

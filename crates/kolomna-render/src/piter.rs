@@ -31,7 +31,8 @@ pub const M_RAILING: u32 = 13; // balcony railing (alpha cut-out)
 pub const M_WIN_PLAIN: u32 = 14; // yard-side window: bare frame, no trim
 pub const M_BLACK_DOOR: u32 = 15; // service entrance (black door)
 pub const M_STABLE: u32 = 16; // coach-house gates seen from the yard
-pub const N_MATS: u32 = 17;
+pub const M_STONE: u32 = 17; // pale smooth stone: columns, entablature, pediment
+pub const N_MATS: u32 = 18;
 
 /// Clear height of the carriage arch (above the basement + piano nobile line).
 pub const ARCH_H: f32 = 4.6;
@@ -462,6 +463,26 @@ fn railing_tex(pal: &Palette) -> Vec<u8> {
     img.px
 }
 
+/// Pale ashlar with faint vertical flutes: columns, entablature, pediment.
+fn stone_tex(pal: &Palette) -> Vec<u8> {
+    let base = shift(pal.wall_light, 24);
+    let mut img = Img::new(TEX_S, TEX_S, base);
+    let mut x = 0usize;
+    while x < TEX_S {
+        img.line_v(x as i32, 0, TEX_S as i32, shift(base, -16));
+        img.line_v(x as i32 + 1, 0, TEX_S as i32, shift(base, 8));
+        img.line_v(x as i32 + 2, 0, TEX_S as i32, base);
+        img.line_v(x as i32 + 3, 0, TEX_S as i32, base);
+        x += 8;
+    }
+    let mut y = 0i32;
+    while y < TEX_S as i32 {
+        img.line_h(0, TEX_S as i32, y, shift(base, -22));
+        y += 48;
+    }
+    img.px
+}
+
 fn band_tex(pal: &Palette) -> Vec<u8> {
     let mut img = Img::new(TEX_S, 32, pal.wall_light);
     img.line_h(0, TEX_S as i32, 0, shift(pal.wall_light, -30));
@@ -514,6 +535,9 @@ struct Manor {
     stable: Option<usize>,
     /// corner house: the east end is a second parade facade (two streets)
     corner: bool,
+    /// Roman-style parade facade: a four-column portico with a pediment and a
+    /// tall portal over a wide perron
+    roman: bool,
 }
 
 /// Basement plinth that follows the real ground instead of a fixed depth.
@@ -621,6 +645,268 @@ pub fn deform(mesh: &mut ModelMesh, w: f32, d: f32, c: [[f32; 2]; 4]) {
 }
 
 impl Manor {
+    /// Free quad with the default uv (facade order: bl, br, tr, tl).
+    fn face(&mut self, mat: u32, p: [[f32; 3]; 4]) {
+        self.b
+            .quad(mat, p, [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+    }
+
+    /// Roman-style parade entrance: four pale columns on bases carry an
+    /// entablature and a triangular pediment; a wide three-step perron leads
+    /// to a tall portal. The portal opening itself was carved out of the
+    /// street wall by the wall builder for `roman` houses.
+    fn roman_portico(&mut self) {
+        let d = self.d;
+        let xc = 2.0 * self.door_tile as f32 + 1.0;
+
+        // ---- perron: podium (top 0.45) + two steps -------------------------
+        let pw = 2.7f32;
+        self.face(
+            M_STONE,
+            [
+                [xc - pw, 0.45, d],
+                [xc - pw, 0.45, d + 1.7],
+                [xc + pw, 0.45, d + 1.7],
+                [xc + pw, 0.45, d],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - pw, 0.30, d + 1.7],
+                [xc + pw, 0.30, d + 1.7],
+                [xc + pw, 0.45, d + 1.7],
+                [xc - pw, 0.45, d + 1.7],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - pw + 0.3, 0.30, d + 1.7],
+                [xc - pw + 0.3, 0.30, d + 2.15],
+                [xc + pw - 0.3, 0.30, d + 2.15],
+                [xc + pw - 0.3, 0.30, d + 1.7],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - pw + 0.3, 0.15, d + 2.15],
+                [xc + pw - 0.3, 0.15, d + 2.15],
+                [xc + pw - 0.3, 0.30, d + 2.15],
+                [xc - pw + 0.3, 0.30, d + 2.15],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - pw + 0.6, 0.15, d + 2.15],
+                [xc - pw + 0.6, 0.15, d + 2.6],
+                [xc + pw - 0.6, 0.15, d + 2.6],
+                [xc + pw - 0.6, 0.15, d + 2.15],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - pw + 0.6, 0.0, d + 2.6],
+                [xc + pw - 0.6, 0.0, d + 2.6],
+                [xc + pw - 0.6, 0.15, d + 2.6],
+                [xc - pw + 0.6, 0.15, d + 2.6],
+            ],
+        );
+
+        // ---- the tall portal itself (0.45 .. 4.75) --------------------------
+        self.face(
+            M_DOOR,
+            [
+                [xc - 1.0, 0.45, d],
+                [xc + 1.0, 0.45, d],
+                [xc + 1.0, 4.75, d],
+                [xc - 1.0, 4.75, d],
+            ],
+        );
+
+        // ---- four columns ----------------------------------------------------
+        for cx in [xc - 2.65, xc - 1.35, xc + 1.35, xc + 2.65] {
+            let zc = d + 1.2;
+            let rb = 0.33f32; // plinth block
+            self.face(
+                M_STONE,
+                [
+                    [cx - rb, 0.45, zc + rb],
+                    [cx + rb, 0.45, zc + rb],
+                    [cx + rb, 0.75, zc + rb],
+                    [cx - rb, 0.75, zc + rb],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx - rb, 0.45, zc - rb],
+                    [cx - rb, 0.45, zc + rb],
+                    [cx - rb, 0.75, zc + rb],
+                    [cx - rb, 0.75, zc - rb],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx + rb, 0.45, zc + rb],
+                    [cx + rb, 0.45, zc - rb],
+                    [cx + rb, 0.75, zc - rb],
+                    [cx + rb, 0.75, zc + rb],
+                ],
+            );
+            // shaft: octagonal prism
+            let r = 0.24f32;
+            let yt = 6.05f32;
+            for k in 0..8 {
+                let a0 = (k as f32 + 0.5) * std::f32::consts::PI / 4.0;
+                let a1 = ((k + 1) as f32 + 0.5) * std::f32::consts::PI / 4.0;
+                let (s0, c0) = a0.sin_cos();
+                let (s1, c1) = a1.sin_cos();
+                self.face(
+                    M_STONE,
+                    [
+                        [cx + r * c0, 0.75, zc + r * s0],
+                        [cx + r * c1, 0.75, zc + r * s1],
+                        [cx + r * c1, yt, zc + r * s1],
+                        [cx + r * c0, yt, zc + r * s0],
+                    ],
+                );
+            }
+            // capital: two stepped blocks
+            let r1 = 0.30f32;
+            self.face(
+                M_STONE,
+                [
+                    [cx - r1, yt, zc + r1],
+                    [cx + r1, yt, zc + r1],
+                    [cx + r1, yt + 0.18, zc + r1],
+                    [cx - r1, yt + 0.18, zc + r1],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx - r1, yt, zc - r1],
+                    [cx - r1, yt, zc + r1],
+                    [cx - r1, yt + 0.18, zc + r1],
+                    [cx - r1, yt + 0.18, zc - r1],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx + r1, yt, zc + r1],
+                    [cx + r1, yt, zc - r1],
+                    [cx + r1, yt + 0.18, zc - r1],
+                    [cx + r1, yt + 0.18, zc + r1],
+                ],
+            );
+            let r2 = 0.4f32;
+            self.face(
+                M_STONE,
+                [
+                    [cx - r2, yt + 0.18, zc + r2],
+                    [cx + r2, yt + 0.18, zc + r2],
+                    [cx + r2, yt + 0.4, zc + r2],
+                    [cx - r2, yt + 0.4, zc + r2],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx - r2, yt + 0.18, zc - r2],
+                    [cx - r2, yt + 0.18, zc + r2],
+                    [cx - r2, yt + 0.4, zc + r2],
+                    [cx - r2, yt + 0.4, zc - r2],
+                ],
+            );
+            self.face(
+                M_STONE,
+                [
+                    [cx + r2, yt + 0.18, zc + r2],
+                    [cx + r2, yt + 0.18, zc - r2],
+                    [cx + r2, yt + 0.4, zc - r2],
+                    [cx + r2, yt + 0.4, zc + r2],
+                ],
+            );
+        }
+
+        // ---- entablature: architrave / frieze / cornice ---------------------
+        let ex = 3.15f32;
+        let zf = d + 1.85;
+        let zb = d + 0.08;
+        for (y0, y1, mat) in [
+            (6.45f32, 6.75, M_STONE),
+            (6.75, 7.0, M_BAND),
+            (7.0, 7.35, M_STONE),
+        ] {
+            self.face(
+                mat,
+                [
+                    [xc - ex, y0, zf],
+                    [xc + ex, y0, zf],
+                    [xc + ex, y1, zf],
+                    [xc - ex, y1, zf],
+                ],
+            );
+            self.face(
+                mat,
+                [
+                    [xc - ex, y0, zb],
+                    [xc - ex, y0, zf],
+                    [xc - ex, y1, zf],
+                    [xc - ex, y1, zb],
+                ],
+            );
+            self.face(
+                mat,
+                [
+                    [xc + ex, y0, zf],
+                    [xc + ex, y0, zb],
+                    [xc + ex, y1, zb],
+                    [xc + ex, y1, zf],
+                ],
+            );
+        }
+
+        // ---- pediment: tympanum + two raking slopes -------------------------
+        let py = 7.35f32;
+        let ph = 1.65f32;
+        let zf2 = d + 1.88;
+        let zb2 = d + 0.12;
+        self.face(
+            M_STONE,
+            [
+                [xc - ex, py, zf2],
+                [xc + ex, py, zf2],
+                [xc + ex, py, zf2],
+                [xc, py + ph, zf2],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc - ex, py, zf2],
+                [xc, py + ph, zf2],
+                [xc, py + ph, zb2],
+                [xc - ex, py, zb2],
+            ],
+        );
+        self.face(
+            M_STONE,
+            [
+                [xc, py + ph, zf2],
+                [xc + ex, py, zf2],
+                [xc + ex, py, zb2],
+                [xc, py + ph, zb2],
+            ],
+        );
+    }
+
     fn wall_quad(&mut self, mat: u32, side: u8, t0: f32, t1: f32, y0: f32, y1: f32, x_or_z: f32) {
         let p = match side {
             // south (+z): u=+x
@@ -664,6 +950,7 @@ pub fn generate_manor(
     arch: bool,
     size: Option<(f32, f32)>,
     corner: bool,
+    roman: bool,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32, Option<(f32, f32)>) {
     let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
     let pal = Palette::new(&mut r);
@@ -690,17 +977,39 @@ pub fn generate_manor(
         .filter(|&t| t >= 1 && t <= tiles - 2)
         .collect();
     let door_tile = win_tiles[win_tiles.len() / 2];
+    // a Roman portico wants clean wall around the portal: no windows on the
+    // two tiles flanking the entrance
+    let win_tiles: Vec<usize> = if roman {
+        win_tiles
+            .into_iter()
+            .filter(|&t| t + 1 != door_tile && t != door_tile + 1)
+            .collect()
+    } else {
+        win_tiles
+    };
     // carriage arch: two street-wall tiles (4 m), close to the facade centre,
     // never overlapping the entrance; the passage runs right through to the yard
     let arch = if arch && tiles >= 6 {
+        // the Roman portico owns the wall around the entrance: an arch squeezed
+        // behind a column reads as blocked, so keep the opening outside the
+        // colonnade footprint (columns at xc ± 2.65, edge 2.91 + 0.25 air)
+        let m = if roman { 2.9 } else { 0.0 };
+        let xc = 2.0 * door_tile as f32 + 1.0;
         let mut cand: Vec<usize> = (1..tiles - 2)
             .filter(|&a| a != door_tile && a + 1 != door_tile)
+            .filter(|&a| {
+                let (x0, x1) = (2.0 * a as f32, 2.0 * (a + 2) as f32);
+                !(x0 < xc + m && x1 > xc - m)
+            })
             .collect();
         cand.sort_by_key(|&a| ((2 * a as i32 + 1) - tiles as i32).abs());
         cand.first().copied()
     } else {
         None
     };
+    if roman && arch.is_some() {
+        println!("  roman arch at tiles {a}..{b} of {tiles} m/{tw}", a = arch.unwrap(), b = arch.unwrap() + 1, tiles = tiles, tw = 2 * tiles);
+    }
     // yard side: a black entrance (always) and sometimes coach-house gates
     let mut yard_door = None;
     let mut stable = None;
@@ -735,6 +1044,7 @@ pub fn generate_manor(
         yard_door,
         stable,
         corner,
+        roman,
     };
     m.build(&mut r);
     let texs = m.textures();
@@ -779,6 +1089,18 @@ impl Manor {
                             self.wall_quad(mat_wall, 0, x0, x0 + 2.0, ARCH_H, y + fh, d);
                             continue;
                         }
+                    }
+                }
+                // Roman portal: one tall opening through both lower floors
+                // (the door body itself is drawn by the portico builder)
+                if self.roman && t == self.door_tile {
+                    if fi == 0 {
+                        self.wall_quad(M_BASE, 0, x0, x0 + 2.0, 0.0, 0.45, d);
+                        continue;
+                    }
+                    if fi == 1 {
+                        self.wall_quad(mat_wall, 0, x0, x0 + 2.0, 4.75, y + fh, d);
+                        continue;
                     }
                 }
                 let mat = if fi == 0 && t == self.door_tile {
@@ -1066,7 +1388,7 @@ impl Manor {
         }
 
         // ---- porch: steps, canopy on brackets, lanterns -------------------
-        {
+        if !self.roman {
             let dt = self.door_tile;
             let xc = 2.0 * dt as f32 + 1.0;
             // three steps rising to the door
@@ -1134,6 +1456,9 @@ impl Manor {
                     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                 );
             }
+        }
+        if self.roman {
+            self.roman_portico();
         }
 
         // ---- roof ---------------------------------------------------------
@@ -1390,6 +1715,7 @@ impl Manor {
             (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(4), false, &mut rr)), // 14 M_WIN_PLAIN
             (TEX_W as u32, TEX_H as u32, black_door_tex(&pal, &mut rr)),              // 15 M_BLACK_DOOR
             (TEX_W as u32, TEX_H as u32, stable_tex(&pal, &mut rr)),                  // 16 M_STABLE
+            (TEX_S as u32, TEX_S as u32, stone_tex(&pal)),                            // 17 M_STONE
         ]
     }
 }
