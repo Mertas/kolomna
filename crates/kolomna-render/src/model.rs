@@ -53,7 +53,15 @@ struct VsOut {
     @location(0) uv: vec2<f32>,
     @location(1) nrm: vec3<f32>,
     @location(2) anim: f32,
+    @location(3) wpos: vec3<f32>,
 };
+
+/// Travelling micro-ripples used for the water normal (analytic sines).
+fn wv(p: vec2<f32>, t: f32) -> f32 {
+    return sin(p.x * 1.9 + p.y * 1.1 + t * 1.3) * 0.45
+         + sin(p.x * 3.7 - p.y * 2.9 - t * 1.9) * 0.35
+         + sin(p.x * 8.1 + p.y * 6.7 + t * 2.7) * 0.20;
+}
 
 fn h21(v: vec2<f32>) -> f32 {
     let f = fract(v * vec2<f32>(0.1031, 0.1030));
@@ -114,6 +122,7 @@ fn vs_model(@location(0) pp: vec3<f32>, @location(1) uv: vec2<f32>, @location(2)
     o.pos = vec4<f32>(ndc.x, ndc.y, 0.95 - dep, 1.0);
     o.uv = uv;
     o.anim = anim;
+    o.wpos = vec3<f32>(wx, wy, wz);
     // normals: model y-up -> scene z-up, then the scene rotation
     let nx0 = nrm.x * c - nrm.z * s;
     let nz0 = nrm.x * s + nrm.z * c;
@@ -144,11 +153,60 @@ fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
     if (t.a < 0.5) {
         discard;
     }
+    var caust = 0.0;
+    if (in.anim > 0.4 && in.anim < 0.6) {
+        // underwater floor: a moving net of light (cheap caustics)
+        caust = abs(wv(in.wpos.xy * 9.0, params.time * 0.9));
+    }
+    var floor_tint = 1.0;
+    if (in.anim > 0.4 && in.anim < 0.6) {
+        floor_tint = 0.84;
+    }
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
-    let lit = 0.60 + 0.50 * max(abs(dot(n, l)), 0.0);
-    let c = t.rgb * lit * (1.0 + shim);
-    return vec4<f32>(c, 1.0);
+    var lit = 0.60 + 0.50 * max(abs(dot(n, l)), 0.0);
+    var rgb = t.rgb;
+    var alpha = 1.0;
+    if (in.anim >= 1.0) {
+        // ---- realistic water: rippled normals, sun glints, fresnel sky ----
+        let ce2 = sqrt(max(1.0 - params.tilt * params.tilt, 0.01));
+        let tk2 = params.tilt / ce2;
+        let v = normalize(vec3<f32>(1.0, 1.0, tk2)); // towards the camera
+        let q = in.wpos.xy * 6.0;
+        let e = 0.14;
+        let gx = wv(q + vec2<f32>(e, 0.0), params.time) - wv(q - vec2<f32>(e, 0.0), params.time);
+        let gy = wv(q + vec2<f32>(0.0, e), params.time) - wv(q - vec2<f32>(0.0, e), params.time);
+        let n2 = normalize(vec3<f32>(-gx * 2.4, -gy * 2.4, 1.0));
+        let h = normalize(l + v);
+        let dnh = max(dot(n2, h), 0.0);
+        let spec = pow(dnh, 60.0) * 1.10 + pow(dnh, 22.0) * 0.30 + pow(dnh, 8.0) * 0.15
+                 + pow(max(dot(n2, v), 0.0), 24.0) * 0.12;
+        let fres = pow(1.0 - clamp(dot(n2, v), 0.0, 1.0), 3.5);
+        let sky = vec3<f32>(0.60, 0.71, 0.83);
+        lit = 0.62 + 0.48 * max(abs(dot(n2, l)), 0.0);
+        if (in.anim >= 3.0) {
+            // falling sheets
+            alpha = 0.70;
+            rgb = mix(t.rgb, sky, fres * 0.35);
+        } else if (in.anim >= 2.0) {
+            // jets
+            alpha = 0.78;
+            rgb = mix(t.rgb, sky, fres * 0.40);
+        } else if (in.anim >= 1.5) {
+            // churn / foam
+            alpha = 0.90;
+            rgb = mix(t.rgb, vec3<f32>(0.95, 0.975, 0.99), 0.50);
+        } else {
+            let shallow = clamp((in.anim - 1.1) / 0.3, 0.0, 1.0);
+            rgb = mix(t.rgb * 0.70, t.rgb, shallow); // deeper reads darker
+            rgb = mix(rgb, sky, fres * 0.70);
+            alpha = mix(0.48, 0.66, shallow) + fres * 0.30;
+        }
+        rgb = rgb + vec3<f32>(spec, spec, spec) * 0.9;
+    }
+    rgb = rgb * floor_tint * (1.0 + 0.55 * caust);
+    let c = rgb * lit * (1.0 + shim);
+    return vec4<f32>(c, alpha);
 }
 "#;
 
@@ -189,6 +247,9 @@ pub struct ModelMesh {
     pub parts: Vec<ModelPart>,
     /// unique FSH instance ids (group 1abe787d) used by the submeshes
     pub texture_ids: Vec<u32>,
+    /// material slots (indices into `texture_ids`) that are WATER: they are
+    /// drawn in a second blended pass after all opaque geometry
+    pub water_slots: Vec<u32>,
 }
 
 fn slot_for(mesh: &mut ModelMesh, id: u32) -> u32 {
@@ -263,6 +324,7 @@ fn push_submesh(m: &mesh3d::Mesh3d, mesh: &mut ModelMesh, vg: usize, ig: usize, 
 /// ANIM group frame-0 block).
 pub fn mesh_from_mesh3d(m: &mesh3d::Mesh3d) -> ModelMesh {
     let mut mesh = ModelMesh {
+        water_slots: Vec::new(),
         verts: Vec::new(),
         indices: Vec::new(),
         parts: Vec::new(),
@@ -291,12 +353,13 @@ pub fn mesh_from_mesh3d(m: &mesh3d::Mesh3d) -> ModelMesh {
 
 pub struct ModelRenderer {
     pipeline: wgpu::RenderPipeline,
+    pipeline_water: wgpu::RenderPipeline,
     group0: wgpu::BindGroup,
     params_buf: wgpu::Buffer,
     model_buf: wgpu::Buffer,
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
-    parts: Vec<(ModelPart, wgpu::BindGroup)>,
+    parts: Vec<(ModelPart, wgpu::BindGroup, bool)>,
 }
 
 impl ModelRenderer {
@@ -519,6 +582,49 @@ impl ModelRenderer {
             multiview_mask: None,
             cache: None,
         });
+        // water: blended, no depth write; drawn after all opaque parts
+        let pipeline_water = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("model-pipeline-water"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_model"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<ModelVertex>() as wgpu::BufferAddress,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3, 3 => Float32],
+                })],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_model"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: sample_count,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        });
         let parts = mesh
             .parts
             .iter()
@@ -534,11 +640,13 @@ impl ModelRenderer {
                         texture: p.texture,
                     },
                     bg,
+                    mesh.water_slots.contains(&p.texture),
                 )
             })
             .collect();
         Self {
             pipeline,
+            pipeline_water,
             group0,
             params_buf,
             model_buf,
@@ -565,11 +673,28 @@ impl ModelRenderer {
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
-        pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.group0, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
-        for (part, bg) in &self.parts {
+        // pass 1: opaque parts only (they write depth)
+        pass.set_pipeline(&self.pipeline);
+        for (part, bg, water) in &self.parts {
+            if *water {
+                continue;
+            }
+            pass.set_bind_group(1, bg, &[]);
+            pass.draw_indexed(
+                part.first_index..part.first_index + part.index_count,
+                0,
+                0..1,
+            );
+        }
+        // pass 2: water (blended, tested against the opaque depth)
+        pass.set_pipeline(&self.pipeline_water);
+        for (part, bg, water) in &self.parts {
+            if !*water {
+                continue;
+            }
             pass.set_bind_group(1, bg, &[]);
             pass.draw_indexed(
                 part.first_index..part.first_index + part.index_count,

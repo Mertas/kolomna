@@ -590,6 +590,22 @@ fn basin(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r_out: f32, wall_h: f32, segs:
             [[0.0, 0.0], [0.4, 0.0], [0.4, 0.5], [0.0, 0.5]],
         );
     }
+    // granite floor slightly below the water line (seen through the water;
+    // anim 0.5 = underwater: the shader adds moving caustics to it)
+    b.anim(0.5);
+    let zf = zw - 0.28;
+    let cf = ctx.pt(p[0], p[1], zf);
+    for j in 0..segs {
+        let j1 = (j + 1) % segs;
+        let a0 = j as f32 / segs as f32 * std::f32::consts::TAU;
+        let a1 = j1 as f32 / segs as f32 * std::f32::consts::TAU;
+        let rr = (r_in - 0.02) / 1.2;
+        b.tri(
+            mat,
+            [cf, pt(j, r_in - 0.02, zf), pt(j1, r_in - 0.02, zf)],
+            [[0.0, 0.0], [a0.cos() * rr, a0.sin() * rr], [a1.cos() * rr, a1.sin() * rr]],
+        );
+    }
     // water disk (animated: ripples + slow drift)
     b.anim(1.0);
     let c = ctx.pt(p[0], p[1], zw);
@@ -612,8 +628,8 @@ fn fountain_big(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     cyl(b, ctx, p, 0.85, 0.55, zw, h + 1.35, 12, M_GRANITE, 1.4);
     cyl(b, ctx, p, 0.35, 2.0, h + 1.35, h + 1.92, 14, M_MARBLE, 1.6);
     cyl(b, ctx, p, 2.0, 2.0, h + 1.92, h + 2.0, 14, M_MARBLE, 1.6);
-    // tier 1 water
-    b.anim(1.0);
+    // tier 1 water (shallow variant)
+    b.anim(1.2);
     let c1 = ctx.pt(p[0], p[1], h + 1.95);
     for j in 0..14 {
         let j1 = (j + 1) % 14;
@@ -632,7 +648,7 @@ fn fountain_big(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     // the tier-2 veil falls onto the tier-1 water
     jet_cyl(b, ctx, p, 1.01, 1.01, h + 1.98, h + 3.00, 12, M_SHEET, 1.6, 3.0);
     splash(b, ctx, p, 1.18, h + 1.97);
-    b.anim(1.0);
+    b.anim(1.2);
     let c2 = ctx.pt(p[0], p[1], h + 3.1);
     for j in 0..12 {
         let j1 = (j + 1) % 12;
@@ -674,7 +690,7 @@ fn fountain_small(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     let zw = basin(b, ctx, p, 1.75, 0.46, 10, M_GRANITE);
     cyl(b, ctx, p, 0.34, 0.22, zw, h + 1.05, 8, M_GRANITE, 0.9);
     cyl(b, ctx, p, 0.16, 0.72, h + 1.05, h + 1.32, 10, M_MARBLE, 1.0);
-    b.anim(1.0);
+    b.anim(1.2);
     let c = ctx.pt(p[0], p[1], h + 1.35);
     for j in 0..10 {
         let j1 = (j + 1) % 10;
@@ -1181,7 +1197,9 @@ pub fn build_garden(
         }
     }
 
-    (b.finish(N_MATS), textures())
+    let mut mesh = b.finish(N_MATS);
+    mesh.water_slots = vec![M_WATER, M_JET, M_SHEET];
+    (mesh, textures())
 }
 
 // ------------------------------------------------------------- textures ------
@@ -1309,27 +1327,28 @@ fn tex_gravel(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
 }
 
 fn tex_water(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
-    let mut im = Img::new(TS, TS, [72, 112, 130], 255);
+    // bright, saturated water so the realistic shading can do the work
+    let mut im = Img::new(TS, TS, [96, 148, 168], 255);
     for y in 0..TS {
         if y % 9 == (y / 9) % 3 {
             let x0 = (hash2(0, y as u32) % 90) as usize;
-            im.line_h(x0, (x0 + 60).min(TS), y, [104, 146, 162], 255);
+            im.line_h(x0, (x0 + 60).min(TS), y, [142, 188, 205], 255);
         }
     }
-    im.noise(6, rng);
-    im.speckle(rng, 260, [176, 206, 214], [58, 92, 110]);
+    im.noise(5, rng);
+    im.speckle(rng, 280, [202, 233, 240], [66, 112, 132]);
     im.flip_rows();
     im.into()
 }
 
 fn tex_jet(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
-    let mut im = Img::new(TS, TS, [198, 224, 238], 255);
+    let mut im = Img::new(TS, TS, [156, 200, 226], 255);
     for j in 0..40 {
         let x = (hash2(j, 3) % TS as u32) as usize;
-        im.line_v(x, 0, TS, [234, 246, 251], 255);
+        im.line_v(x, 0, TS, [228, 242, 249], 255);
     }
     im.noise(6, rng);
-    im.speckle(rng, 320, [172, 204, 224], [244, 250, 253]);
+    im.speckle(rng, 320, [128, 176, 214], [240, 248, 252]);
     im.flip_rows();
     im.into()
 }

@@ -137,6 +137,7 @@ impl Builder {
 
     pub fn finish(self, n_tex: u32) -> ModelMesh {
         ModelMesh {
+            water_slots: Vec::new(),
             verts: self.verts,
             indices: self.indices,
             parts: self
