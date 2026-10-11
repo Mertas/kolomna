@@ -52,6 +52,8 @@ pub struct Builder {
     indices: Vec<u32>,
     /// (material slot, first index, index count) — one segment per material run
     segs: Vec<(u32, u32, u32)>,
+    /// animation channel applied to every following vertex (see ModelVertex)
+    cur_anim: f32,
 }
 
 impl Builder {
@@ -60,7 +62,14 @@ impl Builder {
             verts: Vec::new(),
             indices: Vec::new(),
             segs: Vec::new(),
+            cur_anim: 0.0,
         }
+    }
+
+    /// Set the water animation channel for every following vertex
+    /// (0 = static, 1..1.9 water surface, 2..2.9 jet, 3..3.9 falling sheet).
+    pub fn anim(&mut self, v: f32) {
+        self.cur_anim = v;
     }
 
     fn push_tri(&mut self, mat: u32, a: u32, b: u32, c: u32) {
@@ -78,7 +87,30 @@ impl Builder {
         let n = face_n(p[0], p[1], p[2]);
         let base = self.verts.len() as u32;
         for k in 0..4 {
-            self.verts.push(ModelVertex { pos: p[k], uv: uv[k], nrm: n });
+            self.verts.push(ModelVertex {
+                pos: p[k],
+                uv: uv[k],
+                nrm: n,
+                anim: self.cur_anim,
+            });
+        }
+        self.push_tri(mat, base, base + 1, base + 2);
+        self.push_tri(mat, base, base + 2, base + 3);
+    }
+
+    /// Quad with a per-vertex animation channel (fountain jets: each vertex
+    /// carries its fraction along the water column so the shader can bend
+    /// the jet more towards its top).
+    pub fn quad_anim(&mut self, mat: u32, p: [[f32; 3]; 4], uv: [[f32; 2]; 4], anim: [f32; 4]) {
+        let n = face_n(p[0], p[1], p[2]);
+        let base = self.verts.len() as u32;
+        for k in 0..4 {
+            self.verts.push(ModelVertex {
+                pos: p[k],
+                uv: uv[k],
+                nrm: n,
+                anim: anim[k],
+            });
         }
         self.push_tri(mat, base, base + 1, base + 2);
         self.push_tri(mat, base, base + 2, base + 3);
@@ -88,7 +120,12 @@ impl Builder {
         let n = face_n(p[0], p[1], p[2]);
         let base = self.verts.len() as u32;
         for k in 0..3 {
-            self.verts.push(ModelVertex { pos: p[k], uv: uv[k], nrm: n });
+            self.verts.push(ModelVertex {
+                pos: p[k],
+                uv: uv[k],
+                nrm: n,
+                anim: self.cur_anim,
+            });
         }
         self.push_tri(mat, base, base + 1, base + 2);
     }

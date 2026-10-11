@@ -52,10 +52,44 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
     @location(0) uv: vec2<f32>,
     @location(1) nrm: vec3<f32>,
+    @location(2) anim: f32,
 };
 
+fn h21(v: vec2<f32>) -> f32 {
+    let f = fract(v * vec2<f32>(0.1031, 0.1030));
+    let d = dot(f, f.yx + vec2<f32>(33.33, 33.33));
+    let g = f + vec2<f32>(d, d);
+    return fract((g.x + g.y) * g.x);
+}
+
 @vertex
-fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) nrm: vec3<f32>) -> VsOut {
+fn vs_model(@location(0) pp: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) nrm: vec3<f32>, @location(3) anim: f32) -> VsOut {
+    // ---- water animation (fountain jets, sheets, basin ripples) ---------
+    // fast and free: pure vertex-shader displacement, no CPU work per frame
+    let tw = params.time;
+    var wp = pp;
+    if (anim >= 3.0) {
+        // falling water sheet: the bottom sways, the rim edge stays put
+        let w = clamp(anim - 3.0, 0.0, 1.0);
+        let ph = h21(floor(vec2<f32>(pp.x, pp.z) * 2.13)) * 6.28318;
+        wp.x = wp.x + sin(tw * 4.1 + ph + w * 3.0) * 0.012 * (1.0 - w);
+        wp.z = wp.z + cos(tw * 3.3 + ph) * 0.010 * (1.0 - w);
+    } else if (anim >= 2.0) {
+        // a jet: pulsing, bobbing, swaying in the wind; the top moves most
+        let w = clamp(anim - 2.0, 0.0, 1.0);
+        let ph = h21(floor(vec2<f32>(pp.x, pp.z) * 1.31) + vec2<f32>(5.0, 9.0)) * 6.28318;
+        let bob = 0.24 * sin(tw * 3.4 + ph);
+        let sway = 0.13 * sin(tw * 2.1 + ph * 1.7) + 0.065 * sin(tw * 4.3 + ph * 2.3);
+        let pulse = 0.52 * pow(0.5 + 0.5 * sin(tw * 5.6 + ph), 3.0);
+        wp.y = wp.y + bob * (0.20 + 0.80 * w) + pulse * w;
+        wp.x = wp.x + cos(ph * 1.3) * sway * w;
+        wp.z = wp.z + sin(ph * 1.3) * sway * w;
+    } else if (anim >= 1.0) {
+        // basin / tier water: crossed ripples
+        wp.y = wp.y + 0.035 * sin(pp.x * 6.0 + pp.z * 6.0 + tw * 2.6)
+                     + 0.024 * sin(pp.x * 9.0 - pp.z * 9.0 - tw * 2.1);
+    }
+    let p = wp;
     // model y-up metres -> scene z-up; horizontal metres -> cells (16 m)
     // 3DMD buildings spin with the camera (spin = 1): the picked orientation
     // variant always faces the viewer, its rot compensating the camera angle.
@@ -79,6 +113,7 @@ fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) 
     var o: VsOut;
     o.pos = vec4<f32>(ndc.x, ndc.y, 0.95 - dep, 1.0);
     o.uv = uv;
+    o.anim = anim;
     // normals: model y-up -> scene z-up, then the scene rotation
     let nx0 = nrm.x * c - nrm.z * s;
     let nz0 = nrm.x * s + nrm.z * c;
@@ -89,14 +124,31 @@ fn vs_model(@location(0) p: vec3<f32>, @location(1) uv: vec2<f32>, @location(2) 
 
 @fragment
 fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
-    let t = textureSample(tex, samp, in.uv);
+    var uv2 = in.uv;
+    var shim = 0.0;
+    if (in.anim >= 3.0) {
+        // falling sheet: the streams run down fast with a lateral waver
+        uv2.y = uv2.y + params.time * 1.35;
+        uv2.x = uv2.x + sin(params.time * 2.3 + uv2.y * 9.0) * 0.010;
+        shim = 0.08 * sin(uv2.y * 15.0 + params.time * 3.4);
+    } else if (in.anim >= 2.0) {
+        // a jet: the water streams up fast, with rising shimmer bands
+        uv2.y = uv2.y - params.time * 1.70;
+        shim = 0.12 * sin(uv2.y * 12.57 + params.time * 3.4);
+    } else if (in.anim >= 1.0) {
+        // basin / tier water: crossed drifts + a travelling sparkle
+        uv2 = uv2 + vec2<f32>(params.time * 0.035, params.time * 0.022);
+        shim = 0.09 * sin(uv2.x * 21.0 + uv2.y * 17.0 + params.time * 2.4);
+    }
+    var t = textureSample(tex, samp, uv2);
     if (t.a < 0.5) {
         discard;
     }
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     let lit = 0.60 + 0.50 * max(abs(dot(n, l)), 0.0);
-    return vec4<f32>(t.rgb * lit, 1.0);
+    let c = t.rgb * lit * (1.0 + shim);
+    return vec4<f32>(c, 1.0);
 }
 "#;
 
@@ -106,6 +158,10 @@ pub struct ModelVertex {
     pub pos: [f32; 3],
     pub uv: [f32; 2],
     pub nrm: [f32; 3],
+    /// water animation channel: 0 static; 1..1.9 basin/tier water ripples;
+    /// 2..2.9 fountain jet (fraction = height along the column); 3..3.9 a
+    /// falling water sheet (fraction = height along the sheet)
+    pub anim: f32,
 }
 
 #[repr(C)]
@@ -182,6 +238,7 @@ fn push_submesh(m: &mesh3d::Mesh3d, mesh: &mut ModelMesh, vg: usize, ig: usize, 
             pos: v.pos,
             uv: v.uv,
             nrm: [n[0] / len, n[2] / len, n[1] / len],
+            anim: 0.0,
         });
     }
     let tex_id = m
@@ -430,7 +487,7 @@ impl ModelRenderer {
                 buffers: &[Some(wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<ModelVertex>() as wgpu::BufferAddress,
                     step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3],
+                    attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x2, 2 => Float32x3, 3 => Float32],
                 })],
             },
             fragment: Some(wgpu::FragmentState {
@@ -577,6 +634,12 @@ pub fn render_scene_with_models(
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     let terrain = TerrainRenderer::new(&device, &queue, format, sample_count, layers, verts, mn, wl);
     let mut params = crate::default_params(w as f32, h as f32, grid, zspan);
+    // shots can freeze the water animation at a given phase (KOLOMNA_TIME)
+    if let Ok(s) = std::env::var("KOLOMNA_TIME") {
+        if let Ok(v) = s.parse::<f32>() {
+            params.time = v;
+        }
+    }
     params.scale *= zoom;
     if std::env::var("KOLOMNA_DEBUG").is_ok() {
         eprintln!(

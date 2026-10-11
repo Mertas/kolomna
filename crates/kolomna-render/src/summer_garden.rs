@@ -26,7 +26,8 @@ pub const M_LAMP: u32 = 10;
 pub const M_GOLD: u32 = 11;
 pub const M_GRILLE: u32 = 12;
 pub const M_GATE: u32 = 13;
-const N_MATS: u32 = 14;
+pub const M_SHEET: u32 = 14;
+const N_MATS: u32 = 15;
 
 const SINK: f32 = 0.7; // buried depth of bases so slopes never show gaps
 const PAR_H: f32 = 0.85; // granite parapet above the local ground
@@ -319,6 +320,66 @@ fn cyl(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r0: f32, r1: f32, z0: f32, z1: f
     }
 }
 
+/// A tapered cylinder whose vertices carry an animation channel: weight 0
+/// at the bottom ring, ~1 at the top (`base` 2.0 = jet, 3.0 = falling
+/// sheet), so the shader bends the column more towards its tip. The top
+/// cap inherits the top weight.
+#[allow(clippy::too_many_arguments)]
+fn jet_cyl(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r0: f32, r1: f32, z0: f32, z1: f32, sides: usize, mat: u32, uvm: f32, base: f32) {
+    let ring = |r: f32, z: f32, j: usize| -> [f32; 3] {
+        let a = j as f32 / sides as f32 * std::f32::consts::TAU;
+        let q = [p[0] + a.cos() * r, p[1] + a.sin() * r];
+        ctx.pt(q[0], q[1], z)
+    };
+    let w_top = 0.95f32;
+    for j in 0..sides {
+        let j1 = (j + 1) % sides;
+        let rr = r0.max(r1);
+        let u0 = j as f32 / sides as f32 * (std::f32::consts::TAU * rr / uvm);
+        let u1 = (j + 1) as f32 / sides as f32 * (std::f32::consts::TAU * rr / uvm);
+        let hz = (z1 - z0) / uvm;
+        let an = [base, base + w_top, base + w_top, base];
+        b.quad_anim(
+            mat,
+            [ring(r0, z0, j), ring(r1, z1, j), ring(r1, z1, j1), ring(r0, z0, j1)],
+            [[u0, 0.0], [u0, hz], [u1, hz], [u1, 0.0]],
+            an,
+        );
+    }
+    if r1 > 0.03 {
+        let c = ctx.pt(p[0], p[1], z1);
+        b.anim(base + w_top);
+        for j in 0..sides {
+            let j1 = (j + 1) % sides;
+            b.tri(
+                mat,
+                [c, ring(r1, z1, j), ring(r1, z1, j1)],
+                [
+                    [r1 / uvm, r1 / uvm],
+                    [0.0, 0.0],
+                    [std::f32::consts::TAU * r1 / uvm, 0.0],
+                ],
+            );
+        }
+        b.anim(0.0);
+    }
+}
+
+/// Churned water where a jet or a sheet lands: a flat shimmering disc.
+fn splash(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r: f32, z: f32) {
+    b.anim(1.6);
+    let c = ctx.pt(p[0], p[1], z);
+    let rim = |j: usize| -> [f32; 3] {
+        let a = j as f32 / 9.0 * std::f32::consts::TAU;
+        ctx.pt(p[0] + a.cos() * r, p[1] + a.sin() * r, z)
+    };
+    for j in 0..9 {
+        let j1 = (j + 1) % 9;
+        b.tri(M_JET, [c, rim(j), rim(j1)], [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]]);
+    }
+    b.anim(0.0);
+}
+
 /// A leafy blob (tree crown): 4 latitude rings + poles, jittered.
 fn blob(b: &mut Builder, ctx: &Ctx, c: [f32; 3], r: f32, mat: u32, uvm: f32, rng: &mut Rng) {
     let lats = [-1.0f32, -0.33, 0.33, 1.0];
@@ -529,7 +590,8 @@ fn basin(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r_out: f32, wall_h: f32, segs:
             [[0.0, 0.0], [0.4, 0.0], [0.4, 0.5], [0.0, 0.5]],
         );
     }
-    // water disk
+    // water disk (animated: ripples + slow drift)
+    b.anim(1.0);
     let c = ctx.pt(p[0], p[1], zw);
     for j in 0..segs {
         let j1 = (j + 1) % segs;
@@ -539,6 +601,7 @@ fn basin(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r_out: f32, wall_h: f32, segs:
             [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]],
         );
     }
+    b.anim(0.0);
     zw
 }
 
@@ -550,6 +613,7 @@ fn fountain_big(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     cyl(b, ctx, p, 0.35, 2.0, h + 1.35, h + 1.92, 14, M_MARBLE, 1.6);
     cyl(b, ctx, p, 2.0, 2.0, h + 1.92, h + 2.0, 14, M_MARBLE, 1.6);
     // tier 1 water
+    b.anim(1.0);
     let c1 = ctx.pt(p[0], p[1], h + 1.95);
     for j in 0..14 {
         let j1 = (j + 1) % 14;
@@ -559,8 +623,16 @@ fn fountain_big(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
         };
         b.tri(M_WATER, [c1, a(j), a(j1)], [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]]);
     }
+    b.anim(0.0);
+    // the falling veil from the tier-1 rim + churn where it lands
+    jet_cyl(b, ctx, p, 1.96, 1.96, h + 0.52, h + 1.88, 16, M_SHEET, 2.6, 3.0);
+    splash(b, ctx, p, 2.12, zw + 0.02);
     cyl(b, ctx, p, 0.24, 0.20, h + 1.95, h + 2.62, 10, M_MARBLE, 1.2);
     cyl(b, ctx, p, 0.20, 1.05, h + 2.62, h + 3.06, 12, M_MARBLE, 1.2);
+    // the tier-2 veil falls onto the tier-1 water
+    jet_cyl(b, ctx, p, 1.01, 1.01, h + 1.98, h + 3.00, 12, M_SHEET, 1.6, 3.0);
+    splash(b, ctx, p, 1.18, h + 1.97);
+    b.anim(1.0);
     let c2 = ctx.pt(p[0], p[1], h + 3.1);
     for j in 0..12 {
         let j1 = (j + 1) % 12;
@@ -570,13 +642,16 @@ fn fountain_big(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
         };
         b.tri(M_WATER, [c2, a(j), a(j1)], [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]]);
     }
+    b.anim(0.0);
     blob(b, ctx, ctx.pt(p[0], p[1], h + 3.28), 0.17, M_GOLD, 0.6, &mut Rng::new(11));
-    // central jet + four side jets off the lower tier
-    cyl(b, ctx, p, 0.07, 0.18, h + 3.2, h + 4.9, 8, M_JET, 1.2);
+    // central jet + four side jets off the lower tier (animated columns)
+    jet_cyl(b, ctx, p, 0.10, 0.26, h + 3.2, h + 5.3, 8, M_JET, 1.2, 2.0);
+    splash(b, ctx, p, 0.46, h + 3.13);
     for j in 0..4 {
         let a = j as f32 / 4.0 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_4;
         let q = [p[0] + a.cos() * 1.35, p[1] + a.sin() * 1.35];
-        cyl(b, ctx, q, 0.05, 0.13, h + 1.95, h + 2.75, 6, M_JET, 1.0);
+        jet_cyl(b, ctx, q, 0.08, 0.20, h + 1.95, h + 2.95, 6, M_JET, 1.0, 2.0);
+        splash(b, ctx, q, 0.30, h + 1.97);
     }
     // four granite steps at the cardinals
     for j in 0..4 {
@@ -599,6 +674,7 @@ fn fountain_small(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
     let zw = basin(b, ctx, p, 1.75, 0.46, 10, M_GRANITE);
     cyl(b, ctx, p, 0.34, 0.22, zw, h + 1.05, 8, M_GRANITE, 0.9);
     cyl(b, ctx, p, 0.16, 0.72, h + 1.05, h + 1.32, 10, M_MARBLE, 1.0);
+    b.anim(1.0);
     let c = ctx.pt(p[0], p[1], h + 1.35);
     for j in 0..10 {
         let j1 = (j + 1) % 10;
@@ -608,8 +684,10 @@ fn fountain_small(b: &mut Builder, ctx: &Ctx, p: [f32; 2]) {
         };
         b.tri(M_WATER, [c, a(j), a(j1)], [[0.5, 0.5], [0.0, 0.0], [1.0, 0.0]]);
     }
+    b.anim(0.0);
     blob(b, ctx, ctx.pt(p[0], p[1], h + 1.45), 0.10, M_GOLD, 0.5, &mut Rng::new(9));
-    cyl(b, ctx, p, 0.05, 0.12, h + 1.45, h + 2.35, 6, M_JET, 1.0);
+    jet_cyl(b, ctx, p, 0.07, 0.17, h + 1.45, h + 2.55, 6, M_JET, 1.0, 2.0);
+    splash(b, ctx, p, 0.30, h + 1.37);
 }
 
 fn gravel_disk(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r: f32, segs: usize) {
@@ -1245,13 +1323,13 @@ fn tex_water(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
 }
 
 fn tex_jet(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
-    let mut im = Img::new(TS, TS, [222, 236, 240], 255);
+    let mut im = Img::new(TS, TS, [198, 224, 238], 255);
     for j in 0..40 {
         let x = (hash2(j, 3) % TS as u32) as usize;
-        im.line_v(x, 0, TS, [242, 248, 250], 255);
+        im.line_v(x, 0, TS, [234, 246, 251], 255);
     }
-    im.noise(5, rng);
-    im.speckle(rng, 300, [196, 218, 226], [250, 252, 252]);
+    im.noise(6, rng);
+    im.speckle(rng, 320, [172, 204, 224], [244, 250, 253]);
     im.flip_rows();
     im.into()
 }
@@ -1436,6 +1514,36 @@ fn tex_gate(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
     im.into()
 }
 
+/// A falling water sheet: vertical streams of pale blue water separated by
+/// transparent gaps, so a cylinder of it reads as a ring of falling veils
+/// (not a solid drum); the fragment shader scrolls it downwards.
+fn tex_sheet(rng: &mut Rng) -> (u32, u32, Vec<u8>) {
+    let water = [196, 222, 236];
+    let water_l = [232, 244, 250];
+    let mut im = Img::new(TS, TS, [0, 0, 0], 0);
+    let mut x = 0usize;
+    while x < TS {
+        let w_ = 5 + (hash2(x as u32, 17) % 4) as usize; // stream width 5..8 px
+        let gap = 2 + (hash2(x as u32, 31) % 3) as usize; // gap 2..4 px
+        for xx in x..(x + w_).min(TS) {
+            for y in 0..TS {
+                let n = (hash2(xx as u32 * 7, y as u32 * 3) % 20) as i32 - 10;
+                let c = if (xx - x) < 2 { water_l } else { water };
+                let f = |v: u8| ((v as i32) + n).clamp(0, 255) as u8;
+                im.set(xx, y, [f(c[0]), f(c[1]), f(c[2])], 255);
+            }
+        }
+        // a few bright sparkle pixels inside the streams
+        if hash2(x as u32, 3) % 2 == 0 {
+            let y = (hash2(x as u32, 41) % TS as u32) as usize;
+            im.set(x, y, water_l, 255);
+        }
+        x += w_ + gap;
+    }
+    im.flip_rows();
+    im.into()
+}
+
 fn textures() -> Vec<(u32, u32, Vec<u8>)> {
     let mut rng = Rng::new(0x5EED_6A2D_5EED_6A2D);
     vec![
@@ -1453,5 +1561,6 @@ fn textures() -> Vec<(u32, u32, Vec<u8>)> {
         tex_gold(&mut rng),
         tex_grille(&mut rng),
         tex_gate(&mut rng),
+        tex_sheet(&mut rng),
     ]
 }
