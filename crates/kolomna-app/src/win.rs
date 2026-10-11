@@ -1464,10 +1464,19 @@ fn ui_glyph(ch: char) -> Option<&'static (char, [f32; 4], f32, f32, f32)> {
     ui_atlas::GLYPHS.iter().find(|g| g.0 == ch)
 }
 
+/// Display size of the baked face (the atlas itself is FONT_PX tall).
+const UI_TEXT_PX: f32 = 24.0;
+
+fn ui_k() -> f32 {
+    UI_TEXT_PX / ui_atlas::FONT_PX
+}
+
 fn ui_text_width(s: &str) -> f32 {
+    let k = ui_k();
     s.chars()
         .map(|c| ui_glyph(c).map(|g| g.2).unwrap_or(6.0))
-        .sum()
+        .sum::<f32>()
+        * k
 }
 
 /// One rect [x, y, w, h] per button, physical px, laid left to right.
@@ -1507,24 +1516,29 @@ fn ui_quad(out: &mut Vec<UiVertex>, r: [f32; 4], uv: [f32; 4], col: [f32; 4]) {
     }
 }
 
-/// Draw one line of text with the baked metrics: ink at pen + (dx, dy) from
-/// the line top (the very model PIL used at bake time).
-fn ui_push_text(out: &mut Vec<UiVertex>, x: f32, top: f32, s: &str, k: f32, col: [f32; 4]) {
-    let mut pen = x;
-    for c in s.chars() {
-        match ui_glyph(c) {
-            Some(g) => {
-                if g.1[2] > 0.0 {
-                    ui_quad(
-                        out,
-                        [pen + g.3 * k, top + g.4 * k, g.1[2] * k, g.1[3] * k],
-                        g.1,
-                        col,
-                    );
+/// Draw one line of text with the baked metrics (atlas is FONT_PX tall,
+/// shown at UI_TEXT_PX) and a soft drop shadow underneath.
+fn ui_push_text(out: &mut Vec<UiVertex>, x: f32, top: f32, s: &str, col: [f32; 4]) {
+    let k = ui_k();
+    let shadow = ui_srgb([0.03, 0.04, 0.06, 0.55]);
+    for pass in 0..2 {
+        let (ox, oy, c) = if pass == 0 { (2.0, 2.0, shadow) } else { (0.0, 0.0, col) };
+        let mut pen = x;
+        for ch in s.chars() {
+            match ui_glyph(ch) {
+                Some(g) => {
+                    if g.1[2] > 0.0 {
+                        ui_quad(
+                            out,
+                            [pen + g.3 * k + ox, top + g.4 * k + oy, g.1[2] * k, g.1[3] * k],
+                            g.1,
+                            c,
+                        );
+                    }
+                    pen += g.2 * k;
                 }
-                pen += g.2 * k;
+                None => pen += 6.0 * k,
             }
-            None => pen += 6.0 * k,
         }
     }
 }
@@ -1578,13 +1592,14 @@ fn ui_build(w: f32, h: f32, st: &UiState) -> Vec<UiVertex> {
         );
         // label
         let tx = r[0] + UI_BTN_PAD + UI_ICON + UI_GAP;
-        let ty = (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC)) / 2.0).round();
+        let ty =
+            (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC) * ui_k()) / 2.0).round();
         let tc = if active {
             ui_srgb([0.980, 0.930, 0.780, 1.0])
         } else {
             ui_srgb([0.870, 0.880, 0.900, 1.0])
         };
-        ui_push_text(&mut v, tx, ty, b.label, 1.0, tc);
+        ui_push_text(&mut v, tx, ty, b.label, tc);
     }
     // bottom-left hint bar for the active tool
     if !st.hint.is_empty() {
@@ -1598,8 +1613,9 @@ fn ui_build(w: f32, h: f32, st: &UiState) -> Vec<UiVertex> {
             UI_WHITE,
             ui_srgb([0.870, 0.665, 0.286, 0.95]),
         );
-        let ty = (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC)) / 2.0).round();
-        ui_push_text(&mut v, r[0] + pad, ty, st.hint, 1.0, ui_srgb([0.92, 0.92, 0.90, 1.0]));
+        let ty =
+            (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC) * ui_k()) / 2.0).round();
+        ui_push_text(&mut v, r[0] + pad, ty, st.hint, ui_srgb([0.92, 0.92, 0.90, 1.0]));
     }
     v
 }
@@ -1689,8 +1705,8 @@ impl UiRenderer {
         let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("ui-sampler"),
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1825,6 +1841,57 @@ impl UiRenderer {
     }
 }
 
+fn ui_srgb_to_linear(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn ui_linear_to_srgb(c: f32) -> f32 {
+    if c <= 0.0031308 {
+        c * 12.92
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// Bilinear atlas fetch in linear space - mirrors the GPU, which linearises
+/// the sRGB texture before filtering and blends in linear space too.
+fn ui_fetch(u: f32, v: f32) -> [f32; 4] {
+    let x = u * ui_atlas::ATLAS_W as f32 - 0.5;
+    let y = v * ui_atlas::ATLAS_H as f32 - 0.5;
+    let (x0, y0) = (x.floor(), y.floor());
+    let (fx, fy) = (x - x0, y - y0);
+    let (x0, y0) = (x0 as i32, y0 as i32);
+    let texel = |x: i32, y: i32| -> [f32; 4] {
+        let x = x.clamp(0, ui_atlas::ATLAS_W as i32 - 1) as usize;
+        let y = y.clamp(0, ui_atlas::ATLAS_H as i32 - 1) as usize;
+        let o = (y * ui_atlas::ATLAS_W as usize + x) * 4;
+        let p = &ui_atlas::ATLAS_RAW[o..o + 4];
+        [
+            ui_srgb_to_linear(p[0] as f32 / 255.0),
+            ui_srgb_to_linear(p[1] as f32 / 255.0),
+            ui_srgb_to_linear(p[2] as f32 / 255.0),
+            p[3] as f32 / 255.0,
+        ]
+    };
+    let (c00, c10, c01, c11) = (
+        texel(x0, y0),
+        texel(x0 + 1, y0),
+        texel(x0, y0 + 1),
+        texel(x0 + 1, y0 + 1),
+    );
+    let mut o = [0.0f32; 4];
+    for c in 0..4 {
+        let a = c00[c] + (c10[c] - c00[c]) * fx;
+        let b = c01[c] + (c11[c] - c01[c]) * fx;
+        o[c] = a + (b - a) * fy;
+    }
+    o
+}
+
 /// KOLOMNA_UI_SHOT=<png>: rasterize the toolbar on the CPU (no window) so the
 /// layout and the atlas can be checked from the dev loop.
 pub fn ui_shot(path: &str) {
@@ -1840,7 +1907,6 @@ pub fn ui_shot(path: &str) {
     for p in px.chunks_mut(4) {
         p.copy_from_slice(&[153, 184, 219, 255]); // sky, like in the app
     }
-    let (aw, ah) = (ui_atlas::ATLAS_W as f32, ui_atlas::ATLAS_H as f32);
     for q in verts.chunks(6) {
         let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
         let (mut u0, mut u1, mut v0, mut v1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
@@ -1861,15 +1927,13 @@ pub fn ui_shot(path: &str) {
                 let fv = (yy as f32 + 0.5 - y0) / (y1 - y0).max(1e-6);
                 let u = u0 + fu * (u1 - u0);
                 let v = v0 + fv * (v1 - v0);
-                let tx = ((u * aw) as u32).min(ui_atlas::ATLAS_W - 1);
-                let ty = ((v * ah) as u32).min(ui_atlas::ATLAS_H - 1);
-                let o = ((ty * ui_atlas::ATLAS_W + tx) * 4) as usize;
-                let t = &ui_atlas::ATLAS_RAW[o..o + 4];
-                let a = t[3] as f32 / 255.0 * col[3];
+                let t = ui_fetch(u, v);
+                let a = t[3] * col[3];
                 let i = ((yy * w + xx) * 4) as usize;
                 for c in 0..3 {
-                    let s = t[c] as f32 / 255.0 * col[c];
-                    px[i + c] = ((s * a + px[i + c] as f32 / 255.0 * (1.0 - a)) * 255.0)
+                    let s = t[c] * col[c];
+                    let dst = ui_srgb_to_linear(px[i + c] as f32 / 255.0);
+                    px[i + c] = (ui_linear_to_srgb(s * a + dst * (1.0 - a)) * 255.0)
                         .round()
                         .clamp(0.0, 255.0) as u8;
                 }
