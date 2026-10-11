@@ -555,6 +555,10 @@ struct Manor {
     /// Roman-style parade facade: a four-column portico with a pediment and a
     /// tall portal over a wide perron
     roman: bool,
+    /// bay windows (эркеры) flanking the entrance
+    bays: bool,
+    /// x-spans of the built bays — balconies keep off them
+    bay_x: Vec<(f32, f32)>,
 }
 
 /// Basement plinth that follows the real ground instead of a fixed depth.
@@ -732,6 +736,41 @@ impl Manor {
                 [xc - pw + 0.6, 0.15, d + 2.6],
             ],
         );
+        // side cheeks close the podium and both steps down to the ground —
+        // flat treads alone read as cardboard from the sides (user report)
+        for sx in [xc - pw, xc + pw] {
+            self.face(
+                M_STONE,
+                [
+                    [sx, -1.2, d],
+                    [sx, -1.2, d + 1.7],
+                    [sx, 0.45, d + 1.7],
+                    [sx, 0.45, d],
+                ],
+            );
+        }
+        for sx in [xc - pw + 0.3, xc + pw - 0.3] {
+            self.face(
+                M_STONE,
+                [
+                    [sx, -1.2, d + 1.7],
+                    [sx, -1.2, d + 2.15],
+                    [sx, 0.30, d + 2.15],
+                    [sx, 0.30, d + 1.7],
+                ],
+            );
+        }
+        for sx in [xc - pw + 0.6, xc + pw - 0.6] {
+            self.face(
+                M_STONE,
+                [
+                    [sx, -1.2, d + 2.15],
+                    [sx, -1.2, d + 2.6],
+                    [sx, 0.15, d + 2.6],
+                    [sx, 0.15, d + 2.15],
+                ],
+            );
+        }
 
         // ---- the tall portal itself (0.45 .. 4.75) --------------------------
         self.face(
@@ -958,6 +997,148 @@ impl Manor {
         let uv = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
         self.b.quad(mat, p, uv);
     }
+
+    /// Bay windows (эркеры) flanking the entrance: the nearest free 4 m span
+    /// on each side of the door zone becomes a projection of the upper floors
+    /// (0.85 m deep) on rusticated cheeks, with a closed underside on three
+    /// corbels and a small cornice cap just under the eaves. The built spans
+    /// are recorded in `bay_x` so balconies stay off the bays.
+    fn erkers(&mut self) {
+        let tiles = self.tiles;
+        if tiles < 8 {
+            return; // too narrow to flank the entrance with bays
+        }
+        let dt = self.door_tile;
+        let clear = |t: usize| -> bool {
+            if t == dt || t >= tiles {
+                return false;
+            }
+            if let Some(a) = self.arch {
+                if t == a || t == a + 1 {
+                    return false;
+                }
+            }
+            true
+        };
+        let mut bays: Vec<(f32, f32)> = Vec::new();
+        // nearest free 2-tile span left of the entrance, walking outward
+        // (spans may sit right next to the door tile — that is where bays
+        // belong; the arch and the corner keep their distance)
+        if dt >= 3 {
+            let mut t = dt - 2;
+            loop {
+                if clear(t) && clear(t + 1) {
+                    bays.push((2.0 * t as f32, 2.0 * (t + 2) as f32));
+                    break;
+                }
+                if t <= 1 {
+                    break;
+                }
+                t -= 1;
+            }
+        }
+        // ... and on the right, one free tile to the corner
+        for t in dt + 1..=tiles.saturating_sub(3) {
+            if clear(t) && clear(t + 1) {
+                bays.push((2.0 * t as f32, 2.0 * (t + 2) as f32));
+                break;
+            }
+        }
+        let dep = 0.85f32;
+        let zf = self.d + dep;
+        let y0 = self.heights[0] + self.heights[1];
+        let y_top: f32 = self.heights.iter().sum::<f32>() - 0.25; // under the eaves
+        if y_top <= y0 + 0.8 || bays.is_empty() {
+            return; // no room above the entrance floor
+        }
+        println!(
+            "  erkers: {n} bay(s) at {bays:?} (tiles {tiles}, door tile {dt}, w {w} m)",
+            n = bays.len(),
+            w = self.w
+        );
+        let heights = self.heights.clone(); // avoid an immutable self borrow
+        for &(bx0, bx1) in &bays {
+            // front: one window tile per 2 m per upper floor
+            let mut y = 0.0f32;
+            for (fi, fh) in heights.iter().enumerate() {
+                if fi >= 2 {
+                    let mwin = if fi == 2 { M_WIN_SANDRIK } else { M_WIN };
+                    let ye = (y + fh).min(y_top);
+                    if ye > y + 0.05 {
+                        let mut x = bx0;
+                        while x < bx1 - 1e-3 {
+                            self.wall_quad(mwin, 0, x, x + 2.0, y, ye, zf);
+                            x += 2.0;
+                        }
+                    }
+                }
+                y += fh;
+            }
+            // cheeks
+            for sx in [bx0, bx1] {
+                self.face(
+                    M_RUST,
+                    [
+                        [sx, y0, self.d],
+                        [sx, y0, zf],
+                        [sx, y_top, zf],
+                        [sx, y_top, self.d],
+                    ],
+                );
+            }
+            // closed underside + three corbels
+            self.face(
+                M_RUST,
+                [
+                    [bx0, y0, zf],
+                    [bx1, y0, zf],
+                    [bx1, y0, self.d],
+                    [bx0, y0, self.d],
+                ],
+            );
+            for cx in [bx0 + 0.35, (bx0 + bx1) * 0.5, bx1 - 0.35] {
+                self.face(
+                    M_RUST,
+                    [
+                        [cx - 0.12, y0 - 0.55, self.d + 0.25],
+                        [cx + 0.12, y0 - 0.55, self.d + 0.25],
+                        [cx + 0.12, y0, zf - 0.1],
+                        [cx - 0.12, y0, zf - 0.1],
+                    ],
+                );
+            }
+            // cornice cap: top slab + a 0.1 m fascia ring
+            for p in [
+                [
+                    [bx0 - 0.12, y_top + 0.10, self.d - 0.05],
+                    [bx1 + 0.12, y_top + 0.10, self.d - 0.05],
+                    [bx1 + 0.12, y_top + 0.10, zf + 0.12],
+                    [bx0 - 0.12, y_top + 0.10, zf + 0.12],
+                ],
+                [
+                    [bx0 - 0.12, y_top, zf + 0.12],
+                    [bx1 + 0.12, y_top, zf + 0.12],
+                    [bx1 + 0.12, y_top + 0.10, zf + 0.12],
+                    [bx0 - 0.12, y_top + 0.10, zf + 0.12],
+                ],
+                [
+                    [bx0 - 0.12, y_top, self.d - 0.05],
+                    [bx0 - 0.12, y_top, zf + 0.12],
+                    [bx0 - 0.12, y_top + 0.10, zf + 0.12],
+                    [bx0 - 0.12, y_top + 0.10, self.d - 0.05],
+                ],
+                [
+                    [bx1 + 0.12, y_top, zf + 0.12],
+                    [bx1 + 0.12, y_top, self.d - 0.05],
+                    [bx1 + 0.12, y_top + 0.10, self.d - 0.05],
+                    [bx1 + 0.12, y_top + 0.10, zf + 0.12],
+                ],
+            ] {
+                self.face(M_BAND, p);
+            }
+        }
+        self.bay_x = bays;
+    }
 }
 
 /// Build one tenement house; returns the mesh, its palette textures and the
@@ -968,6 +1149,7 @@ pub fn generate_manor(
     size: Option<(f32, f32)>,
     corner: bool,
     roman: bool,
+    bays: bool,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>, f32, f32, Option<(f32, f32)>) {
     let mut r = Rng::new(seed ^ 0x0050_4954_4552_0000); // "PITER"
     let pal = Palette::new(&mut r);
@@ -1062,6 +1244,8 @@ pub fn generate_manor(
         stable,
         corner,
         roman,
+        bays,
+        bay_x: Vec::new(),
     };
     m.build(&mut r);
     let texs = m.textures();
@@ -1076,6 +1260,9 @@ impl Manor {
         let w = self.w;
         let d = self.d;
         let n_floors = self.heights.len();
+        if self.bays && !self.roman {
+            self.erkers();
+        }
 
         // ---- walls, per floor, per 2 m tile ------------------------------
         let mut y = 0.0f32;
@@ -1315,6 +1502,16 @@ impl Manor {
                             continue; // no balcony over the carriage arch
                         }
                     }
+                    {
+                        let xcx = 2.0 * wt as f32 + 1.0;
+                        if self
+                            .bay_x
+                            .iter()
+                            .any(|&(x0, x1)| xcx > x0 - 0.6 && xcx < x1 + 0.6)
+                        {
+                            continue; // a bay window owns this wall span
+                        }
+                    }
                     // no balcony over the entrance (its canopy and lanterns
                     // hang right there) and none inside the Roman colonnade
                     // (the portico entablature would cut straight through it)
@@ -1420,22 +1617,47 @@ impl Manor {
         if !self.roman {
             let dt = self.door_tile;
             let xc = 2.0 * dt as f32 + 1.0;
-            // three steps rising to the door
+            // three SOLID steps: tread, riser and side cheeks per step,
+            // sunk into the ground (-1.2) so nothing hollow shows from the
+            // sides or below (the user caught flat risers reading as cardboard)
             for s in 0..3 {
                 let sw = 1.9 - 0.18 * s as f32;
                 let zh0 = d + 0.30 * (3 - s) as f32;
                 let zh1 = zh0 + 0.30;
-                let yh = 0.14 * (s + 1) as f32;
+                let yt = 0.14 * (s + 1) as f32 + 0.16;
+                let yb = -1.2f32;
                 self.b.quad(
                     M_BAND,
                     [
-                        [xc - sw, yh, zh1],
-                        [xc + sw, yh, zh1],
-                        [xc + sw, yh + 0.16, zh1],
-                        [xc - sw, yh + 0.16, zh1],
+                        [xc - sw, yt, zh1],
+                        [xc + sw, yt, zh1],
+                        [xc + sw, yt, zh0],
+                        [xc - sw, yt, zh0],
+                    ],
+                    [[0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]],
+                );
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [xc - sw, yb, zh1],
+                        [xc + sw, yb, zh1],
+                        [xc + sw, yt, zh1],
+                        [xc - sw, yt, zh1],
                     ],
                     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                 );
+                for sx in [xc - sw, xc + sw] {
+                    self.b.quad(
+                        M_BAND,
+                        [
+                            [sx, yb, zh0],
+                            [sx, yb, zh1],
+                            [sx, yt, zh1],
+                            [sx, yt, zh0],
+                        ],
+                        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    );
+                }
             }
             // canopy slab over the entrance + brackets
             let can_y = self.heights[0] + 0.55;

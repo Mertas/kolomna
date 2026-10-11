@@ -93,6 +93,11 @@ impl Builder {
         self.push_tri(mat, base, base + 1, base + 2);
     }
 
+    /// Debug helper: vertices lying beyond `z` (protrusions past a facade)
+    pub fn verts_beyond(&self, z: f32) -> usize {
+        self.verts.iter().filter(|v| v.pos[2] > z).count()
+    }
+
     pub fn finish(self, n_tex: u32) -> ModelMesh {
         ModelMesh {
             verts: self.verts,

@@ -182,6 +182,11 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     // to a side, so several plan variants can be compared side by side
     let mut plan_pts: Vec<([[f32; 2]; 4], [[f32; 2]; 4])> = Vec::new();
     let mut focus: Option<[f32; 3]> = None;
+    // which block anchors the --shot view (KOLOMNA_FOCUS_BLK overrides)
+    let focus_blk: u64 = std::env::var("KOLOMNA_FOCUS_BLK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(4);
     for blk in 0..10u64 {
         let s: f32 = if blk % 2 == 0 { 1.0 } else { -1.0 }; // which side of the road
         let u_off = ((blk / 2) as f32 - 2.0) * 56.0;
@@ -191,7 +196,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         // the block plan: an irregular quad (frame: a along the street, b
         // inward), every vertex jittered — never a neat rectangle; the
         // footprint varies per block so the variants differ
-        let a_half = 18.0 + rng.below(9) as f32 * 0.5; // front half width 18–22 m
+        let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
         let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
         let mut q = [
             [u_off - a_half, setback],
@@ -238,10 +243,12 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             // each side keeps >= 10 m for its own row: a wing never takes more
             // than half of (side - 10 m). The old one-sided cap left 4 m rows
             // and squeezed a 10 m house into them.
+            // corner houses stay small (10–12 m): fat 11–16 m wings left the
+            // street rows 8–14 m wide — too narrow for bay windows or a portico
             let cap0 = ((lens[ip] - 10.0) * 0.5).max(10.0);
             let cap1 = ((lens[i] - 10.0) * 0.5).max(10.0);
-            wings[i][0] = (11.0 + rng.below(6) as f32).min(cap0).max(10.0);
-            wings[i][1] = (11.0 + rng.below(6) as f32).min(cap1).max(10.0);
+            wings[i][0] = (10.0 + rng.below(3) as f32).min(cap0).max(10.0);
+            wings[i][1] = (10.0 + rng.below(3) as f32).min(cap1).max(10.0);
         }
 
         // place one house: its plan quad c (block frame, metres) + requested
@@ -252,6 +259,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                          arch: bool,
                          corner: bool,
                          roman: bool,
+                         bay: bool,
                          seed: u64| {
             let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
             let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
@@ -261,6 +269,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 Some((req_w, req_d)),
                 corner,
                 roman,
+                bay,
             );
                 // block frame -> world metres relative to the placement anchor
                 let to_wm = |p: [f32; 2]| -> [f32; 2] {
@@ -311,8 +320,15 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 kolomna_render::piter::deform(&mut pl, wa, da, cw);
                 let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
                 let at = [anchor[0], anchor[1], (seat - mn) * ZSCALE];
-                if blk == 4 && focus.is_none() {
-                    focus = Some(at); // the centre block anchors the --shot view
+                if blk == focus_blk && focus.is_none() {
+                    // aim the --shot view at THIS house's centre: `at` is the
+                    // shared plan anchor, the same point for every block
+                    let cw = to_wm(ctr);
+                    focus = Some([
+                        anchor[0] + cw[0] / 16.0,
+                        anchor[1] + cw[1] / 16.0,
+                        (seat - mn) * ZSCALE,
+                    ]);
                 }
                 village.push((pl, vec![base_tex], at, 0.0));
                 village.push((mesh, texs, at, 0.0));
@@ -331,18 +347,28 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             // house. Both are chosen by width so they always fit.
             let mut archj = vec![false; k];
             let mut romanj = vec![false; k];
+            let mut bayj = vec![false; k];
             if i == 0 {
                 let mut order: Vec<usize> = (0..k).collect();
                 order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
-                // only some blocks show the Roman variant — the gallery puts
-                // both faces of the type on display
-                let rom = if rng.f() < 0.6 {
+                // the gallery splits deterministically so the variants sit
+                // side by side for comparison: 0,2 roman · 1,3 bay · 4 plain
+                let kind = blk % 5;
+                let rom = if kind == 0 || kind == 2 {
                     order.iter().copied().find(|&j| widths[j] >= 14.0)
                 } else {
                     None
                 };
                 if let Some(r) = rom {
                     romanj[r] = true;
+                }
+                if rom.is_none()
+                    && (kind == 1 || kind == 3)
+                    && std::env::var("KOLOMNA_NOBAYS").is_err()
+                {
+                    if let Some(b) = order.iter().copied().find(|&j| widths[j] >= 14.0) {
+                        bayj[b] = true;
+                    }
                 }
                 // the arch goes to ANOTHER piece whenever one exists: the
                 // generator keeps it off the portico, but a gate next to the
@@ -372,7 +398,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 }
                 let ap: Vec<usize> = (0..k).filter(|&j| archj[j]).collect();
                 let rp: Vec<usize> = (0..k).filter(|&j| romanj[j]).collect();
-                println!("block {blk} street row: arches at {ap:?}, roman at {rp:?} (k={k})");
+                let bp: Vec<usize> = (0..k).filter(|&j| bayj[j]).collect();
+                println!("block {blk} street row: arches at {ap:?}, roman at {rp:?}, bays at {bp:?} (k={k})");
             }
             let (_, inn, _) = side(&q, i);
             let mut a0 = a_start;
@@ -399,6 +426,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                     archj[j],
                     false,
                     romanj[j],
+                    bayj[j],
                     seed_b + 1000 + 97 * i as u64 + 31 * j as u64,
                 );
                 a0 = a1;
@@ -411,7 +439,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             let pl_pt = on_side(&q, ip, lens[ip] - u_b);
             let pf_pt = on_side(&q, i, u_a);
             let c = [vv[i], pl_pt, pf_pt, q[i]];
-            place(u_a, u_b, c, false, true, false, seed_b + 500 + i as u64);
+            place(u_a, u_b, c, false, true, false, false, seed_b + 500 + i as u64);
         }
 
         // keep the plan outlines for the boundary overlay drawn in the app
