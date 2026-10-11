@@ -85,6 +85,346 @@ pub struct Scene {
     focus: [f32; 3],
 }
 
+/// One courtyard block: generated (blk < 10) or editor-drawn (q_user is
+/// Some — the quad arrives already CCW in the plan frame).  The filler
+/// inscribes corner houses, rows of rectangles and closing trapezoids
+/// along the sides; every house is seated on the highest ground under
+/// its footprint and gets a ground-following plinth.  Returns the house
+/// meshes (plinth + house per entry), the plan outlines for the debug
+/// overlay, the street-layout edge (generated blocks only), the size
+/// report and the --shot focus when this is the focus block.
+#[allow(clippy::too_many_arguments)]
+fn build_block(
+    blk: u64,
+    q_user: Option<[[f32; 2]; 4]>,
+    h_at: &dyn Fn(f32, f32) -> f32,
+    anchor: [f32; 2],
+    eu: [f32; 2],
+    nvec: [f32; 2],
+    mn: f32,
+    wl: f32,
+    want_focus: bool,
+    focus_blk: u64,
+) -> (
+    Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
+    ([[f32; 2]; 4], [[f32; 2]; 4]),
+    Option<(f32, f32, f32)>,
+    Vec<(f32, f32, f32)>,
+    Option<[f32; 3]>,
+) {
+    let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)> = Vec::new();
+    let mut report: Vec<(f32, f32, f32)> = Vec::new(); // w, d, fall
+    let mut edge: Option<(f32, f32, f32)> = None;
+    let mut focus: Option<[f32; 3]> = None;
+    let plan_out: ([[f32; 2]; 4], [[f32; 2]; 4]);
+
+    let depth = 12.0f32; // one depth for the whole block: rows close exactly
+    let setback = 18.0f32; // front facade distance from the street line
+    let eps = 0.025f32; // every house shrinks 2.5 cm toward its centre, so
+                        // neighbour wall planes part by ~5 cm: no z-fighting,
+                        // no visible gaps
+
+    // bilinear map of a local rectangle (0..w, 0..d) onto the quad c
+    let bilinear = |c: &[[f32; 2]; 4], w: f32, d: f32, lx: f32, lz: f32| -> [f32; 2] {
+        let u = lx / w;
+        let t = lz / d;
+        [
+            (1.0 - u) * (1.0 - t) * c[0][0]
+                + u * (1.0 - t) * c[1][0]
+                + (1.0 - u) * t * c[2][0]
+                + u * t * c[3][0],
+            (1.0 - u) * (1.0 - t) * c[0][1]
+                + u * (1.0 - t) * c[1][1]
+                + (1.0 - u) * t * c[2][1]
+                + u * t * c[3][1],
+        ]
+    };
+    // widths of a row: 12..24 m houses up to a 26 m closing piece, summing
+    // exactly to `run` — no leftovers, no gaps
+    let plan_widths = |rng: &mut kolomna_render::procgen::Rng, run: f32| -> Vec<f32> {
+        let mut out: Vec<f32> = Vec::new();
+        let mut rest = run;
+        while rest > 26.0 {
+            let w = loop {
+                let w = [12.0f32, 16.0, 20.0, 24.0][rng.below(4) as usize];
+                if rest - w >= 10.0 {
+                    break w;
+                }
+            };
+            out.push(w);
+            rest -= w;
+        }
+        out.push(rest);
+        out
+    };
+
+    let usr = q_user.is_some();
+    let s: f32 = if usr { 1.0 } else if blk % 2 == 0 { 1.0 } else { -1.0 };
+    let u_off = if usr { 0.0 } else { ((blk / 2) as f32 - 2.0) * 56.0 };
+    let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
+    let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
+
+    // the block plan: an irregular quad (frame: a along the street, b
+    // inward), every vertex jittered — never a neat rectangle; the
+    // footprint varies per block so the variants differ.  A user block
+    // (blk >= 10) arrives exactly as the editor drew it — already CCW
+    // in this same plan frame — so the very same path fills it.
+    let mut q: [[f32; 2]; 4];
+    if usr {
+        q = q_user.unwrap();
+    } else {
+        let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
+        let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
+        q = [
+            [u_off - a_half, setback],
+            [u_off + a_half, setback],
+            [u_off + a_half - 5.0, setback + b_len],
+            [u_off - a_half + 5.0, setback + b_len],
+        ];
+        for p in q.iter_mut() {
+            p[0] += (rng.f() - 0.5) * 9.0;
+            p[1] += (rng.f() - 0.5) * 7.0;
+        }
+    }
+    if !usr {
+        edge = Some((
+            q[0][0].min(q[3][0]),
+            q[1][0].max(q[2][0]),
+            q[2][1].max(q[3][1]),
+        ));
+    }
+    // side i runs q[i] -> q[i+1]: unit tangent, inward normal, length
+    let side = |q: &[[f32; 2]; 4], i: usize| -> ([f32; 2], [f32; 2], f32) {
+        let a = q[i];
+        let b = q[(i + 1) % 4];
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-4);
+        let t = [d[0] / l, d[1] / l];
+        ([t[0], t[1]], [-t[1], t[0]], l)
+    };
+    let on_side = |q: &[[f32; 2]; 4], i: usize, a: f32| -> [f32; 2] {
+        let (t, _, _) = side(q, i);
+        [q[i][0] + t[0] * a, q[i][1] + t[1] * a]
+    };
+    let lens = [side(&q, 0).2, side(&q, 1).2, side(&q, 2).2, side(&q, 3).2];
+    // courtyard corners: intersections of neighbouring inward lines
+    let mut vv = [[0.0f32; 2]; 4];
+    for i in 0..4 {
+        let ip = (i + 3) % 4;
+        let (t1, n1, _) = side(&q, ip);
+        let (t2, n2, _) = side(&q, i);
+        let p1 = [q[ip][0] + n1[0] * depth, q[ip][1] + n1[1] * depth];
+        let p2 = [q[i][0] + n2[0] * depth, q[i][1] + n2[1] * depth];
+        let den = t1[0] * t2[1] - t1[1] * t2[0];
+        let den = if den.abs() < 1e-6 { 1e-6 } else { den };
+        let u = ((p2[0] - p1[0]) * t2[1] - (p2[1] - p1[1]) * t2[0]) / den;
+        vv[i] = [p1[0] + t1[0] * u, p1[1] + t1[1] * u];
+    }
+    // corner-house wings: [along the previous side (uB), along the next
+    // side (uA)]; every side then keeps at least 10 m for its row
+    let mut wings = [[0.0f32; 2]; 4];
+    for i in 0..4 {
+        let ip = (i + 3) % 4;
+        // each side keeps >= 10 m for its own row: a wing never takes more
+        // than half of (side - 10 m). The old one-sided cap left 4 m rows
+        // and squeezed a 10 m house into them.
+        // corner houses stay small (10–12 m): fat 11–16 m wings left the
+        // street rows 8–14 m wide — too narrow for bay windows or a portico
+        let cap0 = ((lens[ip] - 10.0) * 0.5).max(10.0);
+        let cap1 = ((lens[i] - 10.0) * 0.5).max(10.0);
+        wings[i][0] = (10.0 + rng.below(3) as f32).min(cap0).max(10.0);
+        wings[i][1] = (10.0 + rng.below(3) as f32).min(cap1).max(10.0);
+    }
+
+    // place one house: its plan quad c (block frame, metres) + requested
+    // size; the mesh is generated, seated and mapped onto the quad
+    let mut place = |w_slot: f32,
+                     d_slot: f32,
+                     c: [[f32; 2]; 4],
+                     arch: bool,
+                     corner: bool,
+                     roman: bool,
+                     bay: bool,
+                     seed: u64| {
+        let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
+        let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
+        let (mut mesh, texs, wa, da, archr) = kolomna_render::piter::generate_manor(
+            seed,
+            arch,
+            Some((req_w, req_d)),
+            corner,
+            roman,
+            bay,
+        );
+            // block frame -> world metres relative to the placement anchor
+            let to_wm = |p: [f32; 2]| -> [f32; 2] {
+                [
+                    eu[0] * p[0] + nvec[0] * s * p[1],
+                    eu[1] * p[0] + nvec[1] * s * p[1],
+                ]
+            };
+            // pull the corners slightly toward the centre (see `eps`)
+            let ctr = [
+                (c[0][0] + c[1][0] + c[2][0] + c[3][0]) * 0.25,
+                (c[0][1] + c[1][1] + c[2][1] + c[3][1]) * 0.25,
+            ];
+            let mut cq = c;
+            for p in cq.iter_mut() {
+                let dx_ = p[0] - ctr[0];
+                let dz_ = p[1] - ctr[1];
+                let l = (dx_ * dx_ + dz_ * dz_).sqrt().max(1e-4);
+                p[0] -= dx_ / l * eps;
+                p[1] -= dz_ / l * eps;
+            }
+            // seat on the highest ground under the footprint
+            let mut h_max = f32::NEG_INFINITY;
+            let mut h_min = f32::INFINITY;
+            for (lx, lz) in [
+                (0.0f32, 0.0f32),
+                (wa, 0.0),
+                (0.0, da),
+                (wa, da),
+                (wa * 0.5, da * 0.5),
+            ] {
+                let wm = to_wm(bilinear(&cq, wa, da, lx, lz));
+                let h = h_at(anchor[0] + wm[0] / 16.0, anchor[1] + wm[1] / 16.0);
+                h_max = h_max.max(h);
+                h_min = h_min.min(h);
+            }
+            let seat = (h_max + 0.05).max(wl + 2.0);
+            let low = |lx: f32, lz: f32| -> f32 {
+                let wm = to_wm(bilinear(&cq, wa, da, lx, lz));
+                h_at(anchor[0] + wm[0] / 16.0, anchor[1] + wm[1] / 16.0) - seat
+            };
+            let mut pl = kolomna_render::piter::manor_plinth(wa, da, &low, archr);
+            let mut cw: [[f32; 2]; 4] = [[0.0; 2]; 4];
+            for k in 0..4 {
+                cw[k] = to_wm(cq[k]);
+            }
+            kolomna_render::piter::deform(&mut mesh, wa, da, cw);
+            kolomna_render::piter::deform(&mut pl, wa, da, cw);
+            let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
+            let at = [anchor[0], anchor[1], (seat - mn) * ZSCALE];
+            if want_focus && blk == focus_blk && focus.is_none() {
+                // aim the --shot view at THIS house's centre: `at` is the
+                // shared plan anchor, the same point for every block
+                let cw = to_wm(ctr);
+                focus = Some([
+                    anchor[0] + cw[0] / 16.0,
+                    anchor[1] + cw[1] / 16.0,
+                    (seat - mn) * ZSCALE,
+                ]);
+            }
+            village.push((pl, vec![base_tex], at, 0.0));
+            village.push((mesh, texs, at, 0.0));
+            report.push((wa, da, h_max - h_min));
+        };
+
+    // rows along the four sides, between the corner houses
+    for i in 0..4 {
+        let inx = (i + 1) % 4;
+        let a_start = wings[i][1];
+        let run = lens[i] - wings[i][1] - wings[inx][0];
+        let widths = plan_widths(&mut rng, run);
+        let k = widths.len();
+        // The STREET row (side 0) must open at least one carriage arch
+        // into the yard, and its widest facade gets the Roman portico
+        // house. Both are chosen by width so they always fit.
+        let mut archj = vec![false; k];
+        let mut romanj = vec![false; k];
+        let mut bayj = vec![false; k];
+        if i == 0 {
+            let mut order: Vec<usize> = (0..k).collect();
+            order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
+            // the gallery splits deterministically so the variants sit
+            // side by side for comparison:
+            // 0,2 roman portico · 1,3 bay windows · 4 plain = arch house
+            let kind = blk % 5;
+            let rom = if kind == 0 || kind == 2 {
+                order.iter().copied().find(|&j| widths[j] >= 14.0)
+            } else {
+                None
+            };
+            if let Some(r) = rom {
+                romanj[r] = true;
+            }
+            if rom.is_none()
+                && (kind == 1 || kind == 3)
+                && std::env::var("KOLOMNA_NOBAYS").is_err()
+            {
+                if let Some(b) = order.iter().copied().find(|&j| widths[j] >= 14.0) {
+                    bayj[b] = true;
+                }
+            }
+            // a house with a carriage arch carries no parade entrance:
+            // the arch goes only to a PLAIN street piece — a roman/bay
+            // house never doubles as the arch house, and on k=1 parade
+            // blocks the courtyard stays archless
+            if rom.is_none() && !bayj.iter().any(|&b| b) {
+                if let Some(p) = order.iter().copied().find(|&j| widths[j] >= 12.0) {
+                    archj[p] = true;
+                }
+            }
+            let ap: Vec<usize> = (0..k).filter(|&j| archj[j]).collect();
+            let rp: Vec<usize> = (0..k).filter(|&j| romanj[j]).collect();
+            let bp: Vec<usize> = (0..k).filter(|&j| bayj[j]).collect();
+            println!("block {blk} street row: arches at {ap:?}, roman at {rp:?}, bays at {bp:?} (k={k})");
+        }
+        let (_, inn, _) = side(&q, i);
+        let mut a0 = a_start;
+        for j in 0..k {
+            let a1 = a0 + widths[j];
+            let p0 = on_side(&q, i, a0);
+            let p1 = on_side(&q, i, a1);
+            let mut c = [
+                [p0[0] + inn[0] * depth, p0[1] + inn[1] * depth],
+                [p1[0] + inn[0] * depth, p1[1] + inn[1] * depth],
+                p0,
+                p1,
+            ];
+            if j == 0 {
+                c[0] = vv[i]; // slanted end on the corner house's face
+            }
+            if j == k - 1 {
+                c[1] = vv[inx];
+            }
+            place(
+                widths[j],
+                depth,
+                c,
+                archj[j],
+                false,
+                romanj[j],
+                bayj[j],
+                seed_b + 1000 + 97 * i as u64 + 31 * j as u64,
+            );
+            a0 = a1;
+        }
+    }
+    // corner houses: irregular quads, both street edges get parade walls
+    for i in 0..4 {
+        let ip = (i + 3) % 4;
+        let (u_b, u_a) = (wings[i][0], wings[i][1]);
+        let pl_pt = on_side(&q, ip, lens[ip] - u_b);
+        let pf_pt = on_side(&q, i, u_a);
+        let c = [vv[i], pl_pt, pf_pt, q[i]];
+        place(u_a, u_b, c, false, true, false, false, seed_b + 500 + i as u64);
+    }
+
+    // keep the plan outlines for the boundary overlay drawn in the app
+    let to_wm_b = |p: [f32; 2]| -> [f32; 2] {
+        [
+            eu[0] * p[0] + nvec[0] * s * p[1],
+            eu[1] * p[0] + nvec[1] * s * p[1],
+        ]
+    };
+    plan_out = (
+        [to_wm_b(q[0]), to_wm_b(q[1]), to_wm_b(q[2]), to_wm_b(q[3])],
+        [to_wm_b(vv[0]), to_wm_b(vv[1]), to_wm_b(vv[2]), to_wm_b(vv[3])],
+    );
+    (village, plan_out, edge, report, focus)
+}
+
 pub fn load_scene(
     city: &str,
     dat: &str,
@@ -163,46 +503,6 @@ pub fn load_scene(
     let mut roads_idx: Option<usize> = None;
     let mut report: Vec<(f32, f32, f32)> = Vec::new(); // w, d, fall
 
-    let depth = 12.0f32; // one depth for the whole block: rows close exactly
-    let setback = 18.0f32; // front facade distance from the street line
-    let eps = 0.025f32; // every house shrinks 2.5 cm toward its centre, so
-                        // neighbour wall planes part by ~5 cm: no z-fighting,
-                        // no visible gaps
-
-    // bilinear map of a local rectangle (0..w, 0..d) onto the quad c
-    let bilinear = |c: &[[f32; 2]; 4], w: f32, d: f32, lx: f32, lz: f32| -> [f32; 2] {
-        let u = lx / w;
-        let t = lz / d;
-        [
-            (1.0 - u) * (1.0 - t) * c[0][0]
-                + u * (1.0 - t) * c[1][0]
-                + (1.0 - u) * t * c[2][0]
-                + u * t * c[3][0],
-            (1.0 - u) * (1.0 - t) * c[0][1]
-                + u * (1.0 - t) * c[1][1]
-                + (1.0 - u) * t * c[2][1]
-                + u * t * c[3][1],
-        ]
-    };
-    // widths of a row: 12..24 m houses up to a 26 m closing piece, summing
-    // exactly to `run` — no leftovers, no gaps
-    let plan_widths = |rng: &mut kolomna_render::procgen::Rng, run: f32| -> Vec<f32> {
-        let mut out: Vec<f32> = Vec::new();
-        let mut rest = run;
-        while rest > 26.0 {
-            let w = loop {
-                let w = [12.0f32, 16.0, 20.0, 24.0][rng.below(4) as usize];
-                if rest - w >= 10.0 {
-                    break w;
-                }
-            };
-            out.push(w);
-            rest -= w;
-        }
-        out.push(rest);
-        out
-    };
-
     // ten courtyards: a gallery of blocks along the street line, five columns
     // to a side, so several plan variants can be compared side by side
     let mut plan_pts: Vec<([[f32; 2]; 4], [[f32; 2]; 4])> = Vec::new();
@@ -229,270 +529,32 @@ pub fn load_scene(
     let mut blk_edges: Vec<(f32, f32, f32)> = Vec::new(); // per block: u_min, u_max, v_max
     let n_proc = if skip_proc { 0 } else { 10 };
     for blk in 0..(n_proc + user.blocks.len()) as u64 {
-        let usr = blk >= n_proc as u64; // a courtyard drawn in the editor
-        let s: f32 = if usr { 1.0 } else if blk % 2 == 0 { 1.0 } else { -1.0 };
-        let u_off = if usr { 0.0 } else { ((blk / 2) as f32 - 2.0) * 56.0 };
-        let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
-        let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
-
-        // the block plan: an irregular quad (frame: a along the street, b
-        // inward), every vertex jittered — never a neat rectangle; the
-        // footprint varies per block so the variants differ.  A user block
-        // (blk >= 10) arrives exactly as the editor drew it — already CCW
-        // in this same plan frame — so the very same path fills it.
-        let mut q: [[f32; 2]; 4];
-        if usr {
-            q = user.blocks[(blk - n_proc as u64) as usize];
-        } else {
-            let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
-            let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
-            q = [
-                [u_off - a_half, setback],
-                [u_off + a_half, setback],
-                [u_off + a_half - 5.0, setback + b_len],
-                [u_off - a_half + 5.0, setback + b_len],
-            ];
-            for p in q.iter_mut() {
-                p[0] += (rng.f() - 0.5) * 9.0;
-                p[1] += (rng.f() - 0.5) * 7.0;
-            }
+        let usr = blk >= n_proc as u64;
+        let (meshes, plan, edge, rep, foc) = build_block(
+            blk,
+            if usr {
+                Some(user.blocks[(blk - n_proc as u64) as usize])
+            } else {
+                None
+            },
+            &h_at,
+            anchor,
+            eu,
+            nvec,
+            mn,
+            wl,
+            focus.is_none(),
+            focus_blk,
+        );
+        village.extend(meshes);
+        plan_pts.push(plan);
+        if let Some(e) = edge {
+            blk_edges.push(e);
         }
-        if !usr {
-            blk_edges.push((
-                q[0][0].min(q[3][0]),
-                q[1][0].max(q[2][0]),
-                q[2][1].max(q[3][1]),
-            ));
+        report.extend(rep);
+        if let Some(f) = foc {
+            focus = Some(f);
         }
-        // side i runs q[i] -> q[i+1]: unit tangent, inward normal, length
-        let side = |q: &[[f32; 2]; 4], i: usize| -> ([f32; 2], [f32; 2], f32) {
-            let a = q[i];
-            let b = q[(i + 1) % 4];
-            let d = [b[0] - a[0], b[1] - a[1]];
-            let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-4);
-            let t = [d[0] / l, d[1] / l];
-            ([t[0], t[1]], [-t[1], t[0]], l)
-        };
-        let on_side = |q: &[[f32; 2]; 4], i: usize, a: f32| -> [f32; 2] {
-            let (t, _, _) = side(q, i);
-            [q[i][0] + t[0] * a, q[i][1] + t[1] * a]
-        };
-        let lens = [side(&q, 0).2, side(&q, 1).2, side(&q, 2).2, side(&q, 3).2];
-        // courtyard corners: intersections of neighbouring inward lines
-        let mut vv = [[0.0f32; 2]; 4];
-        for i in 0..4 {
-            let ip = (i + 3) % 4;
-            let (t1, n1, _) = side(&q, ip);
-            let (t2, n2, _) = side(&q, i);
-            let p1 = [q[ip][0] + n1[0] * depth, q[ip][1] + n1[1] * depth];
-            let p2 = [q[i][0] + n2[0] * depth, q[i][1] + n2[1] * depth];
-            let den = t1[0] * t2[1] - t1[1] * t2[0];
-            let den = if den.abs() < 1e-6 { 1e-6 } else { den };
-            let u = ((p2[0] - p1[0]) * t2[1] - (p2[1] - p1[1]) * t2[0]) / den;
-            vv[i] = [p1[0] + t1[0] * u, p1[1] + t1[1] * u];
-        }
-        // corner-house wings: [along the previous side (uB), along the next
-        // side (uA)]; every side then keeps at least 10 m for its row
-        let mut wings = [[0.0f32; 2]; 4];
-        for i in 0..4 {
-            let ip = (i + 3) % 4;
-            // each side keeps >= 10 m for its own row: a wing never takes more
-            // than half of (side - 10 m). The old one-sided cap left 4 m rows
-            // and squeezed a 10 m house into them.
-            // corner houses stay small (10–12 m): fat 11–16 m wings left the
-            // street rows 8–14 m wide — too narrow for bay windows or a portico
-            let cap0 = ((lens[ip] - 10.0) * 0.5).max(10.0);
-            let cap1 = ((lens[i] - 10.0) * 0.5).max(10.0);
-            wings[i][0] = (10.0 + rng.below(3) as f32).min(cap0).max(10.0);
-            wings[i][1] = (10.0 + rng.below(3) as f32).min(cap1).max(10.0);
-        }
-
-        // place one house: its plan quad c (block frame, metres) + requested
-        // size; the mesh is generated, seated and mapped onto the quad
-        let mut place = |w_slot: f32,
-                         d_slot: f32,
-                         c: [[f32; 2]; 4],
-                         arch: bool,
-                         corner: bool,
-                         roman: bool,
-                         bay: bool,
-                         seed: u64| {
-            let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
-            let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
-            let (mut mesh, texs, wa, da, archr) = kolomna_render::piter::generate_manor(
-                seed,
-                arch,
-                Some((req_w, req_d)),
-                corner,
-                roman,
-                bay,
-            );
-                // block frame -> world metres relative to the placement anchor
-                let to_wm = |p: [f32; 2]| -> [f32; 2] {
-                    [
-                        eu[0] * p[0] + nvec[0] * s * p[1],
-                        eu[1] * p[0] + nvec[1] * s * p[1],
-                    ]
-                };
-                // pull the corners slightly toward the centre (see `eps`)
-                let ctr = [
-                    (c[0][0] + c[1][0] + c[2][0] + c[3][0]) * 0.25,
-                    (c[0][1] + c[1][1] + c[2][1] + c[3][1]) * 0.25,
-                ];
-                let mut cq = c;
-                for p in cq.iter_mut() {
-                    let dx_ = p[0] - ctr[0];
-                    let dz_ = p[1] - ctr[1];
-                    let l = (dx_ * dx_ + dz_ * dz_).sqrt().max(1e-4);
-                    p[0] -= dx_ / l * eps;
-                    p[1] -= dz_ / l * eps;
-                }
-                // seat on the highest ground under the footprint
-                let mut h_max = f32::NEG_INFINITY;
-                let mut h_min = f32::INFINITY;
-                for (lx, lz) in [
-                    (0.0f32, 0.0f32),
-                    (wa, 0.0),
-                    (0.0, da),
-                    (wa, da),
-                    (wa * 0.5, da * 0.5),
-                ] {
-                    let wm = to_wm(bilinear(&cq, wa, da, lx, lz));
-                    let h = h_at(anchor[0] + wm[0] / 16.0, anchor[1] + wm[1] / 16.0);
-                    h_max = h_max.max(h);
-                    h_min = h_min.min(h);
-                }
-                let seat = (h_max + 0.05).max(wl + 2.0);
-                let low = |lx: f32, lz: f32| -> f32 {
-                    let wm = to_wm(bilinear(&cq, wa, da, lx, lz));
-                    h_at(anchor[0] + wm[0] / 16.0, anchor[1] + wm[1] / 16.0) - seat
-                };
-                let mut pl = kolomna_render::piter::manor_plinth(wa, da, &low, archr);
-                let mut cw: [[f32; 2]; 4] = [[0.0; 2]; 4];
-                for k in 0..4 {
-                    cw[k] = to_wm(cq[k]);
-                }
-                kolomna_render::piter::deform(&mut mesh, wa, da, cw);
-                kolomna_render::piter::deform(&mut pl, wa, da, cw);
-                let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
-                let at = [anchor[0], anchor[1], (seat - mn) * ZSCALE];
-                if blk == focus_blk && focus.is_none() {
-                    // aim the --shot view at THIS house's centre: `at` is the
-                    // shared plan anchor, the same point for every block
-                    let cw = to_wm(ctr);
-                    focus = Some([
-                        anchor[0] + cw[0] / 16.0,
-                        anchor[1] + cw[1] / 16.0,
-                        (seat - mn) * ZSCALE,
-                    ]);
-                }
-                village.push((pl, vec![base_tex], at, 0.0));
-                village.push((mesh, texs, at, 0.0));
-                report.push((wa, da, h_max - h_min));
-            };
-
-        // rows along the four sides, between the corner houses
-        for i in 0..4 {
-            let inx = (i + 1) % 4;
-            let a_start = wings[i][1];
-            let run = lens[i] - wings[i][1] - wings[inx][0];
-            let widths = plan_widths(&mut rng, run);
-            let k = widths.len();
-            // The STREET row (side 0) must open at least one carriage arch
-            // into the yard, and its widest facade gets the Roman portico
-            // house. Both are chosen by width so they always fit.
-            let mut archj = vec![false; k];
-            let mut romanj = vec![false; k];
-            let mut bayj = vec![false; k];
-            if i == 0 {
-                let mut order: Vec<usize> = (0..k).collect();
-                order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
-                // the gallery splits deterministically so the variants sit
-                // side by side for comparison:
-                // 0,2 roman portico · 1,3 bay windows · 4 plain = arch house
-                let kind = blk % 5;
-                let rom = if kind == 0 || kind == 2 {
-                    order.iter().copied().find(|&j| widths[j] >= 14.0)
-                } else {
-                    None
-                };
-                if let Some(r) = rom {
-                    romanj[r] = true;
-                }
-                if rom.is_none()
-                    && (kind == 1 || kind == 3)
-                    && std::env::var("KOLOMNA_NOBAYS").is_err()
-                {
-                    if let Some(b) = order.iter().copied().find(|&j| widths[j] >= 14.0) {
-                        bayj[b] = true;
-                    }
-                }
-                // a house with a carriage arch carries no parade entrance:
-                // the arch goes only to a PLAIN street piece — a roman/bay
-                // house never doubles as the arch house, and on k=1 parade
-                // blocks the courtyard stays archless
-                if rom.is_none() && !bayj.iter().any(|&b| b) {
-                    if let Some(p) = order.iter().copied().find(|&j| widths[j] >= 12.0) {
-                        archj[p] = true;
-                    }
-                }
-                let ap: Vec<usize> = (0..k).filter(|&j| archj[j]).collect();
-                let rp: Vec<usize> = (0..k).filter(|&j| romanj[j]).collect();
-                let bp: Vec<usize> = (0..k).filter(|&j| bayj[j]).collect();
-                println!("block {blk} street row: arches at {ap:?}, roman at {rp:?}, bays at {bp:?} (k={k})");
-            }
-            let (_, inn, _) = side(&q, i);
-            let mut a0 = a_start;
-            for j in 0..k {
-                let a1 = a0 + widths[j];
-                let p0 = on_side(&q, i, a0);
-                let p1 = on_side(&q, i, a1);
-                let mut c = [
-                    [p0[0] + inn[0] * depth, p0[1] + inn[1] * depth],
-                    [p1[0] + inn[0] * depth, p1[1] + inn[1] * depth],
-                    p0,
-                    p1,
-                ];
-                if j == 0 {
-                    c[0] = vv[i]; // slanted end on the corner house's face
-                }
-                if j == k - 1 {
-                    c[1] = vv[inx];
-                }
-                place(
-                    widths[j],
-                    depth,
-                    c,
-                    archj[j],
-                    false,
-                    romanj[j],
-                    bayj[j],
-                    seed_b + 1000 + 97 * i as u64 + 31 * j as u64,
-                );
-                a0 = a1;
-            }
-        }
-        // corner houses: irregular quads, both street edges get parade walls
-        for i in 0..4 {
-            let ip = (i + 3) % 4;
-            let (u_b, u_a) = (wings[i][0], wings[i][1]);
-            let pl_pt = on_side(&q, ip, lens[ip] - u_b);
-            let pf_pt = on_side(&q, i, u_a);
-            let c = [vv[i], pl_pt, pf_pt, q[i]];
-            place(u_a, u_b, c, false, true, false, false, seed_b + 500 + i as u64);
-        }
-
-        // keep the plan outlines for the boundary overlay drawn in the app
-        let to_wm_b = |p: [f32; 2]| -> [f32; 2] {
-            [
-                eu[0] * p[0] + nvec[0] * s * p[1],
-                eu[1] * p[0] + nvec[1] * s * p[1],
-            ]
-        };
-        plan_pts.push((
-            [to_wm_b(q[0]), to_wm_b(q[1]), to_wm_b(q[2]), to_wm_b(q[3])],
-            [to_wm_b(vv[0]), to_wm_b(vv[1]), to_wm_b(vv[2]), to_wm_b(vv[3])],
-        ));
     }
     // ---- procedural modern streets ---------------------------------------
     // One street along the block fronts, with cross lanes through the gaps
@@ -2163,30 +2225,40 @@ impl App {
         );
     }
 
-    /// Append only the courtyard that was just committed: the scene builder
-    /// runs with the procedural city skipped, so it generates nothing but
-    /// the new block (the save parse stays, it is a fraction of a second).
+    /// Append only the courtyard that was just committed: the block filler
+    /// runs directly (no save parse, no scene scan) and its houses become
+    /// regular village entries.  The block index matches the one a full
+    /// reload would give it, so reloads reproduce the very same buildings.
     fn commit_quarter(&mut self) {
         let t0 = Instant::now();
         let q = match self.user.blocks.last() {
             Some(q) => *q,
             None => return,
         };
-        let user = UserPlan {
-            roads: Vec::new(),
-            blocks: vec![q],
-            parks: Vec::new(),
+        let blk = 10 + (self.user.blocks.len() - 1) as u64;
+        let meshes = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            build_block(
+                blk,
+                Some(q),
+                &h_at,
+                scene.anchor,
+                scene.eu,
+                scene.nvec,
+                scene.mn,
+                scene.wl,
+                false,
+                0,
+            )
+            .0
         };
-        let scene = match load_scene(&self.city, &self.dat, &user, true) {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("постройка квартала не удалась: {e}");
-                return;
-            }
-        };
-        let n = scene.village.len();
+        let n = meshes.len();
         if let Some(r) = self.renderer.as_mut() {
-            for (mesh, texs, pos, rot) in scene.village {
+            for (mesh, texs, pos, rot) in meshes {
                 r.add_village_mesh(mesh, texs, pos, rot);
             }
         }
