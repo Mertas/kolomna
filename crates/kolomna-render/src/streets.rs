@@ -9,12 +9,20 @@
 //! house placements do: `world_rel = eu * u + nvec * v`.
 
 use crate::model::ModelMesh;
-use crate::procgen::Builder;
+use crate::procgen::{Builder, Rng};
 
 pub const M_ASPHALT: u32 = 0;
 pub const M_KERB: u32 = 1;
 pub const M_WALK: u32 = 2;
 pub const M_PAINT: u32 = 3;
+pub const M_IRON: u32 = 4;
+pub const M_GLASS: u32 = 5;
+pub const M_BARK: u32 = 6;
+pub const M_LEAF: u32 = 7;
+pub const M_LEAF2: u32 = 8;
+pub const M_SIGN: u32 = 9;
+pub const M_WOOD: u32 = 10;
+pub const M_WHITE: u32 = 11;
 
 const ROAD_H: f32 = 0.14; // roadway sits this high above the highest ground
 const KERB_H: f32 = 0.15; // kerb / sidewalk step above the roadway
@@ -299,19 +307,21 @@ pub fn build_streets(
         prev = uc + cw + 0.05;
     }
     ranges.push((prev, p.main_t1));
-    for &(a, e) in &ranges {
+    for (ri, &(a, e)) in ranges.iter().enumerate() {
         if e - a > 0.5 {
             seg(&mut b, &ctx, a, e, true, 0.0, hr, hw, false, true, true);
         }
+        furniture_axis(&mut b, &ctx, 0x5100 + ri as u32, true, a, e, 0.0, hr, hw);
     }
 
     // ---- cross lanes through the gaps between block columns (each sized to
     // the gap it runs through)
-    for &(uc, cr, cw) in &p.cross {
+    for (uci, &(uc, cr, cw)) in p.cross.iter().enumerate() {
         for (t0, t1) in [(3.5, p.cross_half), (-p.cross_half, -3.5)] {
             if t1 > t0 + 0.5 {
                 seg(&mut b, &ctx, t0, t1, false, uc, cr, cw, true, true, false);
             }
+            furniture_axis(&mut b, &ctx, 0x6200 + uci as u32 + (t0 > 0.0) as u32 * 64, false, t0, t1, uc, cr, cw);
         }
         for (t0, t1) in [(6.5, p.cross_half), (-p.cross_half, -6.5)] {
             if t1 > t0 + 0.5 {
@@ -355,7 +365,7 @@ pub fn build_streets(
         }
     }
 
-    (b.finish(4), textures())
+    (b.finish(12), textures())
 }
 
 // ------------------------------------------------------------- textures ----
@@ -450,12 +460,473 @@ fn tex_paint() -> (u32, u32, Vec<u8>) {
     (256, 256, v)
 }
 
-/// User-drawn roads (the editor): free chains of plan points. Every
-/// segment gets the same cross-section as the main street — a 7 m
-/// roadway, granite kerbs and tiled sidewalks — sampled on the same
-/// smoothed height field, so a drawn road conforms to the terrain exactly
-/// like the procedural one. Consecutive segments overlap ~3.4 m at
-/// internal nodes (corners close up); free ends keep only a small stub.
+// ------------------------------------------------------- road furniture ----
+// Street-side dressing along any road path: cast-iron lamps alternating
+// sides, small trees, bush clusters, enamel signs and the odd bench — all
+// deterministic (hash-driven) so a reload rebuilds the very same street.
+
+fn vsub(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [a[0] - b[0], a[1] - b[1]]
+}
+
+fn vadd(a: [f32; 2], b: [f32; 2]) -> [f32; 2] {
+    [a[0] + b[0], a[1] + b[1]]
+}
+
+fn vmul(a: [f32; 2], k: f32) -> [f32; 2] {
+    [a[0] * k, a[1] * k]
+}
+
+fn vlen(a: [f32; 2]) -> f32 {
+    (a[0] * a[0] + a[1] * a[1]).sqrt()
+}
+
+fn vunit(a: [f32; 2]) -> [f32; 2] {
+    let l = vlen(a).max(1e-6);
+    [a[0] / l, a[1] / l]
+}
+
+fn vperp(a: [f32; 2]) -> [f32; 2] {
+    [-a[1], a[0]]
+}
+
+/// Oriented box between two plan points (as in the garden): sides, caps, top.
+fn obb(b: &mut Builder, ctx: &Ctx, a: [f32; 2], e: [f32; 2], wid: f32, z0: f32, z1: f32, mat: u32, uvm: f32) {
+    let d = vsub(e, a);
+    let l = vlen(d).max(0.02);
+    let dir = vunit(d);
+    let n = vperp(dir);
+    let w = wid * 0.5;
+    let p = |t: f32, s: f32, z: f32| -> [f32; 3] {
+        let q = vadd(a, vadd(vmul(dir, t), vmul(n, s)));
+        ctx.pt(q[0], q[1], z)
+    };
+    let ul = l / uvm;
+    let uw = wid / uvm;
+    let vz1 = (z1 - z0) / uvm;
+    b.quad(mat, [p(0.0, w, z0), p(l, w, z0), p(l, w, z1), p(0.0, w, z1)], [[0.0, 0.0], [ul, 0.0], [ul, vz1], [0.0, vz1]]);
+    b.quad(mat, [p(l, -w, z0), p(0.0, -w, z0), p(0.0, -w, z1), p(l, -w, z1)], [[0.0, 0.0], [ul, 0.0], [ul, vz1], [0.0, vz1]]);
+    b.quad(mat, [p(0.0, -w, z0), p(0.0, w, z0), p(0.0, w, z1), p(0.0, -w, z1)], [[0.0, 0.0], [uw, 0.0], [uw, vz1], [0.0, vz1]]);
+    b.quad(mat, [p(l, w, z0), p(l, -w, z0), p(l, -w, z1), p(l, w, z1)], [[0.0, 0.0], [uw, 0.0], [uw, vz1], [0.0, vz1]]);
+    b.quad(mat, [p(0.0, -w, z1), p(0.0, w, z1), p(l, w, z1), p(l, -w, z1)], [[0.0, 0.0], [uw, 0.0], [uw, ul], [0.0, ul]]);
+}
+
+/// Tapered cylinder (vertical) at plan point p, top cap when r1 > 0.03.
+fn cyl(b: &mut Builder, ctx: &Ctx, p: [f32; 2], r0: f32, r1: f32, z0: f32, z1: f32, sides: usize, mat: u32, uvm: f32) {
+    let ring = |r: f32, z: f32, j: usize| -> [f32; 3] {
+        let a = j as f32 / sides as f32 * std::f32::consts::TAU;
+        let q = [p[0] + a.cos() * r, p[1] + a.sin() * r];
+        ctx.pt(q[0], q[1], z)
+    };
+    for j in 0..sides {
+        let j1 = (j + 1) % sides;
+        let u0 = j as f32 / sides as f32 * (std::f32::consts::TAU * r0.max(r1) / uvm);
+        let u1 = (j + 1) as f32 / sides as f32 * (std::f32::consts::TAU * r0.max(r1) / uvm);
+        let hz = (z1 - z0) / uvm;
+        b.quad(mat, [ring(r0, z0, j), ring(r1, z1, j), ring(r1, z1, j1), ring(r0, z0, j1)], [[u0, 0.0], [u0, hz], [u1, hz], [u1, 0.0]]);
+    }
+    if r1 > 0.03 {
+        let c = ctx.pt(p[0], p[1], z1);
+        for j in 0..sides {
+            let j1 = (j + 1) % sides;
+            b.tri(mat, [c, ring(r1, z1, j), ring(r1, z1, j1)], [[r1 / uvm, r1 / uvm], [0.0, 0.0], [std::f32::consts::TAU * r1 / uvm, 0.0]]);
+        }
+    }
+}
+
+/// Jittered blob (crown / bush) around a world point.
+fn blob(b: &mut Builder, ctx: &Ctx, c: [f32; 3], r: f32, mat: u32, uvm: f32, rng: &mut Rng) {
+    let lats = [-1.0f32, -0.33, 0.33, 1.0];
+    let lons = 7;
+    let ring = |lat: f32, j: usize, rng: &mut Rng| -> [f32; 3] {
+        let a = j as f32 / lons as f32 * std::f32::consts::TAU;
+        let rr = r * lat.cos() * rng.range(0.9, 1.1);
+        [c[0] + a.cos() * rr, c[1] + lat.sin() * r * rng.range(0.92, 1.05), c[2] + a.sin() * rr]
+    };
+    let mut rings: Vec<Vec<[f32; 3]>> = Vec::new();
+    for &lat in &lats {
+        let mut v = Vec::with_capacity(lons);
+        for j in 0..lons {
+            v.push(ring(lat, j, rng));
+        }
+        rings.push(v);
+    }
+    for k in 0..lats.len() - 1 {
+        for j in 0..lons {
+            let j1 = (j + 1) % lons;
+            let (a, e) = (&rings[k], &rings[k + 1]);
+            let uv = |j: usize, k: usize| [j as f32 / lons as f32 * 2.0 * r / uvm, k as f32 * 0.8 * r / uvm];
+            b.quad(mat, [a[j], e[j], e[j1], a[j1]], [uv(j, k), uv(j, k + 1), uv(j1, k + 2), uv(j, k + 2)]);
+        }
+    }
+    let bot = [c[0], c[1] - r * 0.95, c[2]];
+    let top = [c[0], c[1] + r * 1.02, c[2]];
+    let r0 = &rings[0];
+    let rt = &rings[lats.len() - 1];
+    for j in 0..lons {
+        let j1 = (j + 1) % lons;
+        b.tri(mat, [bot, r0[j1], r0[j]], [[0.5, 0.0], [1.0, 1.0], [0.0, 1.0]]);
+        b.tri(mat, [top, rt[j], rt[j1]], [[0.5, 1.0], [0.0, 0.0], [1.0, 0.0]]);
+    }
+}
+
+/// Street lamp: stone base, cast-iron column, glazed lantern, finial.
+fn st_lamp(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32) {
+    obb(b, ctx, [p[0] - 0.21, p[1]], [p[0] + 0.21, p[1]], 0.42, z - 0.35, z + 0.34, M_KERB, 0.9);
+    cyl(b, ctx, p, 0.095, 0.06, z + 0.34, z + 3.35, 8, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.15, 0.13, z + 1.62, z + 1.74, 8, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.13, 0.105, z + 3.35, z + 3.46, 8, M_IRON, 1.0);
+    for j in 0..4 {
+        let a0 = j as f32 / 4.0 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_4;
+        let a1 = (j + 1) as f32 / 4.0 * std::f32::consts::TAU + std::f32::consts::FRAC_PI_4;
+        let q0 = [p[0] + a0.cos() * 0.185, p[1] + a0.sin() * 0.185];
+        let q1 = [p[0] + a1.cos() * 0.185, p[1] + a1.sin() * 0.185];
+        b.quad(
+            M_GLASS,
+            [ctx.pt(q0[0], q0[1], z + 3.46), ctx.pt(q1[0], q1[1], z + 3.46), ctx.pt(q1[0], q1[1], z + 4.06), ctx.pt(q0[0], q0[1], z + 4.06)],
+            [[0.0, 0.0], [0.4, 0.0], [0.4, 0.6], [0.0, 0.6]],
+        );
+    }
+    cyl(b, ctx, p, 0.30, 0.05, z + 4.06, z + 4.38, 4, M_IRON, 1.0);
+    cyl(b, ctx, p, 0.045, 0.02, z + 4.38, z + 4.56, 5, M_IRON, 0.6);
+}
+
+/// Street tree: trunk plus two or three jittered crowns (three habits).
+fn st_tree(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, s: f32, v: u32) {
+    let mut rng = Rng::new((v as u64).wrapping_mul(0x9E37_79B9) | 1);
+    let variant = (v >> 5) % 3;
+    let trunk_top = match variant {
+        0 => 1.85,
+        1 => 2.45,
+        _ => 2.10,
+    } * s;
+    cyl(b, ctx, p, 0.20 * s, 0.12 * s, z - 0.35, z + trunk_top, 7, M_BARK, 1.6);
+    let base = z + trunk_top;
+    match variant {
+        0 => {
+            blob(b, ctx, ctx.pt(p[0], p[1], base + 0.62 * s), 1.25 * s, M_LEAF, 3.0, &mut rng);
+            for _ in 0..2 {
+                let dx = rng.range(-0.55, 0.55) * s;
+                let dz = rng.range(-0.55, 0.55) * s;
+                let dzz = rng.range(-0.1, 0.2) * s;
+                blob(b, ctx, ctx.pt(p[0] + dx, p[1] + dz, base + 1.15 * s + dzz), 0.80 * s, M_LEAF, 3.0, &mut rng);
+            }
+        }
+        1 => {
+            blob(b, ctx, ctx.pt(p[0], p[1], base + 0.90 * s), 1.00 * s, M_LEAF, 3.0, &mut rng);
+            blob(b, ctx, ctx.pt(p[0], p[1], base + 1.80 * s), 0.82 * s, M_LEAF, 3.0, &mut rng);
+            let dx = rng.range(-0.25, 0.25) * s;
+            blob(b, ctx, ctx.pt(p[0] + dx, p[1], base + 2.50 * s), 0.55 * s, M_LEAF2, 3.0, &mut rng);
+        }
+        _ => {
+            blob(b, ctx, ctx.pt(p[0], p[1], base + 0.75 * s), 1.15 * s, M_LEAF, 3.0, &mut rng);
+            let dx = rng.range(-0.4, 0.4) * s;
+            let dz = rng.range(-0.4, 0.4) * s;
+            blob(b, ctx, ctx.pt(p[0] + dx, p[1] + dz, base + 1.50 * s), 0.70 * s, M_LEAF2, 3.0, &mut rng);
+        }
+    }
+}
+
+/// Bush cluster: two or three low blobs.
+fn st_bush(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, v: u32) {
+    let mut rng = Rng::new((v as u64).wrapping_mul(0xC2B2_AE35) | 1);
+    let n = 2 + rng.below(2) as usize;
+    for k in 0..n {
+        let dx = rng.range(-0.38, 0.38);
+        let dz = rng.range(-0.38, 0.38);
+        let r = rng.range(0.40, 0.62);
+        let mat = if k % 2 == 0 { M_LEAF2 } else { M_LEAF };
+        blob(b, ctx, ctx.pt(p[0] + dx, p[1] + dz, z + r * 0.5), r, mat, 2.2, &mut rng);
+    }
+}
+
+/// Enamel street sign: iron pole, white plate, blue faces, white bar.
+fn st_sign(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, along: [f32; 2]) {
+    let lat = vperp(along);
+    let (z0, z1) = (z + 2.02, z + 2.68);
+    cyl(b, ctx, p, 0.055, 0.045, z - 0.30, z + 2.20, 6, M_IRON, 0.8);
+    let a = [p[0] - lat[0] * 0.50, p[1] - lat[1] * 0.50];
+    let e = [p[0] + lat[0] * 0.50, p[1] + lat[1] * 0.50];
+    obb(b, ctx, a, e, 0.055, z0, z1, M_WHITE, 1.0);
+    for sdir in [1.0f32, -1.0] {
+        let off = [p[0] + along[0] * 0.05 * sdir, p[1] + along[1] * 0.05 * sdir];
+        let ba = [off[0] - lat[0] * 0.42, off[1] - lat[1] * 0.42];
+        let be = [off[0] + lat[0] * 0.42, off[1] + lat[1] * 0.42];
+        obb(b, ctx, ba, be, 0.012, z0 + 0.05, z1 - 0.05, M_SIGN, 0.8);
+        let off2 = [p[0] + along[0] * 0.06 * sdir, p[1] + along[1] * 0.06 * sdir];
+        let ca = [off2[0] - lat[0] * 0.22, off2[1] - lat[1] * 0.22];
+        let ce = [off2[0] + lat[0] * 0.22, off2[1] + lat[1] * 0.22];
+        obb(b, ctx, ca, ce, 0.012, z + 2.28, z + 2.42, M_WHITE, 0.6);
+    }
+}
+
+/// Bench facing `face`, standing on the given surface height.
+fn st_bench(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, face: [f32; 2]) {
+    let t = vperp(face);
+    let q = |to: f32, fo: f32| -> [f32; 2] { vadd(p, vadd(vmul(t, to), vmul(face, fo))) };
+    for s in [-0.82f32, 0.0, 0.82] {
+        let w2 = if s == 0.0 { 0.34 } else { 0.5 };
+        obb(b, ctx, q(s - 0.03, -0.24), q(s + 0.03, 0.24), w2, z - 0.25, z + 0.44, M_IRON, 0.8);
+    }
+    for s in [-0.82f32, 0.82] {
+        obb(b, ctx, q(s - 0.03, 0.20), q(s + 0.03, 0.26), 0.1, z + 0.44, z + 1.0, M_IRON, 0.8);
+    }
+    for f in [-0.195f32, -0.065, 0.065, 0.195] {
+        obb(b, ctx, q(-0.9, f - 0.052), q(0.9, f + 0.052), 0.104, z + 0.44, z + 0.49, M_WOOD, 1.2);
+    }
+    for (z0, z1) in [(0.62f32, 0.70f32), (0.79, 0.87), (0.93, 1.0)] {
+        obb(b, ctx, q(-0.9, 0.235), q(0.9, 0.295), 0.09, z + z0, z + z1, M_WOOD, 1.2);
+    }
+}
+
+// ------------------------------------------------------- smoothed paths ----
+
+/// Station along a road path: arc length, plan point, left normal (perp of
+/// the tangent), roadway height and the lowest ground across the section.
+struct St {
+    s: f32,
+    p: [f32; 2],
+    n: [f32; 2],
+    h0: f32,
+    hn: f32,
+}
+
+/// Stations every STEP m along a smoothed chain, heights sampled across the
+/// section exactly like the straight streets do.
+fn path_stations(ctx: &Ctx, path: &[[f32; 2]], hr: f32, hw: f32) -> Vec<St> {
+    let mut lens = vec![0.0f32];
+    let mut total = 0.0f32;
+    for i in 1..path.len() {
+        total += vlen(vsub(path[i], path[i - 1]));
+        lens.push(total);
+    }
+    if total < 0.5 {
+        return Vec::new();
+    }
+    let n = (total / STEP).ceil().max(2.0) as usize;
+    let mut out = Vec::with_capacity(n + 1);
+    let mut k = 1usize;
+    for i in 0..=n {
+        let s = total * i as f32 / n as f32;
+        while k < lens.len() - 1 && lens[k] < s {
+            k += 1;
+        }
+        let (l0, l1) = (lens[k - 1], lens[k]);
+        let f = if l1 > l0 { (s - l0) / (l1 - l0) } else { 0.0 };
+        let p = [
+            path[k - 1][0] + (path[k][0] - path[k - 1][0]) * f,
+            path[k - 1][1] + (path[k][1] - path[k - 1][1]) * f,
+        ];
+        let d = vunit(vsub(path[k], path[k - 1]));
+        let nv = vperp(d);
+        let mut hm = f32::MIN;
+        let mut hn = f32::MAX;
+        for a in [0.0f32, hr, -hr, hw, -hw] {
+            let q = [p[0] + nv[0] * a, p[1] + nv[1] * a];
+            let h = ctx.hh(q[0], q[1]);
+            hm = hm.max(h);
+            hn = hn.min(h);
+        }
+        out.push(St { s, p, n: nv, h0: hm + ROAD_H, hn });
+    }
+    out
+}
+
+/// Interpolated station at arc length s.
+fn st_at(stns: &[St], s: f32) -> St {
+    if stns.is_empty() {
+        return St { s: 0.0, p: [0.0, 0.0], n: [0.0, 1.0], h0: 0.0, hn: 0.0 };
+    }
+    let s = s.clamp(0.0, stns[stns.len() - 1].s);
+    let mut k = 1usize;
+    while k < stns.len() - 1 && stns[k].s < s {
+        k += 1;
+    }
+    let (a, e) = (&stns[k - 1], &stns[k]);
+    let f = if e.s > a.s { (s - a.s) / (e.s - a.s) } else { 0.0 };
+    St {
+        s,
+        p: [a.p[0] + (e.p[0] - a.p[0]) * f, a.p[1] + (e.p[1] - a.p[1]) * f],
+        n: vunit([a.n[0] + (e.n[0] - a.n[0]) * f, a.n[1] + (e.n[1] - a.n[1]) * f]),
+        h0: a.h0 + (e.h0 - a.h0) * f,
+        hn: a.hn + (e.hn - a.hn) * f,
+    }
+}
+
+/// Corner-filleted dense polyline: every interior vertex is rounded with an
+/// arc of radius r (capped by the neighbouring segment lengths), so the
+/// roadway sweeps through turns instead of meeting them at a sharp angle.
+/// Returns the points and the arc-length positions of the corner apexes.
+fn smooth_chain(pts: &[[f32; 2]], r: f32) -> (Vec<[f32; 2]>, Vec<f32>) {
+    let mut clean: Vec<[f32; 2]> = Vec::new();
+    for &p in pts {
+        if clean.last().map(|q| vlen(vsub(p, *q)) > 0.3).unwrap_or(true) {
+            clean.push(p);
+        }
+    }
+    if clean.len() < 2 {
+        return (clean, Vec::new());
+    }
+    // small stubs at the free ends so the slab covers the very last click
+    let d0 = vunit(vsub(clean[1], clean[0]));
+    let dn = vunit(vsub(clean[clean.len() - 1], clean[clean.len() - 2]));
+    let start = vsub(clean[0], vmul(d0, 0.6));
+    let end = vadd(clean[clean.len() - 1], vmul(dn, 0.6));
+    fn push(out: &mut Vec<[f32; 2]>, s_run: &mut f32, p: [f32; 2]) {
+        *s_run += vlen(vsub(p, *out.last().unwrap()));
+        out.push(p);
+    }
+    let mut out = vec![start];
+    let mut s_run = vlen(vsub(clean[0], start));
+    let mut corners = Vec::new();
+    for i in 1..clean.len() - 1 {
+        let p = clean[i - 1];
+        let vpt = clean[i];
+        let q = clean[i + 1];
+        let d1 = vunit(vsub(vpt, p));
+        let d2 = vunit(vsub(q, vpt));
+        let dot = (d1[0] * d2[0] + d1[1] * d2[1]).clamp(-1.0, 1.0);
+        let turn = dot.acos();
+        if turn < 0.12 {
+            push(&mut out, &mut s_run, vpt);
+            continue;
+        }
+        let half = turn * 0.5;
+        let t = (r * half.tan())
+            .min(vlen(vsub(vpt, p)) * 0.48)
+            .min(vlen(vsub(q, vpt)) * 0.48)
+            .max(0.05);
+        let rr = t / half.tan();
+        let ta = vsub(vpt, vmul(d1, t));
+        let tb = vadd(vpt, vmul(d2, t));
+        let cross = d1[0] * d2[1] - d1[1] * d2[0];
+        let sg = if cross >= 0.0 { 1.0f32 } else { -1.0f32 };
+        let nc = [-d1[1] * sg, d1[0] * sg];
+        let c = vadd(ta, vmul(nc, rr));
+        let a0 = (ta[1] - c[1]).atan2(ta[0] - c[0]);
+        let steps = ((rr * turn) / 1.1).ceil().max(2.0) as usize;
+        push(&mut out, &mut s_run, ta);
+        let s_arc0 = s_run;
+        for k in 1..=steps {
+            let a = a0 + sg * turn * (k as f32 / steps as f32);
+            push(&mut out, &mut s_run, [c[0] + a.cos() * rr, c[1] + a.sin() * rr]);
+        }
+        let _ = tb;
+        corners.push(s_arc0 + rr * half);
+    }
+    push(&mut out, &mut s_run, end);
+    (out, corners)
+}
+
+/// Deterministic street furniture along [0, len]: lamps alternate sides,
+/// trees and bushes fill between, signs occasionally, benches near a few
+/// lamps.  `get(s, x)` maps arc length + lateral offset to (plan point,
+/// sidewalk top, along direction, outward normal).
+fn street_furniture(
+    b: &mut Builder,
+    ctx: &Ctx,
+    seed: u32,
+    hr: f32,
+    hw: f32,
+    len: f32,
+    get: &dyn Fn(f32, f32) -> ([f32; 2], f32, [f32; 2], [f32; 2]),
+    corners: &[f32],
+) {
+    if len < 14.0 {
+        return;
+    }
+    let x_lamp = hr + 0.85;
+    let x_tree = (hr + 1.90).min(hw - 0.30);
+    let x_bush = (hr + 2.35).min(hw - 0.20);
+    let x_sign = hr + 0.80;
+    let step = 4.3f32;
+    let mut s = 6.0f32;
+    let mut i = 0u32;
+    while s < len - 7.0 {
+        let j = hash2(seed.wrapping_mul(0x9E37_79B9).wrapping_add(i), 0x51ED);
+        let ja = (j & 0xFF) as f32 / 255.0; // 0..1 along jitter
+        let jb = ((j >> 8) & 0xFF) as f32 / 255.0; // 0..1 lateral jitter
+        let period = i / 8;
+        let slot = i % 8;
+        let side_a = if period % 2 == 0 { 1.0f32 } else { -1.0f32 };
+        let is_sign = slot == 3 && period % 3 == 2;
+        let (x, item): (f32, u8) = match slot {
+            0 => (x_lamp, 0),
+            1 => (x_bush, 2),
+            2 => (x_tree, 1),
+            3 => {
+                if is_sign {
+                    (x_sign, 3)
+                } else {
+                    (x_bush, 2)
+                }
+            }
+            4 => (x_lamp, 0),
+            5 => (x_bush, 2),
+            6 => (x_tree, 1),
+            _ => (x_bush, 2),
+        };
+        let side = match slot {
+            0 | 3 | 5 | 6 => side_a,
+            _ => -side_a,
+        };
+        let ss = s + (jb - 0.5) * 1.4;
+        let clear = ss > 4.0
+            && ss < len - 4.0
+            && corners.iter().all(|&c| (ss - c).abs() > 3.0);
+        if clear {
+            let (p, z, along, outw) = get(ss, side * (x + (ja - 0.5) * 0.5));
+            let variant = j ^ hash2(i ^ 0x77, seed);
+            match item {
+                0 => {
+                    st_lamp(b, ctx, p, z);
+                    if variant % 5 == 1 {
+                        let (bp, bz, _, _) = get(ss + 2.6, side * (x_lamp + 1.35));
+                        let face = if side > 0.0 { vmul(outw, -1.0) } else { outw };
+                        st_bench(b, ctx, bp, bz, face);
+                    }
+                }
+                1 => st_tree(b, ctx, p, z, 0.80 + ((j >> 20) & 7) as f32 * 0.035, variant),
+                2 => st_bush(b, ctx, p, z, variant),
+                _ => st_sign(b, ctx, p, z, along),
+            }
+        }
+        s += step + ja * 1.1;
+        i += 1;
+    }
+}
+
+/// Furniture along one straight axis piece of the grid streets.
+#[allow(clippy::too_many_arguments)]
+fn furniture_axis(
+    b: &mut Builder,
+    ctx: &Ctx,
+    seed: u32,
+    u_along: bool,
+    t0: f32,
+    t1: f32,
+    c: f32,
+    hr: f32,
+    hw: f32,
+) {
+    let len = t1 - t0;
+    if len < 14.0 {
+        return;
+    }
+    let along = if u_along { ctx.eu } else { ctx.nvec };
+    let outw = if u_along { ctx.nvec } else { ctx.eu };
+    let get = |s: f32, x: f32| -> ([f32; 2], f32, [f32; 2], [f32; 2]) {
+        let t = t0 + s;
+        let (u, v) = pair(u_along, t, c, x);
+        let sec = section(ctx, u_along, t, c, hr, hw);
+        ([u, v], sec.h0 + KERB_H, along, outw)
+    };
+    street_furniture(b, ctx, seed, hr, hw, len, &get, &[]);
+}
+
+/// Editor-drawn road chains: the street cross-section swept along a
+/// corner-filleted path, a dashed centre line, and street furniture along
+/// the sidewalks.  Free ends keep only a small stub.
 pub fn build_roads(
     h_at: &dyn Fn(f32, f32) -> f32,
     anchor: [f32; 2],
@@ -480,150 +951,244 @@ pub fn build_roads(
         }
     };
 
-    for ch in chains {
+    for (ci, ch) in chains.iter().enumerate() {
         if ch.len() < 2 {
             continue;
         }
-        for k in 0..ch.len() - 1 {
-            let p0 = ch[k];
-            let p1 = ch[k + 1];
-            let d = [p1[0] - p0[0], p1[1] - p0[1]];
-            let l0 = (d[0] * d[0] + d[1] * d[1]).sqrt();
-            if l0 < 0.6 {
-                continue;
-            }
-            let dir = [d[0] / l0, d[1] / l0];
-            let per = [-dir[1], dir[0]];
-            let e_a = if k == 0 { 0.4 } else { 3.4 };
-            let e_b = if k + 2 == ch.len() { 0.4 } else { 3.4 };
-            let (t0, t1) = (-e_a, l0 + e_b);
-            let g_at = |t: f32, x: f32| -> [f32; 2] {
-                [p0[0] + dir[0] * t + per[0] * x, p0[1] + dir[1] * t + per[1] * x]
-            };
-            let ns = ((t1 - t0) / STEP).ceil().max(1.0) as usize;
-            let secs: Vec<Sec> = (0..=ns)
-                .map(|i| {
-                    let t = t0 + (t1 - t0) * i as f32 / ns as f32;
-                    let mut hm = f32::MIN;
-                    let mut hn = f32::MAX;
-                    for a in [0.0f32, hr, -hr, hw, -hw] {
-                        let q = g_at(t, a);
-                        let h = ctx.hh(q[0], q[1]);
-                        hm = hm.max(h);
-                        hn = hn.min(h);
-                    }
-                    Sec { t, h0: hm + ROAD_H, hn }
-                })
-                .collect();
-            let g3 = |s: &Sec, x: f32, z: f32| -> [f32; 3] {
-                let q = g_at(s.t, x);
+        let (path, corners) = smooth_chain(ch, 9.0);
+        if path.len() < 2 {
+            continue;
+        }
+        let stns = path_stations(&ctx, &path, hr, hw);
+        if stns.len() < 2 {
+            continue;
+        }
+        let total = stns[stns.len() - 1].s;
+        for j in 0..stns.len() - 1 {
+            let (a, e) = (&stns[j], &stns[j + 1]);
+            let st3 = |st: &St, x: f32, z: f32| -> [f32; 3] {
+                let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
                 ctx.pt(q[0], q[1], z)
             };
-            for j in 0..ns {
-                let (a, e) = (&secs[j], &secs[j + 1]);
-                // roadway slab
-                quad_up(
-                    &mut b,
-                    M_ASPHALT,
-                    [g3(a, -hr, a.h0), g3(e, -hr, e.h0), g3(e, hr, e.h0), g3(a, hr, a.h0)],
-                    [[a.t / 4.0, 0.0], [e.t / 4.0, 0.0], [e.t / 4.0, 1.0], [a.t / 4.0, 1.0]],
-                );
-                // kerb tops
-                quad_up(
-                    &mut b,
-                    M_KERB,
-                    [
-                        g3(a, hr, a.h0 + KERB_H),
-                        g3(e, hr, e.h0 + KERB_H),
-                        g3(e, hr + KERB_W, e.h0 + KERB_H),
-                        g3(a, hr + KERB_W, a.h0 + KERB_H),
-                    ],
-                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
-                );
-                quad_up(
-                    &mut b,
-                    M_KERB,
-                    [
-                        g3(a, -hr - KERB_W, a.h0 + KERB_H),
-                        g3(e, -hr - KERB_W, e.h0 + KERB_H),
-                        g3(e, -hr, e.h0 + KERB_H),
-                        g3(a, -hr, a.h0 + KERB_H),
-                    ],
-                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
-                );
-                // kerb faces toward the roadway
-                for sx in [hr, -hr] {
-                    let p = [
-                        g3(a, sx, a.h0 + KERB_H),
-                        g3(e, sx, e.h0 + KERB_H),
-                        g3(e, sx, e.hn - 0.5),
-                        g3(a, sx, a.hn - 0.5),
-                    ];
-                    let uv = [
-                        [a.t / 2.0, 1.0],
-                        [e.t / 2.0, 1.0],
-                        [e.t / 2.0, 0.0],
-                        [a.t / 2.0, 0.0],
-                    ];
-                    if sx < 0.0 {
-                        b.quad(M_KERB, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
-                    } else {
-                        b.quad(M_KERB, p, uv);
-                    }
+            // roadway slab
+            quad_up(
+                &mut b,
+                M_ASPHALT,
+                [st3(a, -hr, a.h0), st3(e, -hr, e.h0), st3(e, hr, e.h0), st3(a, hr, a.h0)],
+                [[a.s / 4.0, 0.0], [e.s / 4.0, 0.0], [e.s / 4.0, 1.0], [a.s / 4.0, 1.0]],
+            );
+            // kerb tops
+            quad_up(
+                &mut b,
+                M_KERB,
+                [st3(a, hr, a.h0 + KERB_H), st3(e, hr, e.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(a, hr + KERB_W, a.h0 + KERB_H)],
+                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+            );
+            quad_up(
+                &mut b,
+                M_KERB,
+                [st3(a, -hr - KERB_W, a.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(e, -hr, e.h0 + KERB_H), st3(a, -hr, a.h0 + KERB_H)],
+                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+            );
+            // kerb faces toward the roadway
+            for sx in [hr, -hr] {
+                let p = [
+                    st3(a, sx, a.h0 + KERB_H),
+                    st3(e, sx, e.h0 + KERB_H),
+                    st3(e, sx, e.hn - 0.5),
+                    st3(a, sx, a.hn - 0.5),
+                ];
+                let uv = [[a.s / 2.0, 1.0], [e.s / 2.0, 1.0], [e.s / 2.0, 0.0], [a.s / 2.0, 0.0]];
+                if sx < 0.0 {
+                    b.quad(M_KERB, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
+                } else {
+                    b.quad(M_KERB, p, uv);
                 }
-                // sidewalks, flush with the kerb tops
-                quad_up(
-                    &mut b,
-                    M_WALK,
-                    [
-                        g3(a, hr + KERB_W, a.h0 + KERB_H),
-                        g3(e, hr + KERB_W, e.h0 + KERB_H),
-                        g3(e, hw, e.h0 + KERB_H),
-                        g3(a, hw, a.h0 + KERB_H),
-                    ],
-                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
-                );
-                quad_up(
-                    &mut b,
-                    M_WALK,
-                    [
-                        g3(a, -hw, a.h0 + KERB_H),
-                        g3(e, -hw, e.h0 + KERB_H),
-                        g3(e, -hr - KERB_W, e.h0 + KERB_H),
-                        g3(a, -hr - KERB_W, a.h0 + KERB_H),
-                    ],
-                    [[a.t / 2.0, 0.0], [e.t / 2.0, 0.0], [e.t / 2.0, 1.0], [a.t / 2.0, 1.0]],
-                );
-                // outer edges drop to their own local ground
-                for sx in [hw, -hw] {
-                    let gb = |s: &Sec| {
-                        let q = g_at(s.t, sx);
-                        ctx.hh(q[0], q[1]) - 0.5
-                    };
-                    let p = [
-                        g3(a, sx, a.h0 + KERB_H),
-                        g3(e, sx, e.h0 + KERB_H),
-                        g3(e, sx, gb(e)),
-                        g3(a, sx, gb(a)),
-                    ];
-                    let uv = [
-                        [a.t / 2.0, 0.9],
-                        [e.t / 2.0, 0.9],
-                        [e.t / 2.0, 0.0],
-                        [a.t / 2.0, 0.0],
-                    ];
-                    if sx < 0.0 {
-                        b.quad(M_WALK, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
-                    } else {
-                        b.quad(M_WALK, p, uv);
-                    }
+            }
+            // sidewalks, flush with the kerb tops
+            quad_up(
+                &mut b,
+                M_WALK,
+                [st3(a, hr + KERB_W, a.h0 + KERB_H), st3(e, hr + KERB_W, e.h0 + KERB_H), st3(e, hw, e.h0 + KERB_H), st3(a, hw, a.h0 + KERB_H)],
+                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+            );
+            quad_up(
+                &mut b,
+                M_WALK,
+                [st3(a, -hw, a.h0 + KERB_H), st3(e, -hw, e.h0 + KERB_H), st3(e, -hr - KERB_W, e.h0 + KERB_H), st3(a, -hr - KERB_W, a.h0 + KERB_H)],
+                [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 1.0], [a.s / 2.0, 1.0]],
+            );
+            // outer edges drop to their own local ground
+            for sx in [hw, -hw] {
+                let gb = |s: &St| {
+                    let q = [s.p[0] + s.n[0] * sx, s.p[1] + s.n[1] * sx];
+                    ctx.hh(q[0], q[1]) - 0.5
+                };
+                let p = [
+                    st3(a, sx, a.h0 + KERB_H),
+                    st3(e, sx, e.h0 + KERB_H),
+                    st3(e, sx, gb(e)),
+                    st3(a, sx, gb(a)),
+                ];
+                let uv = [[a.s / 2.0, 0.9], [e.s / 2.0, 0.9], [e.s / 2.0, 0.0], [a.s / 2.0, 0.0]];
+                if sx < 0.0 {
+                    b.quad(M_WALK, [p[1], p[0], p[3], p[2]], [uv[1], uv[0], uv[3], uv[2]]);
+                } else {
+                    b.quad(M_WALK, p, uv);
                 }
             }
         }
+        // dashed centre line follows the smoothed line
+        let p3 = |st: &St, x: f32| -> [f32; 3] {
+            let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
+            ctx.pt(q[0], q[1], st.h0 + 0.055)
+        };
+        let mut sd = 3.0f32;
+        while sd + 3.0 < total - 2.0 {
+            let steps = 3;
+            for k in 0..steps {
+                let s0 = sd + 3.0 * k as f32 / steps as f32;
+                let s1 = sd + 3.0 * (k + 1) as f32 / steps as f32;
+                let a = st_at(&stns, s0);
+                let e = st_at(&stns, s1);
+                quad_up(
+                    &mut b,
+                    M_PAINT,
+                    [p3(&a, -0.13), p3(&e, -0.13), p3(&e, 0.13), p3(&a, 0.13)],
+                    [[a.s / 2.0, 0.0], [e.s / 2.0, 0.0], [e.s / 2.0, 0.2], [a.s / 2.0, 0.2]],
+                );
+            }
+            sd += 6.0;
+        }
+        // street lamps / trees / bushes / signs along this road
+        let get = |s: f32, x: f32| -> ([f32; 2], f32, [f32; 2], [f32; 2]) {
+            let st = st_at(&stns, s);
+            let pos = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
+            let along = [-st.n[1], st.n[0]];
+            (pos, st.h0 + KERB_H, along, st.n)
+        };
+        street_furniture(&mut b, &ctx, 0x5700 + ci as u32, hr, hw, total, &get, &corners);
     }
-    (b.finish(4), textures())
+    (b.finish(12), textures())
+}
+
+
+/// Cast iron: near-black with a cold sheen and fine grain.
+fn tex_iron() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 31, y + 77) % 15) as i32 - 7;
+            let sheen = if hash2(x / 32, y) % 23 == 0 { 10 } else { 0 };
+            let base = 48 + n + sheen;
+            push(&mut v, base, base, base + 6);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Milk glass of the lantern panes: warm, faint swirl.
+fn tex_glass() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 400, y + 21) % 17) as i32 - 8;
+            push(&mut v, 246 + n, 232 + n, 196 + n / 2);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Plane-tree bark: warm grey patches over brown.
+fn tex_bark() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 700, y + 120) % 21) as i32 - 10;
+            let patch = hash2(x / 24, y / 34) % 5 == 0;
+            let (r, g, b) = if patch { (138, 126, 108) } else { (96, 76, 58) };
+            push(&mut v, r + n, g + n, b + n);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Summer foliage: mid green with denser clumps.
+fn tex_leaf() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let clump = (hash2(x / 18, y / 18) % 31) as i32 - 15;
+            let n = (hash2(x + 90, y + 90) % 13) as i32 - 6;
+            push(&mut v, 68 + clump + n, 104 + clump + n, 52 + (clump / 2) + n);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Lighter foliage for young shoots.
+fn tex_leaf2() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let clump = (hash2(x / 15, y / 15) % 27) as i32 - 13;
+            let n = (hash2(x + 44, y + 61) % 11) as i32 - 5;
+            push(&mut v, 92 + clump + n, 128 + clump + n, 64 + (clump / 2) + n);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Enamel sign blue.
+fn tex_sign() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 55, y + 205) % 11) as i32 - 5;
+            push(&mut v, 30 + n, 66 + n, 140 + n);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Painted wood (bench slats): fir green with grain lines.
+fn tex_wood() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 12, y + 340) % 9) as i32 - 4;
+            let grain = if (x + (hash2(x / 8, y) % 5) as u32) % 32 < 2 { -14 } else { 0 };
+            push(&mut v, 60 + n + grain, 96 + n + grain, 66 + n + grain);
+        }
+    }
+    (256, 256, v)
+}
+
+/// Sign enamel white.
+fn tex_white() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(256 * 256 * 4);
+    for y in 0..256u32 {
+        for x in 0..256u32 {
+            let n = (hash2(x + 800, y + 811) % 9) as i32 - 4;
+            push(&mut v, 236 + n, 236 + n, 230 + n);
+        }
+    }
+    (256, 256, v)
 }
 
 fn textures() -> Vec<(u32, u32, Vec<u8>)> {
-    vec![tex_asphalt(), tex_kerb(), tex_walk(), tex_paint()]
+    vec![
+        tex_asphalt(),
+        tex_kerb(),
+        tex_walk(),
+        tex_paint(),
+        tex_iron(),
+        tex_glass(),
+        tex_bark(),
+        tex_leaf(),
+        tex_leaf2(),
+        tex_sign(),
+        tex_wood(),
+        tex_white(),
+    ]
 }

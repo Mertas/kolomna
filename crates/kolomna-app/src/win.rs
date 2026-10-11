@@ -634,7 +634,11 @@ pub fn load_scene(
         );
         println!("summer garden: fence around an irregular outline, 2 gates");
         village.push((gmesh, gtexs, [0.0, 0.0, 0.0], 0.0));
+    }
 
+    // ---- the editor's drawings (roads / parks): built even when the
+    // procedural city is skipped ("user drawings only" preview mode)
+    {
         // ---- the editor's roads: free chains with the street cross-section
         if !user.roads.is_empty() {
             let (rmesh, rtexs) =
@@ -762,7 +766,7 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
     // chain, a courtyard quad and a park contour, all in plan coords
     let user = if std::env::var("KOLOMNA_PLAN_DEMO").is_ok() {
         UserPlan {
-            roads: vec![vec![[-40.0, 130.0], [40.0, 150.0], [108.0, 125.0]]],
+            roads: vec![vec![[-40.0, 130.0], [40.0, 150.0], [108.0, 125.0], [95.0, 55.0]]],
             blocks: vec![[[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]]],
             parks: vec![vec![
                 [150.0, 90.0],
@@ -776,7 +780,8 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
     } else {
         UserPlan::default()
     };
-    let scene = load_scene(city, dat, &user, false)?;
+    let only = std::env::var("KOLOMNA_ONLY_USER").is_ok();
+    let scene = load_scene(city, dat, &user, only)?;
     let mut placed = Vec::new();
     for (mesh, texs, pos, rot) in &scene.village {
         placed.push(PlacedModel {
