@@ -1435,7 +1435,12 @@ impl Manor {
                         }
                     }
                 }
-                let mat = if fi == 0 && Some(t) == self.stable {
+                let mat = if self.corner {
+                    // a corner house backs onto the neighbouring wing: this
+                    // wall is a blind firewall as well — no yard door, no
+                    // windows, nothing
+                    mat_wall
+                } else if fi == 0 && Some(t) == self.stable {
                     M_STABLE
                 } else if fi == 0 && Some(t) == self.yard_door {
                     M_BLACK_DOOR
@@ -1461,10 +1466,12 @@ impl Manor {
                     let mat = if fi == 0 { M_BASE_WIN } else { mat_win };
                     self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
                 } else {
-                    let mat = if self.corner { mat_wall } else { M_BRICK };
-                    self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
+                    // blind firewalls are rendered in the house's own
+                    // plaster (Petersburg: the side walls matched the
+                    // facade, they were not left as raw brick)
+                    self.wall_quad(mat_wall, 3, z0, z0 + 2.0, y, y + fh, w);
                 }
-                self.wall_quad(M_BRICK, 2, z0, z0 + 2.0, y, y + fh, 0.0);
+                self.wall_quad(mat_wall, 2, z0, z0 + 2.0, y, y + fh, 0.0);
             }
             y += fh;
             self.y_band.push(y);
@@ -1517,7 +1524,7 @@ impl Manor {
         // ---- string courses between floors + stepped crowning cornice -----
         // the courses wrap the facades only: adjoining end walls are blank
         // firewalls and carry no trim; only a corner house trims its east end
-        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32, eas: bool| {
+        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32, eas: bool, nor: bool| {
             let a = 0.0f32;
             // south
             b.quad(
@@ -1530,17 +1537,19 @@ impl Manor {
                 ],
                 [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
             );
-            // north
-            b.quad(
-                M_BAND,
-                [
-                    [w + a, yy - 0.10, -out],
-                    [-a, yy - 0.10, -out],
-                    [-a, yy + 0.14, -out],
-                    [w + a, yy + 0.14, -out],
-                ],
-                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
-            );
+            // north: skipped on corner houses (that wall is a firewall)
+            if nor {
+                b.quad(
+                    M_BAND,
+                    [
+                        [w + a, yy - 0.10, -out],
+                        [-a, yy - 0.10, -out],
+                        [-a, yy + 0.14, -out],
+                        [w + a, yy + 0.14, -out],
+                    ],
+                    [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
+                );
+            }
             // east: only when this end is a parade facade
             if eas {
                 b.quad(
@@ -1556,12 +1565,13 @@ impl Manor {
             }
         };
         let eas = self.corner;
+        let nor = !self.corner;
         for k in 1..self.y_band.len() {
-            band(&mut self.b, self.y_band[k], 0.10, w, d, eas);
+            band(&mut self.b, self.y_band[k], 0.10, w, d, eas, nor);
         }
         // crowning cornice: two stepped bands overhanging the wall
-        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d, eas);
-        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas);
+        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d, eas, nor);
+        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas, nor);
 
         // ---- balconies ----------------------------------------------------
         let balcony_floor = if r.f() < 0.75 { Some(2usize) } else { None };
@@ -1869,9 +1879,8 @@ impl Manor {
                 ],
                 roof_uv(w, d / 2.0),
             );
-            let tri_mat = if self.corner { M_WALL } else { M_BRICK };
             self.b.tri(
-                M_BRICK,
+                M_WALL,
                 [
                     [-0.02, y_wall_top, -0.02],
                     [-0.02, y_wall_top, d + 0.02],
@@ -1880,7 +1889,7 @@ impl Manor {
                 [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.0]],
             );
             self.b.tri(
-                tri_mat,
+                M_WALL,
                 [
                     [w + 0.02, y_wall_top, d + 0.02],
                     [w + 0.02, y_wall_top, -0.02],
