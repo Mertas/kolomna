@@ -9,6 +9,7 @@
 //! With no arguments the exe opens a window with a procedural city;
 //! it can simply be double-clicked (no external data needed).
 
+mod ui_atlas;
 mod win;
 
 use std::process::exit;
@@ -42,6 +43,10 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     if args.first().map(String::as_str) == Some("--help") || args.first().map(String::as_str) == Some("-h") {
         usage();
+        return Ok(());
+    }
+    if let Ok(p) = std::env::var("KOLOMNA_UI_SHOT") {
+        win::ui_shot(&p);
         return Ok(());
     }
     if args.first().map(String::as_str) == Some("--shot") {

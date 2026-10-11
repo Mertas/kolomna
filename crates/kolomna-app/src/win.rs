@@ -1196,7 +1196,7 @@ impl Renderer {
             })
             .collect();
         let (msaa_view, depth_view) = make_targets(&device, &config);
-        let ui = UiRenderer::new(&device, config.format);
+        let ui = UiRenderer::new(&device, &queue, config.format);
 
         Ok(Self {
             surface,
@@ -1311,8 +1311,7 @@ impl Renderer {
         &mut self,
         scene: &Scene,
         cam: &Camera,
-        show_plans: bool,
-        hover_btn: bool,
+        ui_state: &UiState,
     ) -> Result<(), Box<dyn Error>> {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
@@ -1378,7 +1377,7 @@ impl Renderer {
             });
             self.terrain.draw(&mut pass);
             for (idx, r) in self.village.iter().enumerate() {
-                if !show_plans && idx == self.plan_idx {
+                if !ui_state.show_plans && idx == self.plan_idx {
                     continue; // courtyard boundaries hidden
                 }
                 r.draw(&mut pass);
@@ -1386,7 +1385,7 @@ impl Renderer {
             if let Some(p) = &self.preview {
                 p.draw(&mut pass);
             }
-            self.ui.draw(&self.queue, &mut pass, w, h, hover_btn, show_plans);
+            self.ui.draw(&self.queue, &mut pass, w, h, ui_state);
         }
         self.queue.submit(Some(enc.finish()));
         self.queue.present(frame);
@@ -1394,88 +1393,248 @@ impl Renderer {
     }
 }
 
-// --------------------------------------------------- courtyard ui button ----
+// ------------------------------------------------------------- ui: toolbar ----
+// A row of tool buttons plus a bottom hint bar, drawn as textured quads from
+// a baked atlas (Pixelify Sans glyphs + pixel icons, see `ui_atlas`).  The
+// face is a pixel font, so the sampler is NEAREST and the atlas is 1:1.
 
-/// Screen-space toggle button (top-left corner, physical px) that shows or
-/// hides the courtyard boundary overlay; clicks compare against this rect.
-const UI_BTN: [f32; 4] = [12.0, 12.0, 44.0, 44.0]; // x, y, w, h
+use crate::ui_atlas;
 
-fn ui_btn_hit(px: f64, py: f64) -> bool {
-    px >= UI_BTN[0] as f64
-        && px <= (UI_BTN[0] + UI_BTN[2]) as f64
-        && py >= UI_BTN[1] as f64
-        && py <= (UI_BTN[1] + UI_BTN[3]) as f64
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct UiVertex {
+    pos: [f32; 2],
+    uv: [f32; 2],
+    col: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct UiUniform {
-    rect: [f32; 4],
     screen: [f32; 2],
-    flags: [f32; 2], // x: overlay visible, y: cursor over the button
 }
 
-/// Six painter-order rectangles (border, background, red icon frame + inset,
-/// cyan icon frame + inset) built from `vertex_index` alone — no buffers.
-/// The icon mirrors the overlay: two nested "courtyard" outlines.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum UiAction {
+    TogglePlans,
+    Tool(u8),
+}
+
+struct UiButton {
+    action: UiAction,
+    label: &'static str,
+    icon: &'static str,
+}
+
+const UI_BUTTONS: [UiButton; 5] = [
+    UiButton { action: UiAction::TogglePlans, label: "Границы", icon: "grid" },
+    UiButton { action: UiAction::Tool(0), label: "Обзор", icon: "eye" },
+    UiButton { action: UiAction::Tool(1), label: "Дороги", icon: "road" },
+    UiButton { action: UiAction::Tool(2), label: "Кварталы", icon: "quarter" },
+    UiButton { action: UiAction::Tool(3), label: "Парки", icon: "park" },
+];
+const UI_BTN_H: f32 = 36.0;
+const UI_BTN_Y: f32 = 12.0;
+const UI_BTN_PAD: f32 = 10.0;
+const UI_ICON: f32 = 24.0;
+const UI_GAP: f32 = 6.0;
+/// the atlas white patch: flat-coloured quads sample it
+const UI_WHITE: [f32; 4] = [0.0, 0.0, 4.0, 4.0];
+
+/// Everything the toolbar needs from the app for one frame.
+struct UiState<'a> {
+    tool: u8,
+    show_plans: bool,
+    hint: &'a str,
+    cursor: Option<(f64, f64)>,
+}
+
+/// sRGB intent -> linear, because the surface is an sRGB target and the blend
+/// happens in linear space.
+fn ui_srgb(c: [f32; 4]) -> [f32; 4] {
+    [
+        c[0].powf(2.2),
+        c[1].powf(2.2),
+        c[2].powf(2.2),
+        c[3],
+    ]
+}
+
+fn ui_glyph(ch: char) -> Option<&'static (char, [f32; 4], f32, f32, f32)> {
+    ui_atlas::GLYPHS.iter().find(|g| g.0 == ch)
+}
+
+fn ui_text_width(s: &str) -> f32 {
+    s.chars()
+        .map(|c| ui_glyph(c).map(|g| g.2).unwrap_or(6.0))
+        .sum()
+}
+
+/// One rect [x, y, w, h] per button, physical px, laid left to right.
+fn ui_button_rects() -> Vec<([f32; 4], &'static UiButton)> {
+    let mut x = 12.0;
+    let mut out = Vec::with_capacity(UI_BUTTONS.len());
+    for b in &UI_BUTTONS {
+        let w = UI_BTN_PAD + UI_ICON + UI_GAP + ui_text_width(b.label) + UI_BTN_PAD;
+        out.push(([x, UI_BTN_Y, w, UI_BTN_H], b));
+        x += w + UI_GAP;
+    }
+    out
+}
+
+fn ui_hit(r: [f32; 4], px: f64, py: f64) -> bool {
+    let (px, py) = (px as f32, py as f32);
+    px >= r[0] && px <= r[0] + r[2] && py >= r[1] && py <= r[1] + r[3]
+}
+
+/// Which button (if any) is under the cursor.
+fn ui_action_at(px: f64, py: f64) -> Option<UiAction> {
+    ui_button_rects()
+        .into_iter()
+        .find(|(r, _)| ui_hit(*r, px, py))
+        .map(|(_, b)| b.action)
+}
+
+fn ui_quad(out: &mut Vec<UiVertex>, r: [f32; 4], uv: [f32; 4], col: [f32; 4]) {
+    let (aw, ah) = (ui_atlas::ATLAS_W as f32, ui_atlas::ATLAS_H as f32);
+    let (u0, v0) = (uv[0] / aw, uv[1] / ah);
+    let (u1, v1) = ((uv[0] + uv[2]) / aw, (uv[1] + uv[3]) / ah);
+    let (x, y, w, h) = (r[0], r[1], r[2], r[3]);
+    let p = [[x, y], [x + w, y], [x, y + h], [x + w, y + h]];
+    let t = [[u0, v0], [u1, v0], [u0, v1], [u1, v1]];
+    for i in [0usize, 1, 2, 2, 1, 3] {
+        out.push(UiVertex { pos: p[i], uv: t[i], col });
+    }
+}
+
+/// Draw one line of text with the baked metrics: ink at pen + (dx, dy) from
+/// the line top (the very model PIL used at bake time).
+fn ui_push_text(out: &mut Vec<UiVertex>, x: f32, top: f32, s: &str, k: f32, col: [f32; 4]) {
+    let mut pen = x;
+    for c in s.chars() {
+        match ui_glyph(c) {
+            Some(g) => {
+                if g.1[2] > 0.0 {
+                    ui_quad(
+                        out,
+                        [pen + g.3 * k, top + g.4 * k, g.1[2] * k, g.1[3] * k],
+                        g.1,
+                        col,
+                    );
+                }
+                pen += g.2 * k;
+            }
+            None => pen += 6.0 * k,
+        }
+    }
+}
+
+fn ui_build(w: f32, h: f32, st: &UiState) -> Vec<UiVertex> {
+    let mut v: Vec<UiVertex> = Vec::with_capacity(2048);
+    for (r, b) in ui_button_rects() {
+        let hover = st.cursor.map(|(cx, cy)| ui_hit(r, cx, cy)).unwrap_or(false);
+        let active = match b.action {
+            UiAction::Tool(t) => t == st.tool,
+            UiAction::TogglePlans => st.show_plans,
+        };
+        let bg = if active {
+            ui_srgb([0.271, 0.200, 0.086, 0.96])
+        } else if hover {
+            ui_srgb([0.235, 0.255, 0.310, 0.96])
+        } else {
+            ui_srgb([0.102, 0.114, 0.145, 0.88])
+        };
+        let edge = if active {
+            ui_srgb([0.870, 0.665, 0.286, 1.0])
+        } else if hover {
+            ui_srgb([0.560, 0.610, 0.700, 1.0])
+        } else {
+            ui_srgb([0.280, 0.310, 0.380, 1.0])
+        };
+        // border ring + inner fill
+        ui_quad(&mut v, r, UI_WHITE, edge);
+        ui_quad(
+            &mut v,
+            [r[0] + 1.0, r[1] + 1.0, r[2] - 2.0, r[3] - 2.0],
+            UI_WHITE,
+            bg,
+        );
+        // icon
+        let iuv = ui_atlas::ICONS
+            .iter()
+            .find(|(n, _)| *n == b.icon)
+            .map(|(_, r)| *r)
+            .unwrap_or([0.0, 0.0, 4.0, 4.0]);
+        ui_quad(
+            &mut v,
+            [
+                r[0] + UI_BTN_PAD,
+                (r[1] + (r[3] - UI_ICON) / 2.0).round(),
+                UI_ICON,
+                UI_ICON,
+            ],
+            iuv,
+            [1.0, 1.0, 1.0, 1.0],
+        );
+        // label
+        let tx = r[0] + UI_BTN_PAD + UI_ICON + UI_GAP;
+        let ty = (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC)) / 2.0).round();
+        let tc = if active {
+            ui_srgb([0.980, 0.930, 0.780, 1.0])
+        } else {
+            ui_srgb([0.870, 0.880, 0.900, 1.0])
+        };
+        ui_push_text(&mut v, tx, ty, b.label, 1.0, tc);
+    }
+    // bottom-left hint bar for the active tool
+    if !st.hint.is_empty() {
+        let tw = ui_text_width(st.hint);
+        let (pad, bh) = (10.0, 36.0);
+        let r = [12.0, h - bh - 14.0, tw + pad * 2.0, bh];
+        ui_quad(&mut v, r, UI_WHITE, ui_srgb([0.070, 0.078, 0.098, 0.80]));
+        ui_quad(
+            &mut v,
+            [r[0], r[1], 3.0, r[3]],
+            UI_WHITE,
+            ui_srgb([0.870, 0.665, 0.286, 0.95]),
+        );
+        let ty = (r[1] + (r[3] - (ui_atlas::FONT_ASC + ui_atlas::FONT_DESC)) / 2.0).round();
+        ui_push_text(&mut v, r[0] + pad, ty, st.hint, 1.0, ui_srgb([0.92, 0.92, 0.90, 1.0]));
+    }
+    v
+}
+
+/// Six painter-order quads per vertex list, no buffers: positions+uv+colour.
 const UI_SHADER: &str = r#"
-struct Btn {
-    rect: vec4<f32>,   // x, y, w, h in physical px
-    screen: vec2<f32>, // surface px
-    flags: vec2<f32>,  // x: overlay on, y: hover
+struct Uni {
+    screen: vec2<f32>,
 };
-@group(0) @binding(0) var<uniform> btn: Btn;
+@group(0) @binding(0) var<uniform> uni: Uni;
+@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(2) var smp: sampler;
 
 struct VOut {
     @builtin(position) pos: vec4<f32>,
-    @location(0) col: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) col: vec4<f32>,
 };
 
 @vertex
-fn vs_ui(@builtin(vertex_index) vi: u32) -> VOut {
-    let r: u32 = vi / 6u;
-    let c: u32 = vi % 6u;
-    var lx = 0.0;
-    var ly = 0.0;
-    var lw = 0.0;
-    var lh = 0.0;
-    if (r == 0u) { lx = 0.0; ly = 0.0; lw = btn.rect.z; lh = btn.rect.w; }
-    else if (r == 1u) { lx = 2.0; ly = 2.0; lw = btn.rect.z - 4.0; lh = btn.rect.w - 4.0; }
-    else if (r == 2u) { lx = 7.0; ly = 7.0; lw = 30.0; lh = 30.0; }
-    else if (r == 3u) { lx = 10.0; ly = 10.0; lw = 24.0; lh = 24.0; }
-    else if (r == 4u) { lx = 14.0; ly = 14.0; lw = 16.0; lh = 16.0; }
-    else { lx = 17.0; ly = 17.0; lw = 10.0; lh = 10.0; }
-    var ux = 0.0;
-    var uy = 0.0;
-    if (c == 0u) { ux = 0.0; uy = 0.0; }
-    else if (c == 1u) { ux = 1.0; uy = 0.0; }
-    else if (c == 2u) { ux = 0.0; uy = 1.0; }
-    else if (c == 3u) { ux = 1.0; uy = 0.0; }
-    else if (c == 4u) { ux = 1.0; uy = 1.0; }
-    else { ux = 0.0; uy = 1.0; }
-    let px = btn.rect.x + lx + ux * lw;
-    let py = btn.rect.y + ly + uy * lh;
-    let on = btn.flags.x;
-    let hov = btn.flags.y;
-    let bg = vec3<f32>(0.10 + 0.08 * hov, 0.12 + 0.09 * hov, 0.15 + 0.10 * hov);
-    var col = vec4<f32>(bg, 0.92);
-    if (r == 0u) {
-        let g = 0.55 + 0.40 * hov;
-        col = vec4<f32>(g, g, g + 0.03, 1.0);
-    } else if (r == 2u) {
-        col = vec4<f32>(select(vec3<f32>(0.45, 0.45, 0.48), vec3<f32>(0.92, 0.30, 0.32), on > 0.5), 1.0);
-    } else if (r == 4u) {
-        col = vec4<f32>(select(vec3<f32>(0.45, 0.45, 0.48), vec3<f32>(0.25, 0.82, 0.92), on > 0.5), 1.0);
-    }
+fn vs_ui(
+    @location(0) pos: vec2<f32>,
+    @location(1) uv: vec2<f32>,
+    @location(2) col: vec4<f32>,
+) -> VOut {
     var o: VOut;
-    o.pos = vec4<f32>(px / btn.screen.x * 2.0 - 1.0, 1.0 - py / btn.screen.y * 2.0, 0.0, 1.0);
+    o.pos = vec4<f32>(pos.x / uni.screen.x * 2.0 - 1.0, 1.0 - pos.y / uni.screen.y * 2.0, 0.0, 1.0);
+    o.uv = uv;
     o.col = col;
     return o;
 }
 
 @fragment
 fn fs_ui(in: VOut) -> @location(0) vec4<f32> {
-    return in.col;
+    return in.col * textureSample(tex, smp, in.uv);
 }
 "#;
 
@@ -1483,26 +1642,87 @@ struct UiRenderer {
     pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
+    vb: wgpu::Buffer,
+    vcap: usize,
 }
 
 impl UiRenderer {
-    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+    fn new(device: &wgpu::Device, queue: &wgpu::Queue, format: wgpu::TextureFormat) -> Self {
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("ui-shader"),
             source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()),
         });
+        // the baked atlas (font glyphs + icons), NEAREST: pixel-crisp
+        let tex = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ui-atlas"),
+            size: wgpu::Extent3d {
+                width: ui_atlas::ATLAS_W,
+                height: ui_atlas::ATLAS_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            ui_atlas::ATLAS_RAW,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(ui_atlas::ATLAS_W * 4),
+                rows_per_image: Some(ui_atlas::ATLAS_H),
+            },
+            wgpu::Extent3d {
+                width: ui_atlas::ATLAS_W,
+                height: ui_atlas::ATLAS_H,
+                depth_or_array_layers: 1,
+            },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("ui-sampler"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
         let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ui-bgl"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ui-uniform"),
@@ -1513,16 +1733,38 @@ impl UiRenderer {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ui-bg"),
             layout: &bgl,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+        let vcap = 4096;
+        let vb = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-vb"),
+            size: (vcap * std::mem::size_of::<UiVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ui-layout"),
             bind_group_layouts: &[Some(&bgl)],
             immediate_size: 0,
         });
+        let vbl = wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<UiVertex>() as u64,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Float32x4],
+        };
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("ui-pipeline"),
             layout: Some(&layout),
@@ -1530,7 +1772,7 @@ impl UiRenderer {
                 module: &shader,
                 entry_point: Some("vs_ui"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[],
+                buffers: &[Some(vbl)],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -1565,28 +1807,80 @@ impl UiRenderer {
             pipeline,
             uniform,
             bind_group,
+            vb,
+            vcap,
         }
     }
 
-    fn draw(
-        &self,
-        queue: &wgpu::Queue,
-        pass: &mut wgpu::RenderPass<'_>,
-        w: f32,
-        h: f32,
-        hover: bool,
-        on: bool,
-    ) {
-        let u = UiUniform {
-            rect: UI_BTN,
-            screen: [w, h],
-            flags: [if on { 1.0 } else { 0.0 }, if hover { 1.0 } else { 0.0 }],
-        };
+    fn draw(&self, queue: &wgpu::Queue, pass: &mut wgpu::RenderPass<'_>, w: f32, h: f32, st: &UiState) {
+        let verts = ui_build(w, h, st);
+        assert!(verts.len() <= self.vcap, "ui vertex buffer overflow");
+        let u = UiUniform { screen: [w, h] };
         queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
+        queue.write_buffer(&self.vb, 0, bytemuck::cast_slice(&verts));
         pass.set_pipeline(&self.pipeline);
         pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..36, 0..1);
+        pass.set_vertex_buffer(0, self.vb.slice(..));
+        pass.draw(0..verts.len() as u32, 0..1);
     }
+}
+
+/// KOLOMNA_UI_SHOT=<png>: rasterize the toolbar on the CPU (no window) so the
+/// layout and the atlas can be checked from the dev loop.
+pub fn ui_shot(path: &str) {
+    let st = UiState {
+        tool: 2,
+        show_plans: true,
+        hint: "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
+        cursor: Some((100.0, 30.0)),
+    };
+    let (w, h) = (980u32, 220u32);
+    let verts = ui_build(w as f32, h as f32, &st);
+    let mut px = vec![0u8; (w * h * 4) as usize];
+    for p in px.chunks_mut(4) {
+        p.copy_from_slice(&[153, 184, 219, 255]); // sky, like in the app
+    }
+    let (aw, ah) = (ui_atlas::ATLAS_W as f32, ui_atlas::ATLAS_H as f32);
+    for q in verts.chunks(6) {
+        let (mut x0, mut x1, mut y0, mut y1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        let (mut u0, mut u1, mut v0, mut v1) = (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+        for vtx in q {
+            x0 = x0.min(vtx.pos[0]);
+            x1 = x1.max(vtx.pos[0]);
+            y0 = y0.min(vtx.pos[1]);
+            y1 = y1.max(vtx.pos[1]);
+            u0 = u0.min(vtx.uv[0]);
+            u1 = u1.max(vtx.uv[0]);
+            v0 = v0.min(vtx.uv[1]);
+            v1 = v1.max(vtx.uv[1]);
+        }
+        let col = q[0].col;
+        for yy in (y0.max(0.0) as u32)..(y1.min(h as f32) as u32) {
+            for xx in (x0.max(0.0) as u32)..(x1.min(w as f32) as u32) {
+                let fu = (xx as f32 + 0.5 - x0) / (x1 - x0).max(1e-6);
+                let fv = (yy as f32 + 0.5 - y0) / (y1 - y0).max(1e-6);
+                let u = u0 + fu * (u1 - u0);
+                let v = v0 + fv * (v1 - v0);
+                let tx = ((u * aw) as u32).min(ui_atlas::ATLAS_W - 1);
+                let ty = ((v * ah) as u32).min(ui_atlas::ATLAS_H - 1);
+                let o = ((ty * ui_atlas::ATLAS_W + tx) * 4) as usize;
+                let t = &ui_atlas::ATLAS_RAW[o..o + 4];
+                let a = t[3] as f32 / 255.0 * col[3];
+                let i = ((yy * w + xx) * 4) as usize;
+                for c in 0..3 {
+                    let s = t[c] as f32 / 255.0 * col[c];
+                    px[i + c] = ((s * a + px[i + c] as f32 / 255.0 * (1.0 - a)) * 255.0)
+                        .round()
+                        .clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+    }
+    if let Err(e) = write_png(path, w, h, &px) {
+        eprintln!("ui shot: {e}");
+        return;
+    }
+    println!("ui shot saved: {path} ({w}x{h})");
 }
 
 // ------------------------------------------------------------ winit app ----
@@ -1611,7 +1905,6 @@ struct App {
     frames: u32,
     /// courtyard boundary overlay (button / key B)
     show_plans: bool,
-    hover_btn: bool,
     /// editor: 0 camera, 1 roads, 2 courtyards, 3 parks
     tool: u8,
     /// editor: the in-progress shape (plan coords)
@@ -1664,7 +1957,7 @@ impl ApplicationHandler for App {
         println!("  Shift+средняя / ЛКМ / ПКМ — перенос карты");
         println!("  края окна            — навигация (карта едет, если мышь у края)");
         println!("  WASD/стрелки — перенос · Q/E — поворот 90° · R — сброс · Esc — выход");
-        println!("  B / кнопка слева вверху — границы дворов (вкл/выкл)");
+        println!("  кнопки слева вверху — Границы · Камера · Дороги · Кварталы · Парки");
         println!("  РЕДАКТОР: 1 камера · 2 дороги · 3 кварталы · 4 парки");
         println!("            ЛКМ — точка · ПКМ — отменить фигуру · Backspace — убрать точку");
         println!("            Enter — закончить (дороги: ≥2 точек, кварталы: 4, парки: ≥3) · Esc — выйти из режима");
@@ -1704,6 +1997,18 @@ impl ApplicationHandler for App {
             ];
             self.commit();
             println!("selftest: park commit OK");
+            // toolbar dispatch: every button must answer at its centre
+            for (r, b) in ui_button_rects() {
+                let a = ui_action_at((r[0] + r[2] / 2.0) as f64, (r[1] + r[3] / 2.0) as f64);
+                let ok = a == Some(b.action);
+                println!(
+                    "selftest: button «{}» -> {:?} {}",
+                    b.label,
+                    a,
+                    if ok { "OK" } else { "FAIL" }
+                );
+                assert!(ok, "button {} not clickable", b.label);
+            }
             std::thread::sleep(std::time::Duration::from_millis(2000));
             std::process::exit(0);
         }
@@ -1815,12 +2120,14 @@ impl ApplicationHandler for App {
                         }
                     }
                     MouseButton::Left | MouseButton::Right => {
-                        if pressed
-                            && button == MouseButton::Left
-                            && self.cursor.map(|(px, py)| ui_btn_hit(px, py)).unwrap_or(false)
-                        {
-                            self.show_plans = !self.show_plans;
-                            return; // a button click is not a pan
+                        if pressed && button == MouseButton::Left {
+                            if let Some(a) = self.cursor.and_then(|(px, py)| ui_action_at(px, py)) {
+                                match a {
+                                    UiAction::TogglePlans => self.show_plans = !self.show_plans,
+                                    UiAction::Tool(t) => self.set_tool(t),
+                                }
+                                return; // a button click is not a pan
+                            }
                         }
                         // editor: left adds a point, right cancels the shape
                         if self.tool != 0 {
@@ -1877,7 +2184,6 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
-                self.hover_btn = ui_btn_hit(pos.0, pos.1);
                 self.cursor = Some(pos);
             }
             WindowEvent::Resized(size) => {
@@ -1893,15 +2199,19 @@ impl ApplicationHandler for App {
                 self.fps_acc += dt;
                 self.frames += 1;
                 let mut frame_ok = true;
-                let show_plans = self.show_plans;
-                let hover_btn = self.hover_btn;
+                let ui_state = UiState {
+                    tool: self.tool,
+                    show_plans: self.show_plans,
+                    hint: self.hint_text(),
+                    cursor: self.cursor,
+                };
                 if let Some(scene) = self.scene.as_ref() {
                     if let (Some(cam), Some(renderer)) =
                         (self.camera.as_mut(), self.renderer.as_mut())
                     {
                         let base = renderer.base_scale(scene);
                         cam.step(dt, &self.keys, self.cursor, self.win_size, base);
-                        if let Err(e) = renderer.render(scene, cam, show_plans, hover_btn) {
+                        if let Err(e) = renderer.render(scene, cam, &ui_state) {
                             eprintln!("error: {e}");
                             frame_ok = false;
                         }
@@ -2069,15 +2379,19 @@ impl App {
         self.refresh_preview();
     }
 
-    fn update_title(&self) {
-        let hint = match self.tool {
+    /// The one-line hint shown both in the window title and the status bar.
+    fn hint_text(&self) -> &'static str {
+        match self.tool {
             1 => "ДОРОГИ: ЛКМ точка · Enter — готово · ПКМ — отмена",
             2 => "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
             3 => "ПАРКИ: клики по контуру · Enter — готово · ПКМ — отмена",
-            _ => "1 камера · 2 дороги · 3 кварталы · 4 парки · B — границы дворов",
-        };
+            _ => "ЛКМ — обзор · кнопки вверху: дороги · кварталы · парки · B — границы дворов",
+        }
+    }
+
+    fn update_title(&self) {
         if let Some(w) = self.window.as_ref() {
-            w.set_title(&format!("Kolomna — {hint}"));
+            w.set_title(&format!("Kolomna — {}", self.hint_text()));
         }
     }
 
@@ -2293,7 +2607,6 @@ pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
         fps_acc: 0.0,
         frames: 0,
         show_plans: true,
-        hover_btn: false,
         tool: 0,
         pts: Vec::new(),
         user: UserPlan::default(),
