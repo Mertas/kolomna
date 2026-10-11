@@ -1195,7 +1195,9 @@ pub fn generate_manor(
         let m = if roman { 2.9 } else { 0.0 };
         let xc = 2.0 * door_tile as f32 + 1.0;
         let mut cand: Vec<usize> = (1..tiles - 2)
-            .filter(|&a| a != door_tile && a + 1 != door_tile)
+            // only the Roman house needs the arch clear of the (absent for
+            // non-Roman arch houses) entrance tiles
+            .filter(|&a| roman || (a != door_tile && a + 1 != door_tile))
             .filter(|&a| {
                 let (x0, x1) = (2.0 * a as f32, 2.0 * (a + 2) as f32);
                 !(x0 < xc + m && x1 > xc - m)
@@ -1260,7 +1262,10 @@ impl Manor {
         let w = self.w;
         let d = self.d;
         let n_floors = self.heights.len();
-        if self.bays && !self.roman {
+        // a house with a carriage arch carries no parade entrance: no door,
+        // no porch, no bays on its street facade (user's rule)
+        let no_parade = self.arch.is_some() && !self.roman;
+        if self.bays && !self.roman && self.arch.is_none() {
             self.erkers();
         }
 
@@ -1307,10 +1312,12 @@ impl Manor {
                         continue;
                     }
                 }
-                let mat = if fi == 0 && t == self.door_tile {
+                let mat = if fi == 0 && t == self.door_tile && !no_parade {
                     M_DOOR
-                } else if self.win_tiles.contains(&t) && !(fi == 0 && t == self.door_tile) {
-                    if fi == 1 && t == self.door_tile {
+                } else if self.win_tiles.contains(&t)
+                    && (!(fi == 0 && t == self.door_tile) || no_parade)
+                {
+                    if fi == 1 && t == self.door_tile && !no_parade {
                         mat_wall // above the entrance keep it plain
                     } else {
                         mat_win
@@ -1614,7 +1621,7 @@ impl Manor {
         }
 
         // ---- porch: steps, canopy on brackets, lanterns -------------------
-        if !self.roman {
+        if !self.roman && !no_parade {
             let dt = self.door_tile;
             let xc = 2.0 * dt as f32 + 1.0;
             // three SOLID steps: tread, riser and side cheeks per step,

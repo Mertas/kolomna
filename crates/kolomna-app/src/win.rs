@@ -352,7 +352,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 let mut order: Vec<usize> = (0..k).collect();
                 order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
                 // the gallery splits deterministically so the variants sit
-                // side by side for comparison: 0,2 roman · 1,3 bay · 4 plain
+                // side by side for comparison:
+                // 0,2 roman portico · 1,3 bay windows · 4 plain = arch house
                 let kind = blk % 5;
                 let rom = if kind == 0 || kind == 2 {
                     order.iter().copied().find(|&j| widths[j] >= 14.0)
@@ -370,30 +371,13 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                         bayj[b] = true;
                     }
                 }
-                // the arch goes to ANOTHER piece whenever one exists: the
-                // generator keeps it off the portico, but a gate next to the
-                // parade entrance reads better (and needs tiles >= 12 m)
-                let rest: Vec<usize> = (0..k).filter(|&j| Some(j) != rom).collect();
-                let pick = rest
-                    .iter()
-                    .copied()
-                    .find(|&j| widths[j] >= 12.0)
-                    .or(rom)
-                    .or_else(|| {
-                        rest.iter()
-                            .copied()
-                            .max_by(|&a, &b| widths[a].partial_cmp(&widths[b]).unwrap())
-                    })
-                    .or(Some(order[0]));
-                if let Some(j) = pick {
-                    archj[j] = true;
-                }
-                if blk == 0 && k >= 3 {
-                    for &j in &order {
-                        if !archj[j] && widths[j] >= 12.0 {
-                            archj[j] = true; // a second arch in the first block
-                            break;
-                        }
+                // a house with a carriage arch carries no parade entrance:
+                // the arch goes only to a PLAIN street piece — a roman/bay
+                // house never doubles as the arch house, and on k=1 parade
+                // blocks the courtyard stays archless
+                if rom.is_none() && !bayj.iter().any(|&b| b) {
+                    if let Some(p) = order.iter().copied().find(|&j| widths[j] >= 12.0) {
+                        archj[p] = true;
                     }
                 }
                 let ap: Vec<usize> = (0..k).filter(|&j| archj[j]).collect();
