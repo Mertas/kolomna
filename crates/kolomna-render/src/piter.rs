@@ -423,11 +423,12 @@ fn roof_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
 
 fn brick_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     let mut img = Img::new(TEX_S, TEX_S, pal.brick);
-    img.noise(r, 6);
+    img.noise(r, 9);
     let mut y = 10;
     let mut row = 0;
     while y < TEX_S as i32 {
         img.line_h(0, TEX_S as i32, y, pal.brick_dark);
+        img.line_h(0, TEX_S as i32, y + 1, shift(pal.brick_dark, 22));
         let off = if row % 2 == 0 { 0 } else { 16 };
         for x in (off..TEX_S as i32).step_by(32) {
             img.line_v(x, y - 10, y, pal.brick_dark);
@@ -1449,9 +1450,10 @@ impl Manor {
                 };
                 self.wall_quad(mat, 1, x0, x0 + 2.0, y, y + fh, 0.0);
             }
-            // ends: a plain window near the middle (west, yard facing the
-            // neighbour) — or a second parade facade on the east end when
-            // this house owns a street corner
+            // ends: adjoining end walls are blank brick firewalls
+            // (брандмауэры) — no windows, no trim anywhere on them; only a
+            // corner house keeps its second parade facade on the east end,
+            // which alone keeps windows and its plaster wall
             let dts = (d / 2.0).floor() as usize;
             for t in 0..dts {
                 let z0 = 2.0 * t as f32;
@@ -1459,27 +1461,10 @@ impl Manor {
                     let mat = if fi == 0 { M_BASE_WIN } else { mat_win };
                     self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
                 } else {
-                    let mat = if t == dts / 2 {
-                        if fi == 0 {
-                            M_BASE_WIN
-                        } else {
-                            M_WIN_PLAIN
-                        }
-                    } else {
-                        mat_wall
-                    };
+                    let mat = if self.corner { mat_wall } else { M_BRICK };
                     self.wall_quad(mat, 3, z0, z0 + 2.0, y, y + fh, w);
                 }
-                let mat = if t == dts / 2 {
-                    if fi == 0 {
-                        M_BASE_WIN
-                    } else {
-                        M_WIN_PLAIN
-                    }
-                } else {
-                    mat_wall
-                };
-                self.wall_quad(mat, 2, z0, z0 + 2.0, y, y + fh, 0.0);
+                self.wall_quad(M_BRICK, 2, z0, z0 + 2.0, y, y + fh, 0.0);
             }
             y += fh;
             self.y_band.push(y);
@@ -1530,7 +1515,9 @@ impl Manor {
         }
 
         // ---- string courses between floors + stepped crowning cornice -----
-        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32| {
+        // the courses wrap the facades only: adjoining end walls are blank
+        // firewalls and carry no trim; only a corner house trims its east end
+        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32, eas: bool| {
             let a = 0.0f32;
             // south
             b.quad(
@@ -1554,35 +1541,27 @@ impl Manor {
                 ],
                 [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
             );
-            // west
-            b.quad(
-                M_BAND,
-                [
-                    [-out, yy - 0.10, -a],
-                    [-out, yy - 0.10, d + a],
-                    [-out, yy + 0.14, d + a],
-                    [-out, yy + 0.14, -a],
-                ],
-                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, 1.0], [0.0, 1.0]],
-            );
-            // east
-            b.quad(
-                M_BAND,
-                [
-                    [w + out, yy - 0.10, d + a],
-                    [w + out, yy - 0.10, -a],
-                    [w + out, yy + 0.14, -a],
-                    [w + out, yy + 0.14, d + a],
-                ],
-                [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, 1.0], [0.0, 1.0]],
-            );
+            // east: only when this end is a parade facade
+            if eas {
+                b.quad(
+                    M_BAND,
+                    [
+                        [w + out, yy - 0.10, d + a],
+                        [w + out, yy - 0.10, -a],
+                        [w + out, yy + 0.14, -a],
+                        [w + out, yy + 0.14, d + a],
+                    ],
+                    [[0.0, 0.0], [d / 2.0, 0.0], [d / 2.0, 1.0], [0.0, 1.0]],
+                );
+            }
         };
+        let eas = self.corner;
         for k in 1..self.y_band.len() {
-            band(&mut self.b, self.y_band[k], 0.10, w, d);
+            band(&mut self.b, self.y_band[k], 0.10, w, d, eas);
         }
         // crowning cornice: two stepped bands overhanging the wall
-        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d);
-        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d);
+        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d, eas);
+        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas);
 
         // ---- balconies ----------------------------------------------------
         let balcony_floor = if r.f() < 0.75 { Some(2usize) } else { None };
@@ -1890,8 +1869,9 @@ impl Manor {
                 ],
                 roof_uv(w, d / 2.0),
             );
+            let tri_mat = if self.corner { M_WALL } else { M_BRICK };
             self.b.tri(
-                M_WALL,
+                M_BRICK,
                 [
                     [-0.02, y_wall_top, -0.02],
                     [-0.02, y_wall_top, d + 0.02],
@@ -1900,7 +1880,7 @@ impl Manor {
                 [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.0]],
             );
             self.b.tri(
-                M_WALL,
+                tri_mat,
                 [
                     [w + 0.02, y_wall_top, d + 0.02],
                     [w + 0.02, y_wall_top, -0.02],
