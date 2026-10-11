@@ -182,6 +182,20 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
     // to a side, so several plan variants can be compared side by side
     let mut plan_pts: Vec<([[f32; 2]; 4], [[f32; 2]; 4])> = Vec::new();
     let mut focus: Option<[f32; 3]> = None;
+    // debug: aim the --shot view at an arbitrary plan point (u,v in metres)
+    if let Ok(s) = std::env::var("KOLOMNA_FOCUS_PLAN") {
+        if let Some((a, b)) = s.split_once(',') {
+            if let (Ok(u), Ok(v)) = (a.trim().parse::<f32>(), b.trim().parse::<f32>()) {
+                let w = [eu[0] * u + nvec[0] * v, eu[1] * u + nvec[1] * v];
+                let hh = h_at(anchor[0] + w[0] / 16.0, anchor[1] + w[1] / 16.0);
+                focus = Some([
+                    anchor[0] + w[0] / 16.0,
+                    anchor[1] + w[1] / 16.0,
+                    (hh - mn) * ZSCALE,
+                ]);
+            }
+        }
+    }
     // which block anchors the --shot view (KOLOMNA_FOCUS_BLK overrides)
     let focus_blk: u64 = std::env::var("KOLOMNA_FOCUS_BLK")
         .ok()
@@ -501,6 +515,26 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             },
         );
         village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
+
+        // ---- the Summer Garden beyond the east end of the street ----------
+        // an irregular polygon fenced with the Fельтен grille, with gates,
+        // alleys, bosquets, fountains, busts, statues, vases, benches,
+        // lanterns and urns — all procedural and conforming to the terrain
+        let (gmesh, gtexs) = kolomna_render::summer_garden::build_garden(
+            &h_at,
+            anchor,
+            mn,
+            eu,
+            nvec,
+            &kolomna_render::summer_garden::Params {
+                centre: [212.0, 0.0],
+                ru: 60.0,
+                rv: 46.0,
+                seed: 0x5EED_6A2D,
+            },
+        );
+        println!("summer garden: fence around an irregular outline, 2 gates");
+        village.push((gmesh, gtexs, [0.0, 0.0, 0.0], 0.0));
     }
 
     for (i, (w, d, dh)) in report.iter().enumerate() {

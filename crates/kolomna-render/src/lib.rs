@@ -43,6 +43,7 @@ pub mod road;
 pub mod assets;
 pub mod procgen;
 pub mod streets;
+pub mod summer_garden;
 
 pub const VIEW_W: u32 = 1600;
 pub const VIEW_H: u32 = 1200;
