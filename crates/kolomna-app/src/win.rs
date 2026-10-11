@@ -60,6 +60,10 @@ pub struct Scene {
     road_textures: Vec<(u32, u32, Vec<u8>)>,
     /// generated Petersburg tenements (mesh, textures, model origin, world rot)
     village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
+    /// index of the courtyard-boundary overlay inside `village`
+    plan_idx: usize,
+    /// camera focus for `--shot` (the middle block's anchor house)
+    focus: [f32; 3],
 }
 
 pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
@@ -174,19 +178,26 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         out
     };
 
-    for blk in 0..2u64 {
-        let s: f32 = if blk == 0 { 1.0 } else { -1.0 }; // which side of the road
-        let u_off = if blk == 0 { 4.0f32 } else { -18.0 };
+    // ten courtyards: a gallery of blocks along the street line, five columns
+    // to a side, so several plan variants can be compared side by side
+    let mut plan_pts: Vec<([[f32; 2]; 4], [[f32; 2]; 4])> = Vec::new();
+    let mut focus: Option<[f32; 3]> = None;
+    for blk in 0..10u64 {
+        let s: f32 = if blk % 2 == 0 { 1.0 } else { -1.0 }; // which side of the road
+        let u_off = ((blk / 2) as f32 - 2.0) * 56.0;
         let seed_b = 9000 + blk * 131;
         let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
 
         // the block plan: an irregular quad (frame: a along the street, b
-        // inward), every vertex jittered — never a neat rectangle
+        // inward), every vertex jittered — never a neat rectangle; the
+        // footprint varies per block so the variants differ
+        let a_half = 18.0 + rng.below(9) as f32 * 0.5; // front half width 18–22 m
+        let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
         let mut q = [
-            [u_off - 28.0, setback],
-            [u_off + 28.0, setback],
-            [u_off + 23.0, setback + 46.0],
-            [u_off - 23.0, setback + 46.0],
+            [u_off - a_half, setback],
+            [u_off + a_half, setback],
+            [u_off + a_half - 5.0, setback + b_len],
+            [u_off - a_half + 5.0, setback + b_len],
         ];
         for p in q.iter_mut() {
             p[0] += (rng.f() - 0.5) * 9.0;
@@ -224,14 +235,13 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         let mut wings = [[0.0f32; 2]; 4];
         for i in 0..4 {
             let ip = (i + 3) % 4;
-            wings[i][0] = (11.0 + rng.below(6) as f32).min(lens[ip] - 12.0).max(8.0);
-            wings[i][1] = (11.0 + rng.below(6) as f32).min(lens[i] - 12.0).max(8.0);
-        }
-        for i in 0..4 {
-            let inx = (i + 1) % 4;
-            if lens[i] - wings[i][1] - wings[inx][0] < 10.0 {
-                wings[inx][0] = (lens[i] - wings[i][1] - 10.0).max(8.0);
-            }
+            // each side keeps >= 10 m for its own row: a wing never takes more
+            // than half of (side - 10 m). The old one-sided cap left 4 m rows
+            // and squeezed a 10 m house into them.
+            let cap0 = ((lens[ip] - 10.0) * 0.5).max(10.0);
+            let cap1 = ((lens[i] - 10.0) * 0.5).max(10.0);
+            wings[i][0] = (11.0 + rng.below(6) as f32).min(cap0).max(10.0);
+            wings[i][1] = (11.0 + rng.below(6) as f32).min(cap1).max(10.0);
         }
 
         // place one house: its plan quad c (block frame, metres) + requested
@@ -301,6 +311,9 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
                 kolomna_render::piter::deform(&mut pl, wa, da, cw);
                 let base_tex = texs[kolomna_render::piter::M_BASE as usize].clone();
                 let at = [anchor[0], anchor[1], (seat - mn) * ZSCALE];
+                if blk == 4 && focus.is_none() {
+                    focus = Some(at); // the centre block anchors the --shot view
+                }
                 village.push((pl, vec![base_tex], at, 0.0));
                 village.push((mesh, texs, at, 0.0));
                 report.push((wa, da, h_max - h_min));
@@ -321,7 +334,13 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             if i == 0 {
                 let mut order: Vec<usize> = (0..k).collect();
                 order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
-                let rom = order.iter().copied().find(|&j| widths[j] >= 14.0);
+                // only some blocks show the Roman variant — the gallery puts
+                // both faces of the type on display
+                let rom = if rng.f() < 0.6 {
+                    order.iter().copied().find(|&j| widths[j] >= 14.0)
+                } else {
+                    None
+                };
                 if let Some(r) = rom {
                     romanj[r] = true;
                 }
@@ -394,11 +413,82 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             let c = [vv[i], pl_pt, pf_pt, q[i]];
             place(u_a, u_b, c, false, true, false, seed_b + 500 + i as u64);
         }
+
+        // keep the plan outlines for the boundary overlay drawn in the app
+        let to_wm_b = |p: [f32; 2]| -> [f32; 2] {
+            [
+                eu[0] * p[0] + nvec[0] * s * p[1],
+                eu[1] * p[0] + nvec[1] * s * p[1],
+            ]
+        };
+        plan_pts.push((
+            [to_wm_b(q[0]), to_wm_b(q[1]), to_wm_b(q[2]), to_wm_b(q[3])],
+            [to_wm_b(vv[0]), to_wm_b(vv[1]), to_wm_b(vv[2]), to_wm_b(vv[3])],
+        ));
     }
     for (i, (w, d, dh)) in report.iter().enumerate() {
         println!("tenement {i:02}: {w:.0}x{d:.0} m, slope {dh:.2} m");
     }
     println!("village: {} Petersburg tenements", report.len());
+
+    // ---- courtyard boundary overlay ---------------------------------------
+    // thin ground ribbons along every block's outer plan (red) and its inner
+    // courtyard hole (cyan); the app toggles them with the button / key B.
+    // Outer lines are pushed ~0.9 m out and inner ones ~0.6 m into the
+    // courtyard so they stay visible on the ground instead of hiding under
+    // the walls. One mesh, one 256x1 two-colour texture, uv picks the colour.
+    let mut pal_px = Vec::with_capacity(256 * 4);
+    for x in 0..256usize {
+        let c = if x < 128 { [220u8, 60, 60] } else { [60, 200, 220] };
+        pal_px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+    }
+    let mut bld = kolomna_render::procgen::Builder::new();
+    for (outer, inner) in &plan_pts {
+        for (ring, uv, off) in [
+            (outer, [[0.25f32, 0.25f32]; 4], 0.9f32),
+            (inner, [[0.75f32, 0.25f32]; 4], -0.6f32),
+        ] {
+            for i in 0..4 {
+                let p0 = ring[i];
+                let p1 = ring[(i + 1) % 4];
+                let d = [p1[0] - p0[0], p1[1] - p0[1]];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-3);
+                let (tx, ty) = (d[0] / l, d[1] / l);
+                // ccw ring: outward = (ty, -tx); outer lines go out, inner
+                // ones into the hole
+                let n_off = [ty * off, -tx * off];
+                let perp = [-ty * 0.16, tx * 0.16]; // 32 cm wide ribbon
+                let n_seg = (l / 1.5).ceil().max(1.0) as usize;
+                for s in 0..n_seg {
+                    let t0 = s as f32 / n_seg as f32;
+                    let t1 = (s + 1) as f32 / n_seg as f32;
+                    let a = [p0[0] + d[0] * t0 + n_off[0], p0[1] + d[1] * t0 + n_off[1]];
+                    let e = [p0[0] + d[0] * t1 + n_off[0], p0[1] + d[1] * t1 + n_off[1]];
+                    let hh = |p: [f32; 2]| -> f32 {
+                        h_at(anchor[0] + p[0] / 16.0, anchor[1] + p[1] / 16.0) - mn + 0.35
+                    };
+                    let (ya, ye) = (hh(a), hh(e));
+                    let ax = anchor[0] * 16.0 + a[0];
+                    let az = anchor[1] * 16.0 + a[1];
+                    let ex = anchor[0] * 16.0 + e[0];
+                    let ez = anchor[1] * 16.0 + e[1];
+                    bld.quad(
+                        0,
+                        [
+                            [ax + perp[0], ya, az + perp[1]],
+                            [ex + perp[0], ye, ez + perp[1]],
+                            [ex - perp[0], ye, ez - perp[1]],
+                            [ax - perp[0], ya, az - perp[1]],
+                        ],
+                        uv,
+                    );
+                }
+            }
+        }
+    }
+    let plan_idx = village.len();
+    village.push((bld.finish(1), vec![(256u32, 1u32, pal_px)], [0.0, 0.0, 0.0], 0.0));
+    let focus = focus.unwrap_or([anchor[0], anchor[1], 0.0]);
 
     Ok(Scene {
         base,
@@ -412,6 +502,8 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         road_mesh,
         road_textures,
         village,
+        plan_idx,
+        focus,
     })
 }
 
@@ -438,27 +530,25 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         .ok()
         .and_then(|s| s.parse::<f32>().ok())
         .unwrap_or(0.0);
-    let view = scene
-        .village
-        .get(scene.village.len().saturating_sub(2))
-        .map(|(_, _, p, _)| {
-            // the shader rotates world points about the grid centre before the
-            // iso projection — rotate the anchor the same way, or a frame with
-            // a non-zero angle aims at the wrong place (empty ground).
-            let c = scene.grid * 0.5;
-            let (sa, ca) = angle.sin_cos();
-            let d = [p[0] - c, p[1] - c];
-            let rx = c + d[0] * ca - d[1] * sa;
-            let rz = c + d[0] * sa + d[1] * ca;
-            (
-                [
-                    (rx - rz) * 0.5,
-                    // + ~half the tenement height: keeps a ~17 m house centred
-                    (rx + rz) * (0.5 * tilt) - p[2] - 0.6,
-                ],
-                angle,
-            )
-        });
+    // aim at the middle block's anchor house (the plan overlay sits last in
+    // `village` and must not steal the focus)
+    let p = scene.focus;
+    // the shader rotates world points about the grid centre before the iso
+    // projection — rotate the anchor the same way, or a frame with a non-zero
+    // angle aims at the wrong place (empty ground).
+    let c = scene.grid * 0.5;
+    let (sa, ca) = angle.sin_cos();
+    let d = [p[0] - c, p[1] - c];
+    let rx = c + d[0] * ca - d[1] * sa;
+    let rz = c + d[0] * sa + d[1] * ca;
+    let view = Some((
+        [
+            (rx - rz) * 0.5,
+            // + ~half the tenement height: keeps a ~17 m house centred
+            (rx + rz) * (0.5 * tilt) - p[2] - 0.6,
+        ],
+        angle,
+    ));
     let rgba = kolomna_render::model::render_scene_with_models(
         VIEW_W,
         VIEW_H,
@@ -762,6 +852,9 @@ struct Renderer {
     terrain: TerrainRenderer,
     road: RoadRenderer,
     village: Vec<ModelRenderer>,
+    /// index of the courtyard boundary overlay inside `village`
+    plan_idx: usize,
+    ui: UiRenderer,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
 }
@@ -833,6 +926,7 @@ impl Renderer {
             })
             .collect();
         let (msaa_view, depth_view) = make_targets(&device, &config);
+        let ui = UiRenderer::new(&device, config.format);
 
         Ok(Self {
             surface,
@@ -842,6 +936,8 @@ impl Renderer {
             terrain,
             road,
             village,
+            plan_idx: scene.plan_idx,
+            ui,
             msaa_view,
             depth_view,
         })
@@ -866,7 +962,13 @@ impl Renderer {
         self.depth_view = depth_view;
     }
 
-    fn render(&mut self, scene: &Scene, cam: &Camera) -> Result<(), Box<dyn Error>> {
+    fn render(
+        &mut self,
+        scene: &Scene,
+        cam: &Camera,
+        show_plans: bool,
+        hover_btn: bool,
+    ) -> Result<(), Box<dyn Error>> {
         let (w, h) = (self.config.width as f32, self.config.height as f32);
         let params = cam.params(w, h, scene.grid, self.base_scale(scene));
         self.terrain.set_params(&self.queue, &params);
@@ -927,9 +1029,13 @@ impl Renderer {
                 multiview_mask: None,
             });
             self.terrain.draw(&mut pass);
-            for r in &self.village {
+            for (idx, r) in self.village.iter().enumerate() {
+                if !show_plans && idx == self.plan_idx {
+                    continue; // courtyard boundaries hidden
+                }
                 r.draw(&mut pass);
             }
+            self.ui.draw(&self.queue, &mut pass, w, h, hover_btn, show_plans);
         }
         self.queue.submit(Some(enc.finish()));
         self.queue.present(frame);
@@ -937,7 +1043,203 @@ impl Renderer {
     }
 }
 
+// --------------------------------------------------- courtyard ui button ----
+
+/// Screen-space toggle button (top-left corner, physical px) that shows or
+/// hides the courtyard boundary overlay; clicks compare against this rect.
+const UI_BTN: [f32; 4] = [12.0, 12.0, 44.0, 44.0]; // x, y, w, h
+
+fn ui_btn_hit(px: f64, py: f64) -> bool {
+    px >= UI_BTN[0] as f64
+        && px <= (UI_BTN[0] + UI_BTN[2]) as f64
+        && py >= UI_BTN[1] as f64
+        && py <= (UI_BTN[1] + UI_BTN[3]) as f64
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct UiUniform {
+    rect: [f32; 4],
+    screen: [f32; 2],
+    flags: [f32; 2], // x: overlay visible, y: cursor over the button
+}
+
+/// Six painter-order rectangles (border, background, red icon frame + inset,
+/// cyan icon frame + inset) built from `vertex_index` alone — no buffers.
+/// The icon mirrors the overlay: two nested "courtyard" outlines.
+const UI_SHADER: &str = r#"
+struct Btn {
+    rect: vec4<f32>,   // x, y, w, h in physical px
+    screen: vec2<f32>, // surface px
+    flags: vec2<f32>,  // x: overlay on, y: hover
+};
+@group(0) @binding(0) var<uniform> btn: Btn;
+
+struct VOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) col: vec4<f32>,
+};
+
+@vertex
+fn vs_ui(@builtin(vertex_index) vi: u32) -> VOut {
+    let r: u32 = vi / 6u;
+    let c: u32 = vi % 6u;
+    var lx = 0.0;
+    var ly = 0.0;
+    var lw = 0.0;
+    var lh = 0.0;
+    if (r == 0u) { lx = 0.0; ly = 0.0; lw = btn.rect.z; lh = btn.rect.w; }
+    else if (r == 1u) { lx = 2.0; ly = 2.0; lw = btn.rect.z - 4.0; lh = btn.rect.w - 4.0; }
+    else if (r == 2u) { lx = 7.0; ly = 7.0; lw = 30.0; lh = 30.0; }
+    else if (r == 3u) { lx = 10.0; ly = 10.0; lw = 24.0; lh = 24.0; }
+    else if (r == 4u) { lx = 14.0; ly = 14.0; lw = 16.0; lh = 16.0; }
+    else { lx = 17.0; ly = 17.0; lw = 10.0; lh = 10.0; }
+    var ux = 0.0;
+    var uy = 0.0;
+    if (c == 0u) { ux = 0.0; uy = 0.0; }
+    else if (c == 1u) { ux = 1.0; uy = 0.0; }
+    else if (c == 2u) { ux = 0.0; uy = 1.0; }
+    else if (c == 3u) { ux = 1.0; uy = 0.0; }
+    else if (c == 4u) { ux = 1.0; uy = 1.0; }
+    else { ux = 0.0; uy = 1.0; }
+    let px = btn.rect.x + lx + ux * lw;
+    let py = btn.rect.y + ly + uy * lh;
+    let on = btn.flags.x;
+    let hov = btn.flags.y;
+    let bg = vec3<f32>(0.10 + 0.08 * hov, 0.12 + 0.09 * hov, 0.15 + 0.10 * hov);
+    var col = vec4<f32>(bg, 0.92);
+    if (r == 0u) {
+        let g = 0.55 + 0.40 * hov;
+        col = vec4<f32>(g, g, g + 0.03, 1.0);
+    } else if (r == 2u) {
+        col = vec4<f32>(select(vec3<f32>(0.45, 0.45, 0.48), vec3<f32>(0.92, 0.30, 0.32), on > 0.5), 1.0);
+    } else if (r == 4u) {
+        col = vec4<f32>(select(vec3<f32>(0.45, 0.45, 0.48), vec3<f32>(0.25, 0.82, 0.92), on > 0.5), 1.0);
+    }
+    var o: VOut;
+    o.pos = vec4<f32>(px / btn.screen.x * 2.0 - 1.0, 1.0 - py / btn.screen.y * 2.0, 0.0, 1.0);
+    o.col = col;
+    return o;
+}
+
+@fragment
+fn fs_ui(in: VOut) -> @location(0) vec4<f32> {
+    return in.col;
+}
+"#;
+
+struct UiRenderer {
+    pipeline: wgpu::RenderPipeline,
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+impl UiRenderer {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("ui-shader"),
+            source: wgpu::ShaderSource::Wgsl(UI_SHADER.into()),
+        });
+        let bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ui-bgl"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ui-uniform"),
+            size: std::mem::size_of::<UiUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ui-bg"),
+            layout: &bgl,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ui-layout"),
+            bind_group_layouts: &[Some(&bgl)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ui-pipeline"),
+            layout: Some(&layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_ui"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_ui"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 4,
+                ..Default::default()
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+        Self {
+            pipeline,
+            uniform,
+            bind_group,
+        }
+    }
+
+    fn draw(
+        &self,
+        queue: &wgpu::Queue,
+        pass: &mut wgpu::RenderPass<'_>,
+        w: f32,
+        h: f32,
+        hover: bool,
+        on: bool,
+    ) {
+        let u = UiUniform {
+            rect: UI_BTN,
+            screen: [w, h],
+            flags: [if on { 1.0 } else { 0.0 }, if hover { 1.0 } else { 0.0 }],
+        };
+        queue.write_buffer(&self.uniform, 0, bytemuck::bytes_of(&u));
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        pass.draw(0..36, 0..1);
+    }
+}
+
 // ------------------------------------------------------------ winit app ----
+
 
 struct App {
     city: String,
@@ -956,6 +1258,9 @@ struct App {
     title_acc: f32,
     fps_acc: f32,
     frames: u32,
+    /// courtyard boundary overlay (button / key B)
+    show_plans: bool,
+    hover_btn: bool,
 }
 
 impl ApplicationHandler for App {
@@ -1002,6 +1307,7 @@ impl ApplicationHandler for App {
         println!("  Shift+средняя / ЛКМ / ПКМ — перенос карты");
         println!("  края окна            — навигация (карта едет, если мышь у края)");
         println!("  WASD/стрелки — перенос · Q/E — поворот 90° · R — сброс · Esc — выход");
+        println!("  B / кнопка слева вверху — границы дворов (вкл/выкл)");
         self.camera = Some(Camera::new(scene.grid, scene.zspan));
         self.scene = Some(scene);
         self.renderer = Some(renderer);
@@ -1024,6 +1330,9 @@ impl ApplicationHandler for App {
                                 return;
                             }
                             if !event.repeat {
+                                if code == KeyCode::KeyB {
+                                    self.show_plans = !self.show_plans;
+                                }
                                 if let Some(scene) = self.scene.as_ref() {
                                     if code == KeyCode::KeyR {
                                         if let Some(cam) = self.camera.as_mut() {
@@ -1091,7 +1400,16 @@ impl ApplicationHandler for App {
                             }
                         }
                     }
-                    MouseButton::Left | MouseButton::Right => self.drag_pan = pressed,
+                    MouseButton::Left | MouseButton::Right => {
+                        if pressed
+                            && button == MouseButton::Left
+                            && self.cursor.map(|(px, py)| ui_btn_hit(px, py)).unwrap_or(false)
+                        {
+                            self.show_plans = !self.show_plans;
+                            return; // a button click is not a pan
+                        }
+                        self.drag_pan = pressed;
+                    }
                     _ => {}
                 }
             }
@@ -1126,6 +1444,7 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                self.hover_btn = ui_btn_hit(pos.0, pos.1);
                 self.cursor = Some(pos);
             }
             WindowEvent::Resized(size) => {
@@ -1141,13 +1460,15 @@ impl ApplicationHandler for App {
                 self.fps_acc += dt;
                 self.frames += 1;
                 let mut frame_ok = true;
+                let show_plans = self.show_plans;
+                let hover_btn = self.hover_btn;
                 if let Some(scene) = self.scene.as_ref() {
                     if let (Some(cam), Some(renderer)) =
                         (self.camera.as_mut(), self.renderer.as_mut())
                     {
                         let base = renderer.base_scale(scene);
                         cam.step(dt, &self.keys, self.cursor, self.win_size, base);
-                        if let Err(e) = renderer.render(scene, cam) {
+                        if let Err(e) = renderer.render(scene, cam, show_plans, hover_btn) {
                             eprintln!("error: {e}");
                             frame_ok = false;
                         }
@@ -1208,6 +1529,8 @@ pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
         title_acc: 0.0,
         fps_acc: 0.0,
         frames: 0,
+        show_plans: true,
+        hover_btn: false,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

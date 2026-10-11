@@ -163,6 +163,23 @@ impl Img {
     }
 }
 
+/// Vertical row flip. Wall quads carry uv v=0 on their BOTTOM edge and the
+/// GPU maps v=0 to the first stored row, so a texture drawn top-down (as
+/// every drawing fn here does) renders vertically mirrored — the entrance
+/// doors read upside down (caught by the user). `textures()` stores every
+/// tile bottom-up through this helper.
+fn flip_rows(px: &mut [u8], w: usize, h: usize) {
+    let stride = w * 4;
+    let mut tmp = vec![0u8; stride];
+    for y in 0..h / 2 {
+        let a = y * stride;
+        let b = (h - 1 - y) * stride;
+        tmp.copy_from_slice(&px[a..a + stride]);
+        px.copy_within(b..b + stride, a);
+        px[b..b + stride].copy_from_slice(&tmp);
+    }
+}
+
 /// Horizontal rustication (stone courses) on any field colour.
 fn rusticate(img: &mut Img, base: [u8; 3], course: i32) {
     let dark = shift(base, -58);
@@ -1298,6 +1315,18 @@ impl Manor {
                             continue; // no balcony over the carriage arch
                         }
                     }
+                    // no balcony over the entrance (its canopy and lanterns
+                    // hang right there) and none inside the Roman colonnade
+                    // (the portico entablature would cut straight through it)
+                    if wt == self.door_tile || wt + 1 == self.door_tile || wt == self.door_tile + 1 {
+                        continue;
+                    }
+                    if self.roman {
+                        let px_c = 2.0 * self.door_tile as f32 + 1.0;
+                        if ((2.0 * wt as f32 + 1.0) - px_c).abs() < 4.6 {
+                            continue;
+                        }
+                    }
                     let xc = 2.0 * wt as f32 + 1.0;
                     let x0 = xc - 1.15;
                     let x1 = xc + 1.15;
@@ -1562,12 +1591,16 @@ impl Manor {
 
         // ---- chimneys ------------------------------------------------------
         let chimneys = if n_floors <= 4 { 1 } else { 2 };
-        for c in 0..chimneys {
-            let cx = if chimneys == 1 {
-                w * 0.5
-            } else {
-                w * (0.28 + 0.44 * c as f32)
-            };
+        let chim_x: Vec<f32> = (0..chimneys)
+            .map(|c| {
+                if chimneys == 1 {
+                    w * 0.5
+                } else {
+                    w * (0.28 + 0.44 * c as f32)
+                }
+            })
+            .collect();
+        for &cx in &chim_x {
             chimney(&mut self.b, cx, zm, y1 - 0.4, 1.7, 0.38);
         }
 
@@ -1576,6 +1609,10 @@ impl Manor {
             let dormers = if tiles >= 10 { 3 } else { 2 };
             for i in 0..dormers {
                 let dx = w * (i as f32 + 1.0) / (dormers as f32 + 1.0);
+                // elements must not intersect: a dormer never sits on a flue
+                if chim_x.iter().any(|&c| (dx - c).abs() < 1.6) {
+                    continue;
+                }
                 let t = 0.45f32;
                 let dz = (d + 0.35) - (d + 0.35 - zm) * t;
                 let dy = y_wall_top + rh * t;
@@ -1697,7 +1734,7 @@ impl Manor {
         let mut rr = Rng::new(0x7E57_0000 ^ ((self.tiles as u64) << 8) ^ self.heights.len() as u64);
         let wall = pal.wall;
         let base = pal.basement;
-        vec![
+        let mut out = vec![
             (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, false, &mut rr)), // 0 M_WALL
             (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, true, &mut rr)),  // 1 M_RUST
             (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(0), false, &mut rr)), // 2 M_WIN
@@ -1716,7 +1753,13 @@ impl Manor {
             (TEX_W as u32, TEX_H as u32, black_door_tex(&pal, &mut rr)),              // 15 M_BLACK_DOOR
             (TEX_W as u32, TEX_H as u32, stable_tex(&pal, &mut rr)),                  // 16 M_STABLE
             (TEX_S as u32, TEX_S as u32, stone_tex(&pal)),                            // 17 M_STONE
-        ]
+        ];
+        // store every tile bottom-up (see `flip_rows`): without this the whole
+        // facade renders vertically mirrored and the doors show upside down
+        for t in out.iter_mut() {
+            flip_rows(&mut t.2, t.0 as usize, t.1 as usize);
+        }
+        out
     }
 }
 
