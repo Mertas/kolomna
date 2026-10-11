@@ -187,6 +187,7 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
+    let mut blk_edges: Vec<(f32, f32, f32)> = Vec::new(); // per block: u_min, u_max, v_max
     for blk in 0..10u64 {
         let s: f32 = if blk % 2 == 0 { 1.0 } else { -1.0 }; // which side of the road
         let u_off = ((blk / 2) as f32 - 2.0) * 56.0;
@@ -208,6 +209,11 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             p[0] += (rng.f() - 0.5) * 9.0;
             p[1] += (rng.f() - 0.5) * 7.0;
         }
+        blk_edges.push((
+            q[0][0].min(q[3][0]),
+            q[1][0].max(q[2][0]),
+            q[2][1].max(q[3][1]),
+        ));
         // side i runs q[i] -> q[i+1]: unit tangent, inward normal, length
         let side = |q: &[[f32; 2]; 4], i: usize| -> ([f32; 2], [f32; 2], f32) {
             let a = q[i];
@@ -438,6 +444,65 @@ pub fn load_scene(city: &str, dat: &str) -> Result<Scene, Box<dyn Error>> {
             [to_wm_b(vv[0]), to_wm_b(vv[1]), to_wm_b(vv[2]), to_wm_b(vv[3])],
         ));
     }
+    // ---- procedural modern streets ---------------------------------------
+    // One street along the block fronts, with cross lanes through the gaps
+    // between block columns: asphalt roadway, granite kerbs, tiled
+    // sidewalks, a dashed centre line and zebra crossings — all conforming
+    // to the terrain. Pushed as one world-space mesh (like the overlay).
+    {
+        let mut cols = [[f32::INFINITY, f32::NEG_INFINITY, 0.0f32]; 5];
+        for (b, &(l, r, vm)) in blk_edges.iter().enumerate() {
+            let col = b / 2;
+            cols[col][0] = cols[col][0].min(l);
+            cols[col][1] = cols[col][1].max(r);
+            cols[col][2] = cols[col][2].max(vm);
+        }
+        // each cross lane is sized to the gap it runs through: 5.5 m wide
+        // in a roomy gap, 4.5 m in a tight one, 3.8 m in a sliver
+        let mut cross: Vec<(f32, f32, f32)> = Vec::new();
+        let mut gaps: Vec<String> = Vec::new();
+        for k in 0..4 {
+            let (right, left) = (cols[k][1], cols[k + 1][0]);
+            let g = left - right;
+            gaps.push(format!("{g:.1}"));
+            let uc = (right + left) * 0.5;
+            if g >= 9.6 {
+                cross.push((uc, 2.75, 4.7));
+            } else if g >= 7.4 {
+                cross.push((uc, 2.25, 3.6));
+            } else if g >= 6.0 {
+                cross.push((uc, 1.9, 2.95));
+            }
+        }
+        println!("street gaps between columns: {}", gaps.join(", "));
+        let main_t0 = cols.iter().map(|c| c[0]).fold(f32::INFINITY, f32::min) - 8.0;
+        let main_t1 = cols.iter().map(|c| c[1]).fold(f32::NEG_INFINITY, f32::max) + 8.0;
+        let cross_half = cols.iter().map(|c| c[2]).fold(0.0f32, f32::max) + 8.0;
+        println!(
+            "streets: main {main_t0:.0}..{main_t1:.0} m, {} cross lane(s) {:?}, reach {cross_half:.0} m",
+            cross.len(),
+            cross
+                .iter()
+                .map(|(c, cr, cw)| format!("({c:.0}: {:.1}m road)", cr * 2.0))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        let (rmesh, rtexs) = kolomna_render::streets::build_streets(
+            &h_at,
+            anchor,
+            mn,
+            eu,
+            nvec,
+            &kolomna_render::streets::Params {
+                main_t0,
+                main_t1,
+                cross_half,
+                cross,
+            },
+        );
+        village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
+    }
+
     for (i, (w, d, dh)) in report.iter().enumerate() {
         println!("tenement {i:02}: {w:.0}x{d:.0} m, slope {dh:.2} m");
     }
