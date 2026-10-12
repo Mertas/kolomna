@@ -13,7 +13,7 @@
 //! of the city soft wooded hills rise. The outer 48 m of the map rim blends
 //! toward a smoothed perimeter silhouette so the map-edge skirt reads clean.
 //!
-//! `terrain_textures()` paints six 256x256 RGBA layers in the order the
+//! `terrain_textures()` paints seven 256x256 RGBA layers in the order the
 //! terrain shader expects.
 
 use std::f32::consts::PI;
@@ -330,6 +330,16 @@ fn paint(layer: usize, x: usize, y: usize) -> [f32; 3] {
             let v = m * 12.0 + grain * 6.0 + (if grain2 > 0.96 { 12.0 } else { 0.0 });
             add3([86.0, 100.0, 45.0], v)
         }
+        // 6: wood — the diorama base: warm oak with long grain, few dark knots
+        6 => {
+            let gr = tfbm(xf * 0.5, yf * 3.0, 4, 4, 0x00D1) * 15.0;
+            let g2 = tfbm(xf * 0.28 + 3.7, yf * 1.1 + 9.2, 3, 3, 0x00D2) * 8.0;
+            let mut v = gr + g2 + grain * 4.0;
+            if grain2 > 0.965 {
+                v -= 24.0;
+            }
+            add3([122.0, 86.0, 54.0], v)
+        }
         // 5: light meadow green
         _ => {
             let m = tfbm(xf, yf, 4, 4, 0x11B);
@@ -339,12 +349,13 @@ fn paint(layer: usize, x: usize, y: usize) -> [f32; 3] {
     }
 }
 
-/// Six 256x256 RGBA layers in flat order — the procedural replacement for the
-/// terrain atlas (water bed, dark green, sand, dirt, mid green, light).
+/// Seven 256x256 RGBA layers in flat order — the procedural replacement for
+/// the terrain atlas (water bed, dark green, sand, dirt, mid green,
+/// light) plus a wooden layer for the diorama base.
 pub fn terrain_textures() -> Vec<u8> {
     let t = TILE as usize;
-    let mut out = vec![0u8; t * t * 4 * 6];
-    for layer in 0..6usize {
+    let mut out = vec![0u8; t * t * 4 * 7];
+    for layer in 0..7usize {
         for y in 0..t {
             for x in 0..t {
                 let c = paint(layer, x, y);

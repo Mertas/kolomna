@@ -57,6 +57,9 @@ pub const TERRAIN_INSTANCE: u32 = 1;
 pub const ZSCALE: f32 = 0.035;
 /// world cells per texture repeat (texture instance spans this many cells)
 pub const REPEAT_CELLS: f32 = 5.0;
+/// Land-vertex `layer` sentinel marking the wooden diorama base: the shader
+/// skips the grass blend for it and samples the wood atlas layer instead.
+pub const WOOD_LAYER: f32 = -1000.0;
 /// water surface sits this many metres above the flat-bed mode (see water_level)
 pub const WATER_MARGIN: f32 = 2.2;
 
@@ -217,6 +220,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     let lit = 0.72 + 0.38 * max(dot(n, l), 0.0);
+    // the wooden diorama base: marked verts sample the wood layer; vertical
+    // faces darken so the base reads as one solid wooden volume
+    if (in.layer < -500.0) {
+        let w = textureSample(atlas, samp, in.uv, 6).rgb;
+        let side = clamp(1.0 - n.z, 0.0, 1.0);
+        return vec4<f32>(w * lit * (1.0 - 0.30 * side), 1.0);
+    }
     // grass: CONTINUOUS three-way blend over `layer` (metres above water with
     // forest noise) — soft organic meadow/wood edges, never per-cell squares
     let t1 = smoothstep(20.0, 26.0, in.layer);
@@ -491,14 +501,19 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
         }
     }
 
-    // ------------------------------------------------------- map edge skirt:
-    // the tile rides on a plateau, as a city tile does: along the whole
-    // boundary the ground drops several metres in a short cliff, then a shelf
-    // runs outward so the view never falls off the edge into void.
-    const DROP_M: f32 = 5.0; // metres of the boundary cliff
-    const SHELF_W: f32 = 1.75; // cells of the outward shelf
-    let drop = DROP_M * ZSCALE;
-    let tint = |gx: usize, gy: usize| -> f32 { lay(gx, gy) };
+    // ------------------------------------------------ diorama wooden base:
+    // The map sits on a flat wooden base like an exhibition model: the
+    // terrain is cut at its rim (a soil wall falls from the rim line down to
+    // the board), the board top is a level wooden ring all around, and the
+    // board side is a wooden fascia dropping from the ring's outer edge.
+    // Wood vertices carry layer = WOOD_LAYER: the shader skips the grass
+    // blend for them and samples the wood atlas layer instead.
+    const BOARD_MARGIN_M: f32 = 34.0; // wooden ring width, metres
+    const BOARD_DROP_M: f32 = 2.0; // board top below the water plane, metres
+    const FASCIA_M: f32 = 22.0; // board side height, metres
+    let board_w = BOARD_MARGIN_M / 16.0; // cells
+    let board_z = (wl - BOARD_DROP_M - mn) * ZSCALE;
+    let fascia_z = FASCIA_M * ZSCALE;
     // mesh z -> uv units at the same texel density as the ground (16 m <-> 1 cell)
     let zcell = |z: f32| z / (16.0 * ZSCALE * REPEAT_CELLS);
     let edge = |verts: &mut Vec<Vertex>, pts: &[(usize, usize)], out_xy: [f32; 2], u_along: bool| {
@@ -514,22 +529,22 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let (g1x, g1y) = pts[k + 1];
             let z0 = zof(hc[g0y * n + g0x]);
             let z1 = zof(hc[g1y * n + g1x]);
-            let (l0, l1) = (tint(g0x, g0y), tint(g1x, g1y));
+            let (l0, l1) = (lay(g0x, g0y), lay(g1x, g1y));
             let (p0, p1) = (
                 [g0x as f32 * step, g0y as f32 * step],
                 [g1x as f32 * step, g1y as f32 * step],
             );
             let (q0, q1) = (
-                [p0[0] + out_xy[0] * SHELF_W, p0[1] + out_xy[1] * SHELF_W],
-                [p1[0] + out_xy[0] * SHELF_W, p1[1] + out_xy[1] * SHELF_W],
+                [p0[0] + out_xy[0] * board_w, p0[1] + out_xy[1] * board_w],
+                [p1[0] + out_xy[0] * board_w, p1[1] + out_xy[1] * board_w],
             );
             let wn = [out_xy[0], out_xy[1], 0.0];
-            // cliff wall (vertical; the slope blend turns it into a dirt face)
+            // cut-soil wall: the rim line falls vertically to the board
             for (pos, layer, uv) in [
                 ([p0[0], p0[1], z0], l0, uvw(p0, z0)),
                 ([p1[0], p1[1], z1], l1, uvw(p1, z1)),
-                ([p1[0], p1[1], z1 - drop], l1, uvw(p1, z1 - drop)),
-                ([p0[0], p0[1], z0 - drop], l0, uvw(p0, z0 - drop)),
+                ([p1[0], p1[1], board_z], l1, uvw(p1, board_z)),
+                ([p0[0], p0[1], board_z], l0, uvw(p0, board_z)),
             ] {
                 verts.push(Vertex {
                     pos,
@@ -539,26 +554,22 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                     nrm: wn,
                 });
             }
-            // shelf (flat, outward)
-            for (pos, layer, uv) in [
+            // the level wooden ring around the map
+            for (pos, uv) in [
                 (
-                    [p0[0], p0[1], z0 - drop],
-                    l0,
+                    [p0[0], p0[1], board_z],
                     [p0[0] / REPEAT_CELLS, p0[1] / REPEAT_CELLS],
                 ),
                 (
-                    [p1[0], p1[1], z1 - drop],
-                    l1,
+                    [p1[0], p1[1], board_z],
                     [p1[0] / REPEAT_CELLS, p1[1] / REPEAT_CELLS],
                 ),
                 (
-                    [q1[0], q1[1], z1 - drop],
-                    l1,
+                    [q1[0], q1[1], board_z],
                     [q1[0] / REPEAT_CELLS, q1[1] / REPEAT_CELLS],
                 ),
                 (
-                    [q0[0], q0[1], z0 - drop],
-                    l0,
+                    [q0[0], q0[1], board_z],
                     [q0[0] / REPEAT_CELLS, q0[1] / REPEAT_CELLS],
                 ),
             ] {
@@ -566,8 +577,23 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                     pos,
                     uv,
                     wdep: -1.0,
-                    layer,
+                    layer: crate::WOOD_LAYER,
                     nrm: [0.0, 0.0, 1.0],
+                });
+            }
+            // wooden fascia: the ring's outer edge drops as one solid side
+            for (pos, uv) in [
+                ([q0[0], q0[1], board_z], uvw(q0, board_z)),
+                ([q1[0], q1[1], board_z], uvw(q1, board_z)),
+                ([q1[0], q1[1], board_z - fascia_z], uvw(q1, board_z - fascia_z)),
+                ([q0[0], q0[1], board_z - fascia_z], uvw(q0, board_z - fascia_z)),
+            ] {
+                verts.push(Vertex {
+                    pos,
+                    uv,
+                    wdep: -1.0,
+                    layer: crate::WOOD_LAYER,
+                    nrm: wn,
                 });
             }
         }
@@ -580,28 +606,65 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     edge(&mut verts, &right, [1.0, 0.0], false);
     edge(&mut verts, &back, [0.0, 1.0], true);
     edge(&mut verts, &left, [-1.0, 0.0], false);
-    // corner shelves: flat squares filling the four corners of the ring
+    // the four 90-degree corners: the strips of two neighbouring sides meet in
+    // a wedge — fill the outer corner square with the same bands (the soil
+    // walls need no filler: the two vertical wall planes share the corner
+    // line). o1 is the side whose outward direction is (0, sy).
     for &(cx, cy, sx, sy) in &[
         (0usize, 0usize, -1.0f32, -1.0f32),
         (n - 1, 0, 1.0, -1.0),
         (n - 1, n - 1, 1.0, 1.0),
         (0, n - 1, -1.0, 1.0),
     ] {
-        let z = zof(hc[cy * n + cx]) - drop;
-        let l = tint(cx, cy);
-        let (x0, y0) = (cx as f32 * step, cy as f32 * step);
-        let a = [x0, y0];
-        let b = [x0 + sx * SHELF_W, y0];
-        let c = [x0 + sx * SHELF_W, y0 + sy * SHELF_W];
-        let d = [x0, y0 + sy * SHELF_W];
-        for p in [a, b, c, a, c, d] {
+        let c = [cx as f32 * step, cy as f32 * step];
+        let o1 = [0.0, sy];
+        let o2 = [sx, 0.0];
+        let a = c;
+        let b = [c[0] + o1[0] * board_w, c[1] + o1[1] * board_w];
+        let m = [
+            c[0] + (o1[0] + o2[0]) * board_w,
+            c[1] + (o1[1] + o2[1]) * board_w,
+        ];
+        let d = [c[0] + o2[0] * board_w, c[1] + o2[1] * board_w];
+        // level wooden ring: the corner square
+        for p in [a, b, m, a, m, d] {
             verts.push(Vertex {
-                pos: [p[0], p[1], z],
+                pos: [p[0], p[1], board_z],
                 uv: [p[0] / REPEAT_CELLS, p[1] / REPEAT_CELLS],
                 wdep: -1.0,
-                layer: l,
+                layer: crate::WOOD_LAYER,
                 nrm: [0.0, 0.0, 1.0],
             });
+        }
+        // wooden fascia: the corner square's two outward faces
+        for (e0, e1, wn) in [(b, m, [o1[0], o1[1], 0.0]), (m, d, [o2[0], o2[1], 0.0])] {
+            let uvz = |p: [f32; 2], z: f32| -> [f32; 2] {
+                if wn[0] == 0.0 {
+                    [p[0] / REPEAT_CELLS, zcell(z)]
+                } else {
+                    [zcell(z), p[1] / REPEAT_CELLS]
+                }
+            };
+            for (pos, uv) in [
+                ([e0[0], e0[1], board_z], uvz(e0, board_z)),
+                ([e1[0], e1[1], board_z], uvz(e1, board_z)),
+                (
+                    [e1[0], e1[1], board_z - fascia_z],
+                    uvz(e1, board_z - fascia_z),
+                ),
+                (
+                    [e0[0], e0[1], board_z - fascia_z],
+                    uvz(e0, board_z - fascia_z),
+                ),
+            ] {
+                verts.push(Vertex {
+                    pos,
+                    uv,
+                    wdep: -1.0,
+                    layer: crate::WOOD_LAYER,
+                    nrm: wn,
+                });
+            }
         }
     }
     verts
@@ -636,7 +699,13 @@ pub fn load_atlas(dat_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>>
 
 /// Build the full mip chain of `tex` (array layers, level 0 uploaded already)
 /// by successive fullscreen blits: level i = box-ish average of level i-1.
-fn generate_mips(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture, levels: u32) {
+fn generate_mips(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    tex: &wgpu::Texture,
+    levels: u32,
+    layers: u32,
+) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("mip-shader"),
         source: wgpu::ShaderSource::Wgsl(Cow::Borrowed(MIP_SHADER)),
@@ -705,7 +774,7 @@ fn generate_mips(device: &wgpu::Device, queue: &wgpu::Queue, tex: &wgpu::Texture
         label: Some("mip-enc"),
     });
     for level in 1..levels {
-        for layer in 0..SOURCES.len() as u32 {
+        for layer in 0..layers {
             let src = tex.create_view(&wgpu::TextureViewDescriptor {
                 dimension: Some(wgpu::TextureViewDimension::D2),
                 base_mip_level: level - 1,
@@ -785,13 +854,14 @@ impl TerrainRenderer {
     ) -> Self {
         let water_z = (wl - mn) * ZSCALE;
         let layer_bytes = (TILE * TILE * 4) as usize;
+        let nlayers = (layers.len() / layer_bytes) as u32;
         let mip_levels = (TILE as f32).log2() as u32 + 1;
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("atlas-array"),
             size: wgpu::Extent3d {
                 width: TILE,
                 height: TILE,
-                depth_or_array_layers: SOURCES.len() as u32,
+                depth_or_array_layers: nlayers,
             },
             mip_level_count: mip_levels,
             sample_count: 1,
@@ -827,7 +897,7 @@ impl TerrainRenderer {
                 },
             );
         }
-        generate_mips(device, queue, &atlas_tex, mip_levels);
+        generate_mips(device, queue, &atlas_tex, mip_levels, nlayers);
         let atlas_view = atlas_tex.create_view(&wgpu::TextureViewDescriptor {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
