@@ -2268,7 +2268,7 @@ pub fn ui_shot(path: &str) {
     let st = UiState {
         tool: 2,
         show_plans: true,
-        hint: "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
+        hint: "КВАРТАЛЫ: ≥3 клика · Enter — готово · ПКМ — отмена",
         cursor: Some((100.0, 30.0)),
     };
     let (w, h) = (980u32, 220u32);
