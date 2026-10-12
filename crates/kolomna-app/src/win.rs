@@ -2347,6 +2347,9 @@ struct App {
     user: UserPlan,
     /// last live-preview road point (throttles per-cursor rebuilds)
     last_live: Option<[f32; 2]>,
+    /// KOLOMNA_FRAMES: exit cleanly after N rendered frames (render smoke)
+    frame_stop: Option<u32>,
+    frames_done: u32,
 }
 
 impl ApplicationHandler for App {
@@ -2406,8 +2409,53 @@ impl ApplicationHandler for App {
         self.update_title();
 
         // self-driving editor test (KOLOMNA_EDIT_TEST=1): draw and commit
-        // in the real windowed path without a mouse, then exit
-        if std::env::var("KOLOMNA_EDIT_TEST").is_ok() {
+        // in the real windowed path without a mouse, then exit.
+        // KOLOMNA_EDIT_TEST=select / =draw stop right after the tool pick
+        // (and the first clicks); KOLOMNA_FRAMES then renders live frames —
+        // the synchronous suite itself never draws a frame.
+        let st_mode = std::env::var("KOLOMNA_EDIT_TEST").unwrap_or_default();
+        if st_mode == "select" || st_mode == "draw" {
+            let (cw, ch_) = self.win_size;
+            self.cursor = Some((cw * 0.5, ch_ * 0.5));
+            self.set_tool(1);
+            if st_mode == "draw" {
+                for (fx, fy) in [(0.50, 0.50), (0.56, 0.46)] {
+                    let (px, py) = (cw * fx, ch_ * fy);
+                    self.cursor = Some((px, py));
+                    if let Some(p) = self.screen_to_plan(px, py) {
+                        let p = self.road_snap_point(p);
+                        self.pts.push(p);
+                        self.last_live = Some(p);
+                        self.refresh_preview();
+                    }
+                }
+                let (px, py) = (cw * 0.58, ch_ * 0.42);
+                self.cursor = Some((px, py));
+                if let Some(p) = self.road_cursor_pt() {
+                    let far = self
+                        .last_live
+                        .map(|q| {
+                            let dx = p[0] - q[0];
+                            let dy = p[1] - q[1];
+                            dx * dx + dy * dy > 0.36
+                        })
+                        .unwrap_or(true);
+                    if far {
+                        self.last_live = Some(p);
+                        self.refresh_roads_live();
+                    }
+                }
+            }
+            println!(
+                "selftest: {st_mode} phase done (tool {}, {} point(s))",
+                self.tool,
+                self.pts.len()
+            );
+            if self.frame_stop.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(1200));
+                std::process::exit(0);
+            }
+        } else if !st_mode.is_empty() {
             println!("selftest: road commit ...");
             self.set_tool(1);
             self.pts = vec![[-600.0, -600.0], [600.0, 600.0]];
@@ -2599,8 +2647,11 @@ impl ApplicationHandler for App {
                 );
                 assert!(ok, "button {} not clickable", b.label);
             }
-            std::thread::sleep(std::time::Duration::from_millis(2000));
-            std::process::exit(0);
+            if self.frame_stop.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(2000));
+                std::process::exit(0);
+            }
+            println!("selftest: suite done; rendering frames ...");
         }
     }
 
@@ -2877,6 +2928,13 @@ impl ApplicationHandler for App {
                 }
                 if !frame_ok {
                     event_loop.exit();
+                }
+                self.frames_done += 1;
+                if let Some(stop) = self.frame_stop {
+                    if self.frames_done >= stop {
+                        println!("selftest: frames rendered OK ({})", self.frames_done);
+                        std::process::exit(0);
+                    }
                 }
             }
             _ => {}
@@ -3670,6 +3728,10 @@ pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
         pts: Vec::new(),
         user: UserPlan::default(),
         last_live: None,
+        frame_stop: std::env::var("KOLOMNA_FRAMES")
+            .ok()
+            .and_then(|s| s.parse().ok()),
+        frames_done: 0,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

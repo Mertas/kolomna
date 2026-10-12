@@ -673,6 +673,12 @@ impl ModelRenderer {
     }
 
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        // An empty mesh (e.g. the editor's roads layer before the first chain
+        // lands) has no parts; binding its zero-sized buffers panics in wgpu
+        // ("buffer slice can not be empty"), so bail out first.
+        if self.parts.is_empty() {
+            return;
+        }
         pass.set_bind_group(0, &self.group0, &[]);
         pass.set_vertex_buffer(0, self.vbuf.slice(..));
         pass.set_index_buffer(self.ibuf.slice(..), wgpu::IndexFormat::Uint32);
