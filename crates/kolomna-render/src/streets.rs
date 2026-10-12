@@ -1419,6 +1419,23 @@ pub fn build_roads(
     chains: &[Vec<[f32; 2]>],
     net: &Params,
 ) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
+    build_roads_ext(h_at, anchor, mn, eu, nvec, chains, &[], net)
+}
+
+/// [`build_roads`] + extra way clearers: polylines the given chains must keep
+/// clear of (junctions trim kerbs/walks, free ends extend T-attachments)
+/// WITHOUT being triangulated themselves — the live stroke preview passes the
+/// committed roads here so every cursor move only rebuilds the stroke.
+pub fn build_roads_ext(
+    h_at: &dyn Fn(f32, f32) -> f32,
+    anchor: [f32; 2],
+    mn: f32,
+    eu: [f32; 2],
+    nvec: [f32; 2],
+    chains: &[Vec<[f32; 2]>],
+    extra: &[Vec<[f32; 2]>],
+    net: &Params,
+) -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
     let ctx = Ctx { h_at, anchor, mn, eu, nvec };
     let mut b = Builder::new();
     let (hr, hw) = (3.5f32, 6.5f32);
@@ -1453,6 +1470,11 @@ pub fn build_roads(
         let mut clearers: Vec<(&[[f32; 2]], f32, f32)> = Vec::new();
         for (oj, och) in chains.iter().enumerate() {
             if oj != ci && och.len() >= 2 {
+                clearers.push((och, hr, hw));
+            }
+        }
+        for och in extra {
+            if och.len() >= 2 {
                 clearers.push((och, hr, hw));
             }
         }
@@ -1770,9 +1792,16 @@ fn tex_white() -> (u32, u32, Vec<u8>) {
     (256, 256, v)
 }
 
-fn textures() -> Vec<(u32, u32, Vec<u8>)> {
-    vec![
-        tex_asphalt(),
+pub fn textures() -> Vec<(u32, u32, Vec<u8>)> {
+    // the 12 procedural road textures never change: generate them once per
+    // process and hand out clones (~3 MB memcpy) — the editor rebuilds the
+    // roads mesh on every cursor move and used to pay the full noise
+    // generation (~80 ms) each time
+    static CACHE: std::sync::OnceLock<Vec<(u32, u32, Vec<u8>)>> = std::sync::OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            vec![
+                tex_asphalt(),
         tex_kerb(),
         tex_walk(),
         tex_paint(),
@@ -1782,7 +1811,9 @@ fn textures() -> Vec<(u32, u32, Vec<u8>)> {
         tex_leaf(),
         tex_leaf2(),
         tex_sign(),
-        tex_wood(),
-        tex_white(),
-    ]
+                tex_wood(),
+                tex_white(),
+            ]
+        })
+        .clone()
 }

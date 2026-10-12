@@ -1492,6 +1492,8 @@ struct Renderer {
     plan_idx: usize,
     /// index of the drawn-roads mesh inside `village`
     roads_idx: Option<usize>,
+    /// index of the live (in-progress) stretch of road inside `village`
+    roads_live_idx: Option<usize>,
     /// the editor's in-progress sketch (drawn over the ground)
     preview: Option<ModelRenderer>,
     ui: UiRenderer,
@@ -1578,6 +1580,7 @@ impl Renderer {
             village,
             plan_idx: scene.plan_idx,
             roads_idx: scene.roads_idx,
+            roads_live_idx: None,
             preview: None,
             ui,
             msaa_view,
@@ -2442,8 +2445,16 @@ impl ApplicationHandler for App {
                         .unwrap_or(true);
                     if far {
                         self.last_live = Some(p);
-                        self.refresh_roads_live();
+                        self.refresh_live_stroke();
                     }
+                }
+                for i in 0..5 {
+                    let t0 = std::time::Instant::now();
+                    self.refresh_live_stroke();
+                    println!(
+                        "timing: draw-mode live stroke #{i}: {:.1} ms",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
                 }
             }
             println!(
@@ -2634,6 +2645,32 @@ impl ApplicationHandler for App {
                     (dd - 6.6).abs() < 1.2,
                     "shape snap did not land on the kerb edge"
                 );
+            }
+            // timings: the live stroke preview must rebuild instantly
+            {
+                self.tool = 1;
+                let nch = self.user.roads.len();
+                if let Some(ch0) = self.user.roads.last().cloned() {
+                    self.pts = vec![ch0[0], [ch0[0][0] + 40.0, ch0[0][1] + 40.0]];
+                    self.cursor = Some((self.win_size.0 * 0.5, self.win_size.1 * 0.5));
+                    self.last_live = None;
+                    for i in 0..5 {
+                        let t0 = std::time::Instant::now();
+                        self.refresh_live_stroke();
+                        println!(
+                            "timing: live stroke #{i} over {nch} committed chain(s): {:.1} ms",
+                            t0.elapsed().as_secs_f64() * 1e3
+                        );
+                    }
+                    let t0 = std::time::Instant::now();
+                    self.refresh_roads_committed();
+                    println!(
+                        "timing: committed roads rebuild over {nch} chain(s): {:.1} ms",
+                        t0.elapsed().as_secs_f64() * 1e3
+                    );
+                    self.pts.clear();
+                    self.refresh_live_stroke();
+                }
             }
             // toolbar dispatch: every button must answer at its centre
             for (r, b) in ui_button_rects() {
@@ -2871,7 +2908,7 @@ impl ApplicationHandler for App {
                             .unwrap_or(true);
                         if far {
                             self.last_live = Some(p);
-                            self.refresh_roads_live();
+                            self.refresh_live_stroke();
                         }
                     }
                 }
@@ -3062,7 +3099,7 @@ impl App {
     /// orange ribbon sketch.
     fn refresh_preview(&mut self) {
         if self.tool == 1 {
-            self.refresh_roads_live();
+            self.refresh_live_stroke();
             self.update_title();
             return;
         }
@@ -3175,12 +3212,11 @@ impl App {
         }
     }
 
-    /// The chains as they are on screen: committed roads + the chain being
-    /// drawn, with its rubber-band point under the cursor.
-    fn road_chains_live(&self) -> Vec<Vec<[f32; 2]>> {
-        let mut v = self.user.roads.clone();
-        if self.tool == 1 && !self.pts.is_empty() {
-            let mut ch = self.pts.clone();
+    /// The chain being drawn right now: the clicked points + the rubber-band
+    /// point under the cursor.
+    fn live_stroke_pts(&self) -> Vec<[f32; 2]> {
+        let mut ch = self.pts.clone();
+        if self.tool == 1 && !ch.is_empty() {
             if let Some(p) = self.road_cursor_pt() {
                 let l = ch[ch.len() - 1];
                 let dx = p[0] - l[0];
@@ -3189,14 +3225,19 @@ impl App {
                     ch.push(p);
                 }
             }
-            v.push(ch);
         }
-        v
+        ch
     }
 
-    /// Live rebuild of the drawn-roads mesh (fast path: no save re-parse).
-    fn refresh_roads_live(&mut self) {
-        let chains = self.road_chains_live();
+    /// Full rebuild of the committed roads mesh (all settled chains) — the
+    /// expensive path; runs at load and once per chain commit, never per
+    /// cursor move.
+    fn refresh_roads_committed(&mut self) {
+        if self.user.roads.is_empty() {
+            return;
+        }
+        let t_all = std::time::Instant::now();
+        let chains = self.user.roads.clone();
         let (mesh, texs) = {
             let scene = match self.scene.as_ref() {
                 Some(s) => s,
@@ -3213,12 +3254,86 @@ impl App {
                 &scene.net,
             )
         };
+        let nv = mesh.verts.len();
+        let t_build = t_all.elapsed();
         if let Some(r) = self.renderer.as_mut() {
             match r.roads_idx {
-                Some(ix) => r.replace_village_mesh(ix, mesh, texs),
-                None => {
+                Some(ix) if ix < r.village.len() => {
+                    r.village[ix].set_mesh(&r.device, &mesh);
+                }
+                _ => {
                     let ix = r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
                     r.roads_idx = Some(ix);
+                }
+            }
+        }
+        if std::env::var("KOLOMNA_EDIT_TEST").is_ok() {
+            let up = t_all.elapsed() - t_build;
+            println!(
+                "committed roads: mesh {:.1} ms + swap {:.1} ms ({} chain(s), {nv} verts)",
+                t_build.as_secs_f64() * 1e3,
+                up.as_secs_f64() * 1e3,
+                chains.len()
+            );
+        }
+    }
+
+    /// Live rebuild of ONLY the stroke being drawn (the instant path): the
+    /// committed roads ride along as extra clearers instead of being
+    /// re-triangulated, and the renderer swaps geometry without touching its
+    /// shader or textures (ModelRenderer::set_mesh).
+    fn refresh_live_stroke(&mut self) {
+        let stroke = self.live_stroke_pts();
+        if stroke.len() < 2 {
+            self.clear_live_stroke();
+            return;
+        }
+        let t_all = std::time::Instant::now();
+        let (mesh, texs) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            let h_at = Self::scene_h_at(scene);
+            kolomna_render::streets::build_roads_ext(
+                &h_at,
+                scene.anchor,
+                scene.mn,
+                scene.eu,
+                scene.nvec,
+                std::slice::from_ref(&stroke),
+                &self.user.roads,
+                &scene.net,
+            )
+        };
+        let nv = mesh.verts.len();
+        let t_build = t_all.elapsed();
+        if let Some(r) = self.renderer.as_mut() {
+            match r.roads_live_idx {
+                Some(ix) if ix < r.village.len() => r.village[ix].set_mesh(&r.device, &mesh),
+                _ => {
+                    let ix = r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
+                    r.roads_live_idx = Some(ix);
+                }
+            }
+        }
+        if std::env::var("KOLOMNA_EDIT_TEST").is_ok() {
+            let up = t_all.elapsed() - t_build;
+            println!(
+                "live stroke: mesh {:.1} ms + swap {:.1} ms ({} pt(s), {nv} verts)",
+                t_build.as_secs_f64() * 1e3,
+                up.as_secs_f64() * 1e3,
+                stroke.len()
+            );
+        }
+    }
+
+    /// Blank the live stroke layer (nothing is being drawn).
+    fn clear_live_stroke(&mut self) {
+        if let Some(r) = self.renderer.as_mut() {
+            if let Some(ix) = r.roads_live_idx {
+                if ix < r.village.len() {
+                    r.village[ix].set_mesh(&r.device, &kolomna_render::model::ModelMesh::empty());
                 }
             }
         }
@@ -3229,7 +3344,8 @@ impl App {
     /// fresh chain crosses (houses on the roadway go, gardens split).
     fn after_road_commit(&mut self) {
         self.last_live = None;
-        self.refresh_roads_live();
+        self.refresh_roads_committed();
+        self.clear_live_stroke();
         if self.chains_near_grid() {
             self.rebuild_streets();
         }
@@ -3485,6 +3601,27 @@ impl App {
         self.tool = t;
         self.pts.clear();
         self.last_live = None;
+        if t != 1 {
+            self.clear_live_stroke();
+        }
+        // pre-warm the live stroke layer when the roads tool is picked, so
+        // the first stroke of the session does not pay the one-off shader /
+        // texture cost mid-draw (it lands on the toolbar click instead)
+        if t == 1 {
+            if let Some(r) = self.renderer.as_mut() {
+                if r.roads_live_idx.is_none() {
+                    let texs = kolomna_render::streets::textures();
+                    let n_slots = texs.len();
+                    let ix = r.add_village_mesh(
+                        kolomna_render::model::ModelMesh::empty_with_slots(n_slots),
+                        texs,
+                        [0.0, 0.0, 0.0],
+                        0.0,
+                    );
+                    r.roads_live_idx = Some(ix);
+                }
+            }
+        }
         self.refresh_preview();
     }
 

@@ -351,6 +351,30 @@ pub fn mesh_from_mesh3d(m: &mesh3d::Mesh3d) -> ModelMesh {
     mesh
 }
 
+impl ModelMesh {
+    /// An empty mesh (no geometry): renders as nothing; used to clear the
+    /// live-preview layers without rebuilding their renderer.
+    pub fn empty() -> Self {
+        Self {
+            water_slots: Vec::new(),
+            verts: Vec::new(),
+            indices: Vec::new(),
+            parts: Vec::new(),
+            texture_ids: Vec::new(),
+        }
+    }
+
+    /// [`empty`] + declared texture slots: a renderer built from it still
+    /// creates one texture bind group per slot, so later `set_mesh` calls
+    /// may reference any of the first `n_tex` texture ids.  Used to
+    /// pre-warm the live road-stroke layer.
+    pub fn empty_with_slots(n_tex: usize) -> Self {
+        let mut m = Self::empty();
+        m.texture_ids = (0..n_tex as u32).collect();
+        m
+    }
+}
+
 pub struct ModelRenderer {
     pipeline: wgpu::RenderPipeline,
     pipeline_water: wgpu::RenderPipeline,
@@ -359,6 +383,7 @@ pub struct ModelRenderer {
     model_buf: wgpu::Buffer,
     vbuf: wgpu::Buffer,
     ibuf: wgpu::Buffer,
+    tex_bgs: Vec<wgpu::BindGroup>,
     parts: Vec<(ModelPart, wgpu::BindGroup, bool)>,
 }
 
@@ -652,8 +677,66 @@ impl ModelRenderer {
             model_buf,
             vbuf,
             ibuf,
+            tex_bgs,
             parts,
         }
+    }
+
+    /// Swap the geometry in place — fresh vertex/index buffers and part
+    /// ranges, while the pipeline and the texture bind groups stay.  The
+    /// mesh must use the same texture slots this renderer was built with
+    /// (the road textures are process-cached, so the live preview always
+    /// does).  Meant for per-interaction rebuilds: shader compilation and
+    /// texture uploads are not repeated.
+    pub fn set_mesh(&mut self, device: &wgpu::Device, mesh: &ModelMesh) {
+        use wgpu::util::DeviceExt;
+        static DV: ModelVertex = ModelVertex {
+            pos: [0.0; 3],
+            uv: [0.0; 2],
+            nrm: [0.0; 3],
+            anim: 0.0,
+        };
+        static DI: [u32; 1] = [0];
+        let vbuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("model-verts"),
+            contents: if mesh.verts.is_empty() {
+                bytemuck::bytes_of(&DV)
+            } else {
+                bytemuck::cast_slice(&mesh.verts)
+            },
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        let ibuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("model-indices"),
+            contents: if mesh.indices.is_empty() {
+                bytemuck::bytes_of(&DI)
+            } else {
+                bytemuck::cast_slice(&mesh.indices)
+            },
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        self.parts = mesh
+            .parts
+            .iter()
+            .map(|p| {
+                let bg = self
+                    .tex_bgs
+                    .get(p.texture as usize)
+                    .expect("texture slot out of range for set_mesh")
+                    .clone();
+                (
+                    ModelPart {
+                        first_index: p.first_index,
+                        index_count: p.index_count,
+                        texture: p.texture,
+                    },
+                    bg,
+                    mesh.water_slots.contains(&p.texture),
+                )
+            })
+            .collect();
+        self.vbuf = vbuf;
+        self.ibuf = ibuf;
     }
 
     pub fn set_params(&self, queue: &wgpu::Queue, params: &Params) {
