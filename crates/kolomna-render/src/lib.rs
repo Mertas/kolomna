@@ -44,6 +44,7 @@ pub mod assets;
 pub mod procgen;
 pub mod streets;
 pub mod summer_garden;
+pub mod terrain_gen;
 
 pub const VIEW_W: u32 = 1600;
 pub const VIEW_H: u32 = 1200;
@@ -358,6 +359,10 @@ pub fn smooth_field(vals: &[f32], wl: f32) -> Vec<f32> {
 /// continuously in the shader, so no per-cell classification squares exist.
 pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     let n = grid_side(vals);
+    // grid step in cells: 129 nodes span 128 cells (16 m); a 513-node grid
+    // spans the same 128 cells at 4 m — the render mesh samples finer so
+    // slopes show no visible triangle facets
+    let step = 128.0 / (n as f32 - 1.0);
     // clamped + blurred field (see smooth_field): geometry and normals treat
     // the water bed as the surface
     let hc = smooth_field(vals, wl);
@@ -371,8 +376,8 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let xr = (gx + 1).min(n - 1);
             let yl = gy.saturating_sub(1);
             let yr = (gy + 1).min(n - 1);
-            let wx = if gx == 0 || gx + 1 == n { 1.0 } else { 2.0 };
-            let wy = if gy == 0 || gy + 1 == n { 1.0 } else { 2.0 };
+            let wx = if gx == 0 || gx + 1 == n { step } else { 2.0 * step };
+            let wy = if gy == 0 || gy + 1 == n { step } else { 2.0 * step };
             let dzdx = (hc[gy * n + xr] - hc[gy * n + xl]) / wx * ZSCALE;
             let dzdy = (hc[yr * n + gx] - hc[yl * n + gx]) / wy * ZSCALE;
             let inv = 1.0 / (dzdx * dzdx + dzdy * dzdy + 1.0).sqrt();
@@ -393,14 +398,15 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let layer: f32 = if is_water {
                 0.0
             } else {
-                // three grass tints by altitude, dithered at the band edges
+                // grass tints by altitude, mottled by a soft forest noise so
+                // woodland and meadow edges come out organic, not banded
                 let hsh =
                     (cx as u32).wrapping_mul(73_856_093) ^ (cy as u32).wrapping_mul(19_349_663);
                 let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
-                let h = havg + jit;
-                if h > wl + 60.0 {
+                let h = havg + jit + crate::terrain_gen::forest_noise(cx as f32 * step, cy as f32 * step);
+                if h > wl + 52.0 {
                     LAYER_GRASS_DARK
-                } else if h > wl + 25.0 {
+                } else if h > wl + 22.0 {
                     LAYER_GRASS_MID
                 } else {
                     LAYER_GRASS_LIGHT
@@ -428,10 +434,10 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 normals[(cy + 1) * n + cx],
                 normals[(cy + 1) * n + cx + 1],
             );
-            let x0 = cx as f32;
-            let x1 = (cx + 1) as f32;
-            let y0 = cy as f32;
-            let y1 = (cy + 1) as f32;
+            let x0 = cx as f32 * step;
+            let x1 = (cx + 1) as f32 * step;
+            let y0 = cy as f32 * step;
+            let y1 = (cy + 1) as f32 * step;
             // continuous UV: shared corners share UVs -> texture flows across cells
             let (u0, u1) = (x0 / REPEAT_CELLS, x1 / REPEAT_CELLS);
             let (v0, v1) = (y0 / REPEAT_CELLS, y1 / REPEAT_CELLS);
@@ -490,10 +496,12 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     let tint = |gx: usize, gy: usize| -> f32 {
         let hsh = (gx as u32).wrapping_mul(73_856_093) ^ (gy as u32).wrapping_mul(19_349_663);
         let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
-        let h = hc[gy * n + gx] + jit;
-        if h > wl + 60.0 {
+        let h = hc[gy * n + gx]
+            + jit
+            + crate::terrain_gen::forest_noise(gx as f32 * step, gy as f32 * step);
+        if h > wl + 52.0 {
             LAYER_GRASS_DARK
-        } else if h > wl + 25.0 {
+        } else if h > wl + 22.0 {
             LAYER_GRASS_MID
         } else {
             LAYER_GRASS_LIGHT
@@ -515,7 +523,10 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let z0 = zof(hc[g0y * n + g0x]);
             let z1 = zof(hc[g1y * n + g1x]);
             let (l0, l1) = (tint(g0x, g0y), tint(g1x, g1y));
-            let (p0, p1) = ([g0x as f32, g0y as f32], [g1x as f32, g1y as f32]);
+            let (p0, p1) = (
+                [g0x as f32 * step, g0y as f32 * step],
+                [g1x as f32 * step, g1y as f32 * step],
+            );
             let (q0, q1) = (
                 [p0[0] + out_xy[0] * SHELF_W, p0[1] + out_xy[1] * SHELF_W],
                 [p1[0] + out_xy[0] * SHELF_W, p1[1] + out_xy[1] * SHELF_W],
@@ -586,7 +597,7 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     ] {
         let z = zof(hc[cy * n + cx]) - drop;
         let l = tint(cx, cy);
-        let (x0, y0) = (cx as f32, cy as f32);
+        let (x0, y0) = (cx as f32 * step, cy as f32 * step);
         let a = [x0, y0];
         let b = [x0 + sx * SHELF_W, y0];
         let c = [x0 + sx * SHELF_W, y0 + sy * SHELF_W];

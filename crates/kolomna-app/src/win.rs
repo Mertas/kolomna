@@ -16,12 +16,10 @@ use std::error::Error;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kolomna_render::assets::fsh_rgba_search;
 use kolomna_render::model::{ModelMesh, ModelRenderer, PlacedModel};
-use kolomna_render::road::{build_road_mesh, load_road_tiles, RoadMesh, RoadRenderer};
 use kolomna_render::{
-    Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, load_atlas,
-    load_terrain, smooth_field, water_level, write_png,
+    Params, TerrainRenderer, VIEW_H, VIEW_W, Vertex, ZSCALE, build_mesh, grid_side, smooth_field,
+    write_png,
 };
 use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
@@ -94,9 +92,6 @@ pub struct Scene {
     anchor: [f32; 2],
     eu: [f32; 2],
     nvec: [f32; 2],
-    /// road network from the save (16 m tiles)
-    road_mesh: RoadMesh,
-    road_textures: Vec<(u32, u32, Vec<u8>)>,
     /// generated Petersburg tenements (mesh, textures, model origin, world rot)
     village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
     /// index of the courtyard-boundary overlay inside `village`
@@ -770,57 +765,42 @@ fn overlay_ribbons(
     bld.finish(1)
 }
 
-pub fn load_scene(
-    city: &str,
-    dat: &str,
-    user: &UserPlan,
-    skip_proc: bool,
-) -> Result<Scene, Box<dyn Error>> {
-    let mut terrain = load_terrain(city)?;
+pub fn load_scene(user: &UserPlan, skip_proc: bool) -> Result<Scene, Box<dyn Error>> {
+    // fully procedural terrain — nothing external involved
+    let seed: u64 = std::env::var("KOLOMNA_SEED")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x5EED_1957);
+    let world = kolomna_render::terrain_gen::generate(seed);
+    let terrain = world.coarse;
     let n = grid_side(&terrain);
     if n * n != terrain.len() {
         return Err(format!("terrain grid is not square ({} values)", terrain.len()).into());
     }
-    let mn = terrain.iter().copied().fold(f32::INFINITY, f32::min);
-    let mx = terrain.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let wl = water_level(&terrain, mn);
-    println!("terrain: {n}x{n} vertices, altitude {mn:.1}..{mx:.1} m, water surface {wl:.2} m");
+    let mn = world.mn;
+    let mx = world.mx;
+    let wl = world.wl;
+    println!(
+        "terrain: {n}x{n} generated (seed {seed:#x}), altitude {mn:.1}..{mx:.1} m, water surface {wl:.2} m"
+    );
 
-    let atlas = load_atlas(dat)?;
-    println!("atlas: 6 textures -> 256x256 px layers");
+    let atlas = kolomna_render::terrain_gen::terrain_textures();
+    println!("atlas: 6 procedural textures -> 256x256 px layers");
 
     // (the terrain mesh is built after the tenement pads are levelled below)
 
-    // ---- road network from the save (one 16 m tile per record)
-    let tiles = load_road_tiles(city)?;
-    println!("roads: {} tiles", tiles.len());
-    let road_mesh = build_road_mesh(&tiles, mn, wl);
-    let mut road_textures = Vec::new();
-    for id in &road_mesh.texture_ids {
-        road_textures.push(fsh_rgba_search(dat, *id)?);
-    }
-    println!("road textures: {}", road_textures.len());
-
-    // (The 3DMD house family is retired from the scene — the focus is now the
-    // generated Petersburg tenements; the 3DMD parser stays for the examples.)
-    let t = &tiles[tiles.len() / 2];
-    let alt = (t.verts[0][1] + t.verts[2][1]) * 0.5;
-    let anchor = [
-        (t.verts[0][0] + t.verts[2][0]) * 0.5 / 16.0,
-        (t.verts[0][2] + t.verts[2][2]) * 0.5 / 16.0 - 1.0,
-    ];
+    // ---- plan frame: the street runs west -> east along the river bank ---
+    let anchor = [64.0f32, 64.0f32];
     println!(
-        "street anchor at cell ({:.1}, {:.1}), altitude {alt:.1} m",
+        "city plan anchor at cell ({:.1}, {:.1}) — the street runs along +x",
         anchor[0], anchor[1]
     );
-    let mut dx = t.verts[1][0] - t.verts[0][0];
-    let mut dz = t.verts[1][2] - t.verts[0][2];
-    let dl = (dx * dx + dz * dz).sqrt().max(1e-6);
-    dx /= dl;
-    dz /= dl;
+    let dx = 1.0f32;
+    let dz = 0.0f32;
 
-    // ---- terrain field + mesh (the houses adapt to it, not vice versa) ----
-    let base = build_mesh(&terrain, mn, mx, wl);
+    // ---- terrain field + mesh (the houses adapt to it, not vice versa) ---
+    // the render mesh samples the generator at 4 m so slopes stay smooth
+    let base = build_mesh(&world.fine, mn, mx, wl);
     let sm = smooth_field(&terrain, wl);
     println!("mesh: {} triangles", base.len() / 3);
 
@@ -1091,8 +1071,6 @@ pub fn load_scene(
         anchor,
         eu,
         nvec,
-        road_mesh,
-        road_textures,
         village,
         plan_idx,
         roads_idx,
@@ -1106,7 +1084,7 @@ pub fn load_scene(
 
 /// Headless mode: render exactly one frame offscreen with the default camera
 /// (`zoom` scales the framing; 1.0 = whole grid) and write it as a PNG.
-pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
+pub fn shot(out: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
     // hidden headless test hatch (KOLOMNA_PLAN_DEMO=1): a demo drawing so
     // the editor's generators can be exercised without a mouse — a road
     // chain, a courtyard quad and a park contour, all in plan coords
@@ -1141,7 +1119,7 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
         UserPlan::default()
     };
     let only = std::env::var("KOLOMNA_ONLY_USER").is_ok();
-    let scene = load_scene(city, dat, &user, only)?;
+    let scene = load_scene(&user, only)?;
     let mut placed = Vec::new();
     for (mesh, texs, pos, rot) in &scene.village {
         placed.push(PlacedModel {
@@ -1486,7 +1464,6 @@ struct Renderer {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     terrain: TerrainRenderer,
-    road: RoadRenderer,
     village: Vec<ModelRenderer>,
     /// index of the courtyard boundary overlay inside `village`
     plan_idx: usize,
@@ -1550,14 +1527,6 @@ impl Renderer {
             scene.mn,
             scene.wl,
         );
-        let road = RoadRenderer::new(
-            &device,
-            &queue,
-            config.format,
-            4,
-            &scene.road_mesh,
-            &scene.road_textures,
-        );
         let village: Vec<ModelRenderer> = scene
             .village
             .iter()
@@ -1576,7 +1545,6 @@ impl Renderer {
             queue,
             config,
             terrain,
-            road,
             village,
             plan_idx: scene.plan_idx,
             roads_idx: scene.roads_idx,
@@ -2324,8 +2292,6 @@ pub fn ui_shot(path: &str) {
 
 
 struct App {
-    city: String,
-    dat: String,
     window: Option<Arc<Window>>,
     scene: Option<Scene>,
     renderer: Option<Renderer>,
@@ -2360,13 +2326,7 @@ impl ApplicationHandler for App {
         if self.window.is_some() {
             return;
         }
-        let title = format!(
-            "Kolomna — {}",
-            std::path::Path::new(&self.city)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| self.city.clone())
-        );
+        let title = "Kolomna — сгенерированный город".to_string();
         let attrs = Window::default_attributes()
             .with_title(title)
             .with_inner_size(PhysicalSize::new(VIEW_W, VIEW_H));
@@ -2377,7 +2337,7 @@ impl ApplicationHandler for App {
                 std::process::exit(1);
             }
         };
-        let scene = match load_scene(&self.city, &self.dat, &self.user, false) {
+        let scene = match load_scene(&self.user, false) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("error: {e}");
@@ -2950,13 +2910,9 @@ impl ApplicationHandler for App {
                             self.fps_acc = 0.0;
                             self.frames = 0;
                             if let Some(w) = self.window.as_ref() {
-                                let stem = std::path::Path::new(&self.city)
-                                    .file_stem()
-                                    .map(|s| s.to_string_lossy().into_owned())
-                                    .unwrap_or_default();
                                 let deg = cam.rot.to_degrees().round() as i32;
                                 w.set_title(&format!(
-                                    "Kolomna — {stem} · {fps:.0} fps · зум ×{:.2} · {deg}°",
+                                    "Kolomna · {fps:.0} fps · зум ×{:.2} · {deg}°",
                                     cam.zoom
                                 ));
                             }
@@ -3840,12 +3796,10 @@ impl App {
 }
 
 /// Interactive mode: open a window and run the event loop until the user quits.
-pub fn run(city: &str, dat: &str) -> Result<(), Box<dyn Error>> {
+pub fn run() -> Result<(), Box<dyn Error>> {
     let event_loop = EventLoop::new()?;
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App {
-        city: city.to_string(),
-        dat: dat.to_string(),
         window: None,
         scene: None,
         renderer: None,
