@@ -73,9 +73,7 @@ pub const SOURCES: [(u32, u32); 6] = [
     (0x891b0e1a, 0x00000034),
     (0x891b0e1a, 0x00000035),
 ];
-const LAYER_GRASS_MID: f32 = 4.0;
-const LAYER_GRASS_LIGHT: f32 = 5.0;
-const LAYER_GRASS_DARK: f32 = 1.0;
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -85,7 +83,8 @@ pub struct Vertex {
     pub uv: [f32; 2],
     /// water bed depth in meters (>= 0.10) for water vertices; -1 for dry land
     pub wdep: f32,
-    /// green texture layer for land vertices (ignored for water)
+    /// continuous grass-blend coordinate: metres above water + forest noise
+    /// (ignored for water; the shader blends the three greens over it)
     pub layer: f32,
     /// smooth mesh-space normal (for land lighting and slope blending)
     pub nrm: [f32; 3],
@@ -218,14 +217,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     let lit = 0.72 + 0.38 * max(dot(n, l), 0.0);
-    let g = textureSample(atlas, samp, in.uv, i32(in.layer + 0.5));
+    // grass: CONTINUOUS three-way blend over `layer` (metres above water with
+    // forest noise) — soft organic meadow/wood edges, never per-cell squares
+    let t1 = smoothstep(20.0, 26.0, in.layer);
+    let t2 = smoothstep(48.0, 56.0, in.layer);
+    let gm = textureSample(atlas, samp, in.uv, 4).rgb;
+    let g = mix(mix(textureSample(atlas, samp, in.uv, 5).rgb, gm, t1),
+                textureSample(atlas, samp, in.uv, 1).rgb, t2);
     // sand: CONTINUOUS fade by metres above the water plane — a hard per-cell
     // rule here was what cut green squares into sandy slopes.
     let zs = 0.035; // ZSCALE (mesh units per metre)
     let above = (in.wpos.z - params.water_z) / zs;
     let ws = 1.0 - smoothstep(0.5, 3.5, above);
     let sand = textureSample(atlas, samp, in.uv, 2);
-    var col = mix(g.rgb, sand.rgb, ws);
+    var col = mix(g, sand.rgb, ws);
     // cliffs: blend dirt/rock by slope from the smooth normals; the sample is
     // TRIPLANAR (top + both vertical faces, weighted by n^2) so steep slopes
     // show no stretched streaks and no cell-shaped patches.
@@ -367,6 +372,12 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     // the water bed as the surface
     let hc = smooth_field(vals, wl);
     let zof = |h: f32| (h.max(wl) - mn) * ZSCALE;
+    // metres above the water level with the soft forest noise folded in — the
+    // continuous coordinate the fragment shader blends the three greens over;
+    // no per-cell classification => no square dither at any mesh resolution
+    let lay = |gx: usize, gy: usize| -> f32 {
+        hc[gy * n + gx] - wl + crate::terrain_gen::forest_noise(gx as f32 * step, gy as f32 * step)
+    };
 
     // per-grid-vertex normals in mesh units (central differences, one-sided at borders)
     let mut normals = vec![[0.0f32, 0.0, 1.0]; n * n];
@@ -395,22 +406,16 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             let havg = (h00 + h10 + h01 + h11) * 0.25;
 
             let is_water = havg <= wl + 0.02;
-            let layer: f32 = if is_water {
-                0.0
+            // per-vertex grass blend coordinate — water vertices keep 0.0
+            let (l00, l10, l01, l11) = if is_water {
+                (0.0, 0.0, 0.0, 0.0)
             } else {
-                // grass tints by altitude, mottled by a soft forest noise so
-                // woodland and meadow edges come out organic, not banded
-                let hsh =
-                    (cx as u32).wrapping_mul(73_856_093) ^ (cy as u32).wrapping_mul(19_349_663);
-                let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
-                let h = havg + jit + crate::terrain_gen::forest_noise(cx as f32 * step, cy as f32 * step);
-                if h > wl + 52.0 {
-                    LAYER_GRASS_DARK
-                } else if h > wl + 22.0 {
-                    LAYER_GRASS_MID
-                } else {
-                    LAYER_GRASS_LIGHT
-                }
+                (
+                    lay(cx, cy),
+                    lay(cx + 1, cy),
+                    lay(cx, cy + 1),
+                    lay(cx + 1, cy + 1),
+                )
             };
 
             // per-vertex bed depth in meters for the water shader; -1 = dry land
@@ -445,42 +450,42 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 pos: [x0, y0, z00],
                 uv: [u0, v0],
                 wdep: d00,
-                layer,
+                layer: l00,
                 nrm: n00,
             });
             verts.push(Vertex {
                 pos: [x1, y0, z10],
                 uv: [u1, v0],
                 wdep: d10,
-                layer,
+                layer: l10,
                 nrm: n10,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
                 wdep: d11,
-                layer,
+                layer: l11,
                 nrm: n11,
             });
             verts.push(Vertex {
                 pos: [x0, y0, z00],
                 uv: [u0, v0],
                 wdep: d00,
-                layer,
+                layer: l00,
                 nrm: n00,
             });
             verts.push(Vertex {
                 pos: [x1, y1, z11],
                 uv: [u1, v1],
                 wdep: d11,
-                layer,
+                layer: l11,
                 nrm: n11,
             });
             verts.push(Vertex {
                 pos: [x0, y1, z01],
                 uv: [u0, v1],
                 wdep: d01,
-                layer,
+                layer: l01,
                 nrm: n01,
             });
         }
@@ -493,20 +498,7 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
     const DROP_M: f32 = 5.0; // metres of the boundary cliff
     const SHELF_W: f32 = 1.75; // cells of the outward shelf
     let drop = DROP_M * ZSCALE;
-    let tint = |gx: usize, gy: usize| -> f32 {
-        let hsh = (gx as u32).wrapping_mul(73_856_093) ^ (gy as u32).wrapping_mul(19_349_663);
-        let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
-        let h = hc[gy * n + gx]
-            + jit
-            + crate::terrain_gen::forest_noise(gx as f32 * step, gy as f32 * step);
-        if h > wl + 52.0 {
-            LAYER_GRASS_DARK
-        } else if h > wl + 22.0 {
-            LAYER_GRASS_MID
-        } else {
-            LAYER_GRASS_LIGHT
-        }
-    };
+    let tint = |gx: usize, gy: usize| -> f32 { lay(gx, gy) };
     // mesh z -> uv units at the same texel density as the ground (16 m <-> 1 cell)
     let zcell = |z: f32| z / (16.0 * ZSCALE * REPEAT_CELLS);
     let edge = |verts: &mut Vec<Vertex>, pts: &[(usize, usize)], out_xy: [f32; 2], u_along: bool| {
