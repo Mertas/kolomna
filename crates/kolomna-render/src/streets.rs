@@ -641,8 +641,19 @@ fn st_lamp(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32) {
     cyl(b, ctx, p, 0.045, 0.02, z + 4.38, z + 4.56, 5, M_IRON, 0.6);
 }
 
-/// Street tree: trunk plus two or three jittered crowns (three habits).
-fn st_tree(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, s: f32, v: u32) {
+/// Street tree: trunk plus two or three jittered crowns (three habits);
+/// the sidewalk tree stands in a low granite kerb surround (tree pit).
+fn st_tree(b: &mut Builder, ctx: &Ctx, p: [f32; 2], z: f32, s: f32, v: u32, along: [f32; 2]) {
+    // tree pit: granite kerb rim + soil bed, aligned with the street
+    let lat = vperp(along);
+    let a = |to: f32, fo: f32| -> [f32; 2] { vadd(p, vadd(vmul(along, to), vmul(lat, fo))) };
+    for fo in [0.715f32, -0.715] {
+        obb(b, ctx, a(-0.775, fo), a(0.775, fo), 0.12, z, z + 0.14, M_KERB, 0.9);
+    }
+    for to in [0.715f32, -0.715] {
+        obb(b, ctx, a(to, -0.655), a(to, 0.655), 0.12, z, z + 0.14, M_KERB, 0.9);
+    }
+    obb(b, ctx, a(-0.655, 0.0), a(0.655, 0.0), 1.31, z, z + 0.115, M_BARK, 1.2);
     let mut rng = Rng::new((v as u64).wrapping_mul(0x9E37_79B9) | 1);
     let variant = (v >> 5) % 3;
     let trunk_top = match variant {
@@ -938,11 +949,12 @@ fn street_furniture(
                     st_lamp(b, ctx, p, z);
                     if variant % 5 == 1 {
                         let (bp, bz, _, _) = get(ss + 2.6, side * (x_lamp + 1.35));
-                        let face = if side > 0.0 { vmul(outw, -1.0) } else { outw };
+                        // back to the sidewalk, seat facing the roadway
+                        let face = if side > 0.0 { outw } else { vmul(outw, -1.0) };
                         st_bench(b, ctx, bp, bz, face);
                     }
                 }
-                1 => st_tree(b, ctx, p, z, 0.80 + ((j >> 20) & 7) as f32 * 0.035, variant),
+                1 => st_tree(b, ctx, p, z, 0.80 + ((j >> 20) & 7) as f32 * 0.035, variant, along),
                 2 => st_bush(b, ctx, p, z, variant),
                 _ => st_sign(b, ctx, p, z, along),
             }
@@ -1055,6 +1067,170 @@ pub fn near_poly(pts: &[[f32; 2]], p: [f32; 2]) -> ([f32; 2], f32) {
         }
     }
     best
+}
+
+/// The smoothed centre line of a chain (the same fillet path the mesh uses)
+/// — house clearing and park splitting measure against the road as drawn.
+pub fn smooth_path(pts: &[[f32; 2]]) -> Vec<[f32; 2]> {
+    smooth_chain(pts, 9.0).0
+}
+
+/// Nearest point on a polyline plus the local unit normal (its direction
+/// rotated 90°); used to snap onto a road's cross-section edge.
+pub fn near_poly_n(pts: &[[f32; 2]], p: [f32; 2]) -> ([f32; 2], [f32; 2], f32) {
+    let mut best = (p, [0.0f32, 1.0], f32::MAX);
+    for k in 0..pts.len().saturating_sub(1) {
+        let a = pts[k];
+        let ab = vsub(pts[k + 1], a);
+        let l2 = ab[0] * ab[0] + ab[1] * ab[1];
+        if l2 < 1e-9 {
+            continue;
+        }
+        let t = (((p[0] - a[0]) * ab[0] + (p[1] - a[1]) * ab[1]) / l2).clamp(0.0, 1.0);
+        let q = vadd(a, vmul(ab, t));
+        let d = vlen(vsub(p, q));
+        if d < best.2 {
+            let dir = vunit(ab);
+            best = (q, [-dir[1], dir[0]], d);
+        }
+    }
+    best
+}
+
+/// Shortest distance between two segments.
+pub fn seg_seg_dist(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> f32 {
+    let seg_pt = |p: [f32; 2], q0: [f32; 2], q1: [f32; 2]| -> f32 {
+        let d = vsub(q1, q0);
+        let l2 = d[0] * d[0] + d[1] * d[1];
+        if l2 < 1e-9 {
+            return vlen(vsub(p, q0));
+        }
+        let t = (((p[0] - q0[0]) * d[0] + (p[1] - q0[1]) * d[1]) / l2).clamp(0.0, 1.0);
+        vlen(vsub(p, vadd(q0, vmul(d, t))))
+    };
+    let d1 = vsub(a1, a0);
+    let d2 = vsub(b1, b0);
+    let den = d1[0] * d2[1] - d1[1] * d2[0];
+    if den.abs() > 1e-6 {
+        let r = vsub(b0, a0);
+        let t = (r[0] * d2[1] - r[1] * d2[0]) / den;
+        let s = (r[0] * d1[1] - r[1] * d1[0]) / den;
+        if (0.0..=1.0).contains(&t) && (0.0..=1.0).contains(&s) {
+            return 0.0;
+        }
+    }
+    seg_pt(a0, b0, b1)
+        .min(seg_pt(a1, b0, b1))
+        .min(seg_pt(b0, a0, a1))
+        .min(seg_pt(b1, a0, a1))
+}
+
+/// Signed area of a closed polygon.
+fn poly_area(p: &[[f32; 2]]) -> f32 {
+    let mut s = 0.0f32;
+    for k in 0..p.len() {
+        let a = p[k];
+        let e = p[(k + 1) % p.len()];
+        s += a[0] * e[1] - e[0] * a[1];
+    }
+    (s * 0.5).abs()
+}
+
+/// Sutherland–Hodgman clip of a closed polygon against a half-plane given
+/// by its signed distance function `keep`.
+fn clip_half(part: &[[f32; 2]], a: [f32; 2], nrm: [f32; 2], keep: impl Fn(f32) -> bool) -> Vec<[f32; 2]> {
+    let sd = |p: [f32; 2]| (p[0] - a[0]) * nrm[0] + (p[1] - a[1]) * nrm[1];
+    let mut out: Vec<[f32; 2]> = Vec::new();
+    for k in 0..part.len() {
+        let c = part[k];
+        let e = part[(k + 1) % part.len()];
+        let (sc, se) = (sd(c), sd(e));
+        if keep(sc) {
+            out.push(c);
+        }
+        if keep(sc) != keep(se) {
+            let t = sc / (sc - se);
+            out.push([c[0] + (e[0] - c[0]) * t, c[1] + (e[1] - c[1]) * t]);
+        }
+    }
+    out
+}
+
+/// Cut a park outline by the road corridors that cross it: each smoothed
+/// road segment splits every part it truly crosses into the two halves
+/// pulled `margin` metres off the centre line, so the fence then runs
+/// parallel to the roadway.  Slivers below the size floor are dropped;
+/// a road-free outline comes back whole.
+pub fn split_outline_by_chains(
+    outline: &[[f32; 2]],
+    chains: &[Vec<[f32; 2]>],
+    margin: f32,
+) -> Vec<Vec<[f32; 2]>> {
+    let mut parts: Vec<Vec<[f32; 2]>> = vec![outline.to_vec()];
+    for ch in chains {
+        if ch.len() < 2 {
+            continue;
+        }
+        let (path, _) = smooth_chain(ch, 9.0);
+        for w in path.windows(2) {
+            let (a, e) = (w[0], w[1]);
+            let l = vlen(vsub(e, a));
+            if l < 0.15 {
+                continue;
+            }
+            let dir = vmul(vsub(e, a), 1.0 / l);
+            let nrm = [-dir[1], dir[0]];
+            let sd = |p: [f32; 2]| (p[0] - a[0]) * nrm[0] + (p[1] - a[1]) * nrm[1];
+            let mut next: Vec<Vec<[f32; 2]>> = Vec::new();
+            for part in parts.drain(..) {
+                let straddles =
+                    part.iter().any(|&p| sd(p) < -margin) && part.iter().any(|&p| sd(p) > margin);
+                let mut touch = f32::MAX;
+                if straddles {
+                    for k in 0..part.len() {
+                        touch = touch
+                            .min(seg_seg_dist(a, e, part[k], part[(k + 1) % part.len()]));
+                    }
+                }
+                if !straddles || touch > margin + 2.0 {
+                    next.push(part);
+                    continue;
+                }
+                let lo = clip_half(&part, a, nrm, |s| s <= -margin);
+                let hi = clip_half(&part, a, nrm, |s| s >= margin);
+                let ok_lo = lo.len() >= 3 && poly_area(&lo) > 40.0;
+                let ok_hi = hi.len() >= 3 && poly_area(&hi) > 40.0;
+                if ok_lo {
+                    next.push(lo);
+                }
+                if ok_hi {
+                    next.push(hi);
+                }
+                if !ok_lo && !ok_hi {
+                    // the cut left nothing viable: keep the part as it was
+                    next.push(part);
+                }
+            }
+            parts = next;
+        }
+    }
+    parts.retain(|p| {
+        let mut u0 = f32::MAX;
+        let mut u1 = f32::MIN;
+        let mut v0 = f32::MAX;
+        let mut v1 = f32::MIN;
+        for q in p {
+            u0 = u0.min(q[0]);
+            u1 = u1.max(q[0]);
+            v0 = v0.min(q[1]);
+            v1 = v1.max(q[1]);
+        }
+        (u1 - u0) >= 6.0 && (v1 - v0) >= 6.0 && poly_area(p) >= 250.0
+    });
+    if parts.is_empty() {
+        parts.push(outline.to_vec());
+    }
+    parts
 }
 
 /// Direction of the polyline segment nearest to p.

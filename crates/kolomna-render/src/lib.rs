@@ -479,6 +479,128 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             });
         }
     }
+
+    // ------------------------------------------------------- map edge skirt:
+    // the tile rides on a plateau, as a city tile does: along the whole
+    // boundary the ground drops several metres in a short cliff, then a shelf
+    // runs outward so the view never falls off the edge into void.
+    const DROP_M: f32 = 5.0; // metres of the boundary cliff
+    const SHELF_W: f32 = 1.75; // cells of the outward shelf
+    let drop = DROP_M * ZSCALE;
+    let tint = |gx: usize, gy: usize| -> f32 {
+        let hsh = (gx as u32).wrapping_mul(73_856_093) ^ (gy as u32).wrapping_mul(19_349_663);
+        let jit = ((hsh >> 8) & 0xff) as f32 / 255.0 * 16.0 - 8.0;
+        let h = hc[gy * n + gx] + jit;
+        if h > wl + 60.0 {
+            LAYER_GRASS_DARK
+        } else if h > wl + 25.0 {
+            LAYER_GRASS_MID
+        } else {
+            LAYER_GRASS_LIGHT
+        }
+    };
+    // mesh z -> uv units at the same texel density as the ground (16 m <-> 1 cell)
+    let zcell = |z: f32| z / (16.0 * ZSCALE * REPEAT_CELLS);
+    let edge = |verts: &mut Vec<Vertex>, pts: &[(usize, usize)], out_xy: [f32; 2], u_along: bool| {
+        let uvw = |p: [f32; 2], z: f32| -> [f32; 2] {
+            if u_along {
+                [p[0] / REPEAT_CELLS, zcell(z)]
+            } else {
+                [zcell(z), p[1] / REPEAT_CELLS]
+            }
+        };
+        for k in 0..pts.len() - 1 {
+            let (g0x, g0y) = pts[k];
+            let (g1x, g1y) = pts[k + 1];
+            let z0 = zof(hc[g0y * n + g0x]);
+            let z1 = zof(hc[g1y * n + g1x]);
+            let (l0, l1) = (tint(g0x, g0y), tint(g1x, g1y));
+            let (p0, p1) = ([g0x as f32, g0y as f32], [g1x as f32, g1y as f32]);
+            let (q0, q1) = (
+                [p0[0] + out_xy[0] * SHELF_W, p0[1] + out_xy[1] * SHELF_W],
+                [p1[0] + out_xy[0] * SHELF_W, p1[1] + out_xy[1] * SHELF_W],
+            );
+            let wn = [out_xy[0], out_xy[1], 0.0];
+            // cliff wall (vertical; the slope blend turns it into a dirt face)
+            for (pos, layer, uv) in [
+                ([p0[0], p0[1], z0], l0, uvw(p0, z0)),
+                ([p1[0], p1[1], z1], l1, uvw(p1, z1)),
+                ([p1[0], p1[1], z1 - drop], l1, uvw(p1, z1 - drop)),
+                ([p0[0], p0[1], z0 - drop], l0, uvw(p0, z0 - drop)),
+            ] {
+                verts.push(Vertex {
+                    pos,
+                    uv,
+                    wdep: -1.0,
+                    layer,
+                    nrm: wn,
+                });
+            }
+            // shelf (flat, outward)
+            for (pos, layer, uv) in [
+                (
+                    [p0[0], p0[1], z0 - drop],
+                    l0,
+                    [p0[0] / REPEAT_CELLS, p0[1] / REPEAT_CELLS],
+                ),
+                (
+                    [p1[0], p1[1], z1 - drop],
+                    l1,
+                    [p1[0] / REPEAT_CELLS, p1[1] / REPEAT_CELLS],
+                ),
+                (
+                    [q1[0], q1[1], z1 - drop],
+                    l1,
+                    [q1[0] / REPEAT_CELLS, q1[1] / REPEAT_CELLS],
+                ),
+                (
+                    [q0[0], q0[1], z0 - drop],
+                    l0,
+                    [q0[0] / REPEAT_CELLS, q0[1] / REPEAT_CELLS],
+                ),
+            ] {
+                verts.push(Vertex {
+                    pos,
+                    uv,
+                    wdep: -1.0,
+                    layer,
+                    nrm: [0.0, 0.0, 1.0],
+                });
+            }
+        }
+    };
+    let front: Vec<(usize, usize)> = (0..n).map(|i| (i, 0)).collect();
+    let right: Vec<(usize, usize)> = (0..n).map(|i| (n - 1, i)).collect();
+    let back: Vec<(usize, usize)> = (0..n).map(|i| (n - 1 - i, n - 1)).collect();
+    let left: Vec<(usize, usize)> = (0..n).map(|i| (0, n - 1 - i)).collect();
+    edge(&mut verts, &front, [0.0, -1.0], true);
+    edge(&mut verts, &right, [1.0, 0.0], false);
+    edge(&mut verts, &back, [0.0, 1.0], true);
+    edge(&mut verts, &left, [-1.0, 0.0], false);
+    // corner shelves: flat squares filling the four corners of the ring
+    for &(cx, cy, sx, sy) in &[
+        (0usize, 0usize, -1.0f32, -1.0f32),
+        (n - 1, 0, 1.0, -1.0),
+        (n - 1, n - 1, 1.0, 1.0),
+        (0, n - 1, -1.0, 1.0),
+    ] {
+        let z = zof(hc[cy * n + cx]) - drop;
+        let l = tint(cx, cy);
+        let (x0, y0) = (cx as f32, cy as f32);
+        let a = [x0, y0];
+        let b = [x0 + sx * SHELF_W, y0];
+        let c = [x0 + sx * SHELF_W, y0 + sy * SHELF_W];
+        let d = [x0, y0 + sy * SHELF_W];
+        for p in [a, b, c, a, c, d] {
+            verts.push(Vertex {
+                pos: [p[0], p[1], z],
+                uv: [p[0] / REPEAT_CELLS, p[1] / REPEAT_CELLS],
+                wdep: -1.0,
+                layer: l,
+                nrm: [0.0, 0.0, 1.0],
+            });
+        }
+    }
     verts
 }
 

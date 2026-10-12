@@ -48,10 +48,32 @@ const ZOOM_MAX: f32 = 100.0;
 pub struct UserPlan {
     /// road chains: click-to-click polylines
     pub roads: Vec<Vec<[f32; 2]>>,
-    /// courtyards: exactly four clicks (CCW in plan)
-    pub blocks: Vec<[[f32; 2]; 4]>,
+    /// courtyards: >= 3 clicks, any polygon (CCW in plan)
+    pub blocks: Vec<Vec<[f32; 2]>>,
     /// parks: >= 3 contour clicks (CCW in plan)
     pub parks: Vec<Vec<[f32; 2]>>,
+}
+
+/// Footprint of one placed house (plan frame, metres) — roads remove the
+/// houses they cover and later blocks keep clear of those already standing.
+pub type HouseQuad = [[f32; 2]; 4];
+
+/// One built block: where its meshes live in `village` and the footprints of
+/// its houses, so a road can later remove exactly the houses on its way.
+pub struct BlkRec {
+    pub blk: u64,
+    /// outer plan ring, plan-frame metres (the shared frame of the roads)
+    pub q: Vec<[f32; 2]>,
+    pub usr: bool,
+    pub entries: Vec<usize>,
+    pub houses: Vec<HouseQuad>,
+}
+
+/// One drawn park: the outline as drawn plus the village entries of the
+/// gardens its parts became after the road splits.
+pub struct ParkRec {
+    pub outline: Vec<[f32; 2]>,
+    pub entries: Vec<usize>,
 }
 
 pub struct Scene {
@@ -85,22 +107,66 @@ pub struct Scene {
     streets_idx: usize,
     /// the street-grid layout: junction trims and road snapping use it
     net: kolomna_render::streets::Params,
+    /// built blocks: plan ring, house footprints and village entries
+    blk_records: Vec<BlkRec>,
+    /// drawn parks: outlines and the village entries of their parts
+    park_records: Vec<ParkRec>,
     /// camera focus for `--shot` (the middle block's anchor house)
     focus: [f32; 3],
 }
 
+/// What one block build produces: the meshes (plinth + house per entry),
+/// the plan rings for the boundary overlay (world metres), the street-layout
+/// edge (generated blocks only), the size report, the --shot focus, the
+/// plan-frame ring and the footprints of the houses that were built.
+struct BlkBuilt {
+    meshes: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
+    plan: (Vec<[f32; 2]>, Vec<[f32; 2]>),
+    edge: Option<(f32, f32, f32)>,
+    report: Vec<(f32, f32, f32)>,
+    focus: Option<[f32; 3]>,
+    q_plan: Vec<[f32; 2]>,
+    houses: Vec<HouseQuad>,
+}
+
+/// Inset ring: intersections of the offset lines of neighbouring sides —
+/// the courtyard corners (shared by the filler and the boundary overlay).
+fn inset_ring(q: &[[f32; 2]], depth: f32) -> Vec<[f32; 2]> {
+    let n = q.len();
+    let side = |i: usize| -> ([f32; 2], [f32; 2]) {
+        let a = q[i];
+        let b = q[(i + 1) % n];
+        let d = [b[0] - a[0], b[1] - a[1]];
+        let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-4);
+        let t = [d[0] / l, d[1] / l];
+        (t, [-t[1], t[0]])
+    };
+    let mut vv = Vec::with_capacity(n);
+    for i in 0..n {
+        let ip = (i + n - 1) % n;
+        let (t1, n1) = side(ip);
+        let (t2, n2) = side(i);
+        let p1 = [q[ip][0] + n1[0] * depth, q[ip][1] + n1[1] * depth];
+        let p2 = [q[i][0] + n2[0] * depth, q[i][1] + n2[1] * depth];
+        let den = t1[0] * t2[1] - t1[1] * t2[0];
+        let den = if den.abs() < 1e-6 { 1e-6 } else { den };
+        let u = ((p2[0] - p1[0]) * t2[1] - (p2[1] - p1[1]) * t2[0]) / den;
+        vv.push([p1[0] + t1[0] * u, p1[1] + t1[1] * u]);
+    }
+    vv
+}
+
 /// One courtyard block: generated (blk < 10) or editor-drawn (q_user is
-/// Some — the quad arrives already CCW in the plan frame).  The filler
-/// inscribes corner houses, rows of rectangles and closing trapezoids
-/// along the sides; every house is seated on the highest ground under
-/// its footprint and gets a ground-following plinth.  Returns the house
-/// meshes (plinth + house per entry), the plan outlines for the debug
-/// overlay, the street-layout edge (generated blocks only), the size
-/// report and the --shot focus when this is the focus block.
+/// Some — the polygon arrives already CCW in the plan frame, any vertices
+/// >= 3).  The filler inscribes corner houses, rows of rectangles and
+/// closing trapezoids along the sides; every house is seated on the highest
+/// ground under its footprint and gets a ground-following plinth.  Slots a
+/// drawn road covers — or one an earlier block already occupies — are left
+/// empty, so a road crossing a courtyard removes exactly the houses it hits.
 #[allow(clippy::too_many_arguments)]
 fn build_block(
     blk: u64,
-    q_user: Option<[[f32; 2]; 4]>,
+    q_user: Option<&[[f32; 2]]>,
     h_at: &dyn Fn(f32, f32) -> f32,
     anchor: [f32; 2],
     eu: [f32; 2],
@@ -109,18 +175,14 @@ fn build_block(
     wl: f32,
     want_focus: bool,
     focus_blk: u64,
-) -> (
-    Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)>,
-    ([[f32; 2]; 4], [[f32; 2]; 4]),
-    Option<(f32, f32, f32)>,
-    Vec<(f32, f32, f32)>,
-    Option<[f32; 3]>,
-) {
+    roads: &[Vec<[f32; 2]>],
+    avoid: &[HouseQuad],
+) -> BlkBuilt {
     let mut village: Vec<(ModelMesh, Vec<(u32, u32, Vec<u8>)>, [f32; 3], f32)> = Vec::new();
     let mut report: Vec<(f32, f32, f32)> = Vec::new(); // w, d, fall
     let mut edge: Option<(f32, f32, f32)> = None;
     let mut focus: Option<[f32; 3]> = None;
-    let plan_out: ([[f32; 2]; 4], [[f32; 2]; 4]);
+    let mut houses: Vec<HouseQuad> = Vec::new();
 
     let depth = 12.0f32; // one depth for the whole block: rows close exactly
     let setback = 18.0f32; // front facade distance from the street line
@@ -168,18 +230,17 @@ fn build_block(
     let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
     let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
 
-    // the block plan: an irregular quad (frame: a along the street, b
-    // inward), every vertex jittered — never a neat rectangle; the
-    // footprint varies per block so the variants differ.  A user block
-    // (blk >= 10) arrives exactly as the editor drew it — already CCW
-    // in this same plan frame — so the very same path fills it.
-    let mut q: [[f32; 2]; 4];
+    // the block plan: an irregular polygon (frame: a along the street, b
+    // inward), every vertex jittered — never a neat rectangle.  A user
+    // block (blk >= 10) arrives exactly as the editor drew it — any
+    // polygon with >= 3 vertices, already CCW in this same plan frame.
+    let mut q: Vec<[f32; 2]>;
     if usr {
-        q = q_user.unwrap();
+        q = q_user.unwrap().to_vec();
     } else {
         let a_half = 20.0 + rng.below(5) as f32 * 0.5; // front half width 20–22 m
         let b_len = 44.0 + rng.below(13) as f32; // block depth 44–56 m
-        q = [
+        q = vec![
             [u_off - a_half, setback],
             [u_off + a_half, setback],
             [u_off + a_half - 5.0, setback + b_len],
@@ -190,6 +251,7 @@ fn build_block(
             p[1] += (rng.f() - 0.5) * 7.0;
         }
     }
+    let n = q.len();
     if !usr {
         edge = Some((
             q[0][0].min(q[3][0]),
@@ -198,50 +260,67 @@ fn build_block(
         ));
     }
     // side i runs q[i] -> q[i+1]: unit tangent, inward normal, length
-    let side = |q: &[[f32; 2]; 4], i: usize| -> ([f32; 2], [f32; 2], f32) {
+    let side = |q: &[[f32; 2]], i: usize| -> ([f32; 2], [f32; 2], f32) {
         let a = q[i];
-        let b = q[(i + 1) % 4];
+        let b = q[(i + 1) % q.len()];
         let d = [b[0] - a[0], b[1] - a[1]];
         let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-4);
         let t = [d[0] / l, d[1] / l];
         ([t[0], t[1]], [-t[1], t[0]], l)
     };
-    let on_side = |q: &[[f32; 2]; 4], i: usize, a: f32| -> [f32; 2] {
+    let on_side = |q: &[[f32; 2]], i: usize, a: f32| -> [f32; 2] {
         let (t, _, _) = side(q, i);
         [q[i][0] + t[0] * a, q[i][1] + t[1] * a]
     };
-    let lens = [side(&q, 0).2, side(&q, 1).2, side(&q, 2).2, side(&q, 3).2];
+    let lens: Vec<f32> = (0..n).map(|i| side(&q, i).2).collect();
     // courtyard corners: intersections of neighbouring inward lines
-    let mut vv = [[0.0f32; 2]; 4];
-    for i in 0..4 {
-        let ip = (i + 3) % 4;
-        let (t1, n1, _) = side(&q, ip);
-        let (t2, n2, _) = side(&q, i);
-        let p1 = [q[ip][0] + n1[0] * depth, q[ip][1] + n1[1] * depth];
-        let p2 = [q[i][0] + n2[0] * depth, q[i][1] + n2[1] * depth];
-        let den = t1[0] * t2[1] - t1[1] * t2[0];
-        let den = if den.abs() < 1e-6 { 1e-6 } else { den };
-        let u = ((p2[0] - p1[0]) * t2[1] - (p2[1] - p1[1]) * t2[0]) / den;
-        vv[i] = [p1[0] + t1[0] * u, p1[1] + t1[1] * u];
-    }
+    let vv = inset_ring(&q, depth);
     // corner-house wings: [along the previous side (uB), along the next
-    // side (uA)]; every side then keeps at least 10 m for its row
-    let mut wings = [[0.0f32; 2]; 4];
-    for i in 0..4 {
-        let ip = (i + 3) % 4;
+    // side (uA)]; every side then keeps at least 6 m for its row
+    let mut wings = vec![[0.0f32; 2]; n];
+    for i in 0..n {
+        let ip = (i + n - 1) % n;
         // each side keeps >= 10 m for its own row: a wing never takes more
         // than half of (side - 10 m). The old one-sided cap left 4 m rows
         // and squeezed a 10 m house into them.
         // corner houses stay small (10–12 m): fat 11–16 m wings left the
         // street rows 8–14 m wide — too narrow for bay windows or a portico
-        let cap0 = ((lens[ip] - 10.0) * 0.5).max(10.0);
-        let cap1 = ((lens[i] - 10.0) * 0.5).max(10.0);
-        wings[i][0] = (10.0 + rng.below(3) as f32).min(cap0).max(10.0);
-        wings[i][1] = (10.0 + rng.below(3) as f32).min(cap1).max(10.0);
+        let cap0 = ((lens[ip] - 10.0) * 0.5).max(6.0);
+        let cap1 = ((lens[i] - 10.0) * 0.5).max(6.0);
+        wings[i][0] = (10.0 + rng.below(3) as f32).min(cap0).max(6.0);
+        wings[i][1] = (10.0 + rng.below(3) as f32).min(cap1).max(6.0);
     }
+    // the roads as drawn (smoothed) and the houses already standing:
+    // both keep the filler from seating a house where they are
+    let road_paths: Vec<Vec<[f32; 2]>> = roads
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| kolomna_render::streets::smooth_path(c))
+        .collect();
+    // the parade (street) row faces the nearest road on drawn blocks;
+    // the procedural gallery always parades on side 0 (its street side)
+    let street_side = if usr {
+        let mut best = (0usize, f32::INFINITY);
+        for i in 0..n {
+            let mid = on_side(&q, i, lens[i] * 0.5);
+            let mut d = f32::INFINITY;
+            for rp in &road_paths {
+                let (_, dd) = kolomna_render::streets::near_poly(rp, mid);
+                d = d.min(dd);
+            }
+            if d < best.1 {
+                best = (i, d);
+            }
+        }
+        best.0
+    } else {
+        0
+    };
 
     // place one house: its plan quad c (block frame, metres) + requested
-    // size; the mesh is generated, seated and mapped onto the quad
+    // size; the mesh is generated, seated and mapped onto the quad.  A
+    // slot the roadway covers — or one an earlier block already occupies —
+    // is simply left empty: only the houses that fall on the road go.
     let mut place = |w_slot: f32,
                      d_slot: f32,
                      c: [[f32; 2]; 4],
@@ -250,6 +329,30 @@ fn build_block(
                      roman: bool,
                      bay: bool,
                      seed: u64| {
+        // the roads and the standing houses live in the plan frame; the
+        // footprint c is in the block frame (b flipped by s on odd blocks)
+        let cp: [[f32; 2]; 4] = [
+            [c[0][0], s * c[0][1]],
+            [c[1][0], s * c[1][1]],
+            [c[2][0], s * c[2][1]],
+            [c[3][0], s * c[3][1]],
+        ];
+        if !road_paths.is_empty() || !avoid.is_empty() {
+            let mut hit = false;
+            for rp in &road_paths {
+                if quad_path_dist(&cp, rp) < ROAD_CUT {
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                hit = avoid.iter().any(|a| quads_overlap(&cp, a));
+            }
+            if hit {
+                return;
+            }
+        }
+        houses.push(cp);
         let req_w = (w_slot / 2.0).round().clamp(5.0, 15.0) * 2.0;
         let req_d = (d_slot / 2.0).round().clamp(4.0, 9.0) * 2.0;
         let (mut mesh, texs, wa, da, archr) = kolomna_render::piter::generate_manor(
@@ -324,11 +427,14 @@ fn build_block(
             report.push((wa, da, h_max - h_min));
         };
 
-    // rows along the four sides, between the corner houses
-    for i in 0..4 {
-        let inx = (i + 1) % 4;
+    // rows along every side, between the corner houses
+    for i in 0..n {
+        let inx = (i + 1) % n;
         let a_start = wings[i][1];
         let run = lens[i] - wings[i][1] - wings[inx][0];
+        if run < 6.0 {
+            continue; // a short side belongs entirely to its corner houses
+        }
         let widths = plan_widths(&mut rng, run);
         let k = widths.len();
         // The STREET row (side 0) must open at least one carriage arch
@@ -337,7 +443,7 @@ fn build_block(
         let mut archj = vec![false; k];
         let mut romanj = vec![false; k];
         let mut bayj = vec![false; k];
-        if i == 0 {
+        if i == street_side {
             let mut order: Vec<usize> = (0..k).collect();
             order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
             // the gallery splits deterministically so the variants sit
@@ -406,8 +512,8 @@ fn build_block(
         }
     }
     // corner houses: irregular quads, both street edges get parade walls
-    for i in 0..4 {
-        let ip = (i + 3) % 4;
+    for i in 0..n {
+        let ip = (i + n - 1) % n;
         let (u_b, u_a) = (wings[i][0], wings[i][1]);
         let pl_pt = on_side(&q, ip, lens[ip] - u_b);
         let pf_pt = on_side(&q, i, u_a);
@@ -422,11 +528,246 @@ fn build_block(
             eu[1] * p[0] + nvec[1] * s * p[1],
         ]
     };
-    plan_out = (
-        [to_wm_b(q[0]), to_wm_b(q[1]), to_wm_b(q[2]), to_wm_b(q[3])],
-        [to_wm_b(vv[0]), to_wm_b(vv[1]), to_wm_b(vv[2]), to_wm_b(vv[3])],
+    let plan_out = (
+        q.iter().map(|&p| to_wm_b(p)).collect::<Vec<_>>(),
+        vv.iter().map(|&p| to_wm_b(p)).collect::<Vec<_>>(),
     );
-    (village, plan_out, edge, report, focus)
+    // the ring in the plan frame (the frame the roads are drawn in)
+    let q_plan: Vec<[f32; 2]> = q.iter().map(|p| [p[0], s * p[1]]).collect();
+    BlkBuilt {
+        meshes: village,
+        plan: plan_out,
+        edge,
+        report,
+        focus,
+        q_plan,
+        houses,
+    }
+}
+
+// ------------------------------------------------------- city edit helpers --
+
+/// Metres from a road centre line that a road clears of houses.
+const ROAD_CUT: f32 = 6.4;
+/// Fence distance from a road centre line for the parks a road splits.
+const PARK_MARGIN: f32 = 6.9;
+
+/// Min distance between two segments (standard clamped closest points).
+fn seg_seg_dist(a0: [f32; 2], a1: [f32; 2], b0: [f32; 2], b1: [f32; 2]) -> f32 {
+    let d = |p: [f32; 2], q: [f32; 2]| ((p[0] - q[0]).powi(2) + (p[1] - q[1]).powi(2)).sqrt();
+    let clamp01 = |v: f32| v.clamp(0.0, 1.0);
+    let d1 = [a1[0] - a0[0], a1[1] - a0[1]];
+    let d2 = [b1[0] - b0[0], b1[1] - b0[1]];
+    let r = [a0[0] - b0[0], a0[1] - b0[1]];
+    let a = d1[0] * d1[0] + d1[1] * d1[1];
+    let e = d2[0] * d2[0] + d2[1] * d2[1];
+    let f = d2[0] * r[0] + d2[1] * r[1];
+    let (mut s, mut t);
+    if a <= 1e-8 && e <= 1e-8 {
+        return d(a0, b0);
+    }
+    if a <= 1e-8 {
+        s = 0.0;
+        t = clamp01(f / e);
+    } else {
+        let c = d1[0] * r[0] + d1[1] * r[1];
+        if e <= 1e-8 {
+            t = 0.0;
+            s = clamp01(-c / a);
+        } else {
+            let b = d1[0] * d2[0] + d1[1] * d2[1];
+            let den = a * e - b * b;
+            s = if den.abs() > 1e-8 { clamp01((b * f - c * e) / den) } else { 0.0 };
+            t = (b * s + f) / e;
+            if t < 0.0 {
+                t = 0.0;
+                s = clamp01(-c / a);
+            } else if t > 1.0 {
+                t = 1.0;
+                s = clamp01((b - c) / a);
+            }
+        }
+    }
+    let p = [a0[0] + d1[0] * s, a0[1] + d1[1] * s];
+    let q = [b0[0] + d2[0] * t, b0[1] + d2[1] * t];
+    d(p, q)
+}
+
+/// Distance from a house footprint (closed quad) to a road centre line.
+fn quad_path_dist(quad: &[[f32; 2]; 4], path: &[[f32; 2]]) -> f32 {
+    let mut best = f32::MAX;
+    for k in 0..4 {
+        let a = quad[k];
+        let b = quad[(k + 1) % 4];
+        for w in path.windows(2) {
+            best = best.min(seg_seg_dist(a, b, w[0], w[1]));
+        }
+    }
+    best
+}
+
+/// Two quads really overlap when they overlap by > 15 cm on every axis:
+/// touching facades of neighbouring houses do not count.
+fn quads_overlap(a: &[[f32; 2]; 4], b: &[[f32; 2]; 4]) -> bool {
+    const MIN_DEPTH: f32 = 0.15;
+    let proj = |poly: &[[f32; 2]; 4], n: [f32; 2]| -> (f32, f32) {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for p in poly {
+            let s = p[0] * n[0] + p[1] * n[1];
+            lo = lo.min(s);
+            hi = hi.max(s);
+        }
+        (lo, hi)
+    };
+    for poly in [a, b] {
+        for k in 0..4 {
+            let p0 = poly[k];
+            let p1 = poly[(k + 1) % 4];
+            let l = ((p1[0] - p0[0]).powi(2) + (p1[1] - p0[1]).powi(2)).sqrt().max(1e-6);
+            let n = [(p1[1] - p0[1]) / l, -(p1[0] - p0[0]) / l];
+            let (al, ah) = proj(a, n);
+            let (bl, bh) = proj(b, n);
+            if ah.min(bh) - al.max(bl) <= MIN_DEPTH {
+                return false; // a separating axis: no real overlap
+            }
+        }
+    }
+    true
+}
+
+fn point_in_ring(p: [f32; 2], ring: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    for k in 0..ring.len() {
+        let a = ring[k];
+        let b = ring[(k + 1) % ring.len()];
+        if (a[1] > p[1]) != (b[1] > p[1]) {
+            let t = (p[1] - a[1]) / (b[1] - a[1]);
+            if p[0] < a[0] + (b[0] - a[0]) * t {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+/// Does any drawn road reach this ring: cross it, end inside it, or run
+/// close enough that a house at the ring could stand on the roadway?
+fn ring_hits_roads(ring: &[[f32; 2]], paths: &[Vec<[f32; 2]>], reach: f32) -> bool {
+    for path in paths {
+        if path.len() < 2 {
+            continue;
+        }
+        for w in path.windows(2) {
+            for k in 0..ring.len() {
+                let a = ring[k];
+                let b = ring[(k + 1) % ring.len()];
+                if seg_seg_dist(a, b, w[0], w[1]) < reach {
+                    return true;
+                }
+            }
+        }
+        if point_in_ring(path[0], ring) || point_in_ring(path[path.len() - 1], ring) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The drawn chains as the smoothed centre lines the mesh follows.
+fn smooth_roads(chains: &[Vec<[f32; 2]>]) -> Vec<Vec<[f32; 2]>> {
+    chains
+        .iter()
+        .filter(|c| c.len() >= 2)
+        .map(|c| kolomna_render::streets::smooth_path(c))
+        .collect()
+}
+
+/// A zero-area placeholder entry: fills a village slot without drawing
+/// anything.  Rebuilt blocks and parks blank their stale entries and
+/// append the fresh ones, so every other index stays valid.
+fn blank_mesh() -> (ModelMesh, Vec<(u32, u32, Vec<u8>)>) {
+    let mut b = kolomna_render::procgen::Builder::new();
+    b.tri(
+        0,
+        [
+            [0.0, 0.0, -900.0],
+            [0.0, 0.0, -900.0],
+            [0.0, 0.0, -900.0],
+        ],
+        [[0.0, 0.0], [0.0, 0.0], [0.0, 0.0]],
+    );
+    (b.finish(1), vec![(1u32, 1u32, vec![0u8, 0, 0, 255])])
+}
+
+/// The two-colour palette of the courtyard-boundary ribbons (red outer,
+/// cyan inner); the ribbon uv picks the half.
+fn plan_palette() -> Vec<(u32, u32, Vec<u8>)> {
+    let mut pal_px = Vec::with_capacity(256 * 4);
+    for x in 0..256usize {
+        let c = if x < 128 {
+            [220u8, 60, 60]
+        } else {
+            [60, 200, 220]
+        };
+        pal_px.extend_from_slice(&[c[0], c[1], c[2], 255]);
+    }
+    vec![(256u32, 1u32, pal_px)]
+}
+
+/// Ground ribbons along block outlines for the app (outer plan in red,
+/// the courtyard hole in cyan).  Rings arrive in world metres.
+fn overlay_ribbons(
+    rings: &[(Vec<[f32; 2]>, Vec<[f32; 2]>)],
+    anchor: [f32; 2],
+    h_at: &dyn Fn(f32, f32) -> f32,
+    mn: f32,
+) -> ModelMesh {
+    let mut bld = kolomna_render::procgen::Builder::new();
+    for (outer, inner) in rings {
+        for (ring, uv, off) in [
+            (outer, [[0.25f32, 0.25f32]; 4], 0.9f32),
+            (inner, [[0.75f32, 0.25f32]; 4], -0.6f32),
+        ] {
+            for i in 0..ring.len() {
+                let p0 = ring[i];
+                let p1 = ring[(i + 1) % ring.len()];
+                let d = [p1[0] - p0[0], p1[1] - p0[1]];
+                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-3);
+                let (tx, ty) = (d[0] / l, d[1] / l);
+                // ccw ring: outward = (ty, -tx); outer lines go out, inner
+                // ones into the hole
+                let n_off = [ty * off, -tx * off];
+                let perp = [-ty * 0.16, tx * 0.16]; // 32 cm wide ribbon
+                let n_seg = (l / 1.5).ceil().max(1.0) as usize;
+                for s in 0..n_seg {
+                    let t0 = s as f32 / n_seg as f32;
+                    let t1 = (s + 1) as f32 / n_seg as f32;
+                    let a = [p0[0] + d[0] * t0 + n_off[0], p0[1] + d[1] * t0 + n_off[1]];
+                    let e = [p0[0] + d[0] * t1 + n_off[0], p0[1] + d[1] * t1 + n_off[1]];
+                    let hh = |p: [f32; 2]| -> f32 {
+                        h_at(anchor[0] + p[0] / 16.0, anchor[1] + p[1] / 16.0) - mn + 0.35
+                    };
+                    let (ya, ye) = (hh(a), hh(e));
+                    let ax = anchor[0] * 16.0 + a[0];
+                    let az = anchor[1] * 16.0 + a[1];
+                    let ex = anchor[0] * 16.0 + e[0];
+                    let ez = anchor[1] * 16.0 + e[1];
+                    bld.quad(
+                        0,
+                        [
+                            [ax + perp[0], ya, az + perp[1]],
+                            [ex + perp[0], ye, ez + perp[1]],
+                            [ex - perp[0], ye, ez - perp[1]],
+                            [ax - perp[0], ya, az - perp[1]],
+                        ],
+                        uv,
+                    );
+                }
+            }
+        }
+    }
+    bld.finish(1)
 }
 
 pub fn load_scene(
@@ -509,7 +850,7 @@ pub fn load_scene(
 
     // ten courtyards: a gallery of blocks along the street line, five columns
     // to a side, so several plan variants can be compared side by side
-    let mut plan_pts: Vec<([[f32; 2]; 4], [[f32; 2]; 4])> = Vec::new();
+    let mut plan_pts: Vec<(Vec<[f32; 2]>, Vec<[f32; 2]>)> = Vec::new();
     let mut focus: Option<[f32; 3]> = None;
     // debug: aim the --shot view at an arbitrary plan point (u,v in metres)
     if let Ok(s) = std::env::var("KOLOMNA_FOCUS_PLAN") {
@@ -531,16 +872,22 @@ pub fn load_scene(
         .and_then(|s| s.parse().ok())
         .unwrap_or(4);
     let mut blk_edges: Vec<(f32, f32, f32)> = Vec::new(); // per block: u_min, u_max, v_max
+    let mut blk_records: Vec<BlkRec> = Vec::new();
+    let mut park_records: Vec<ParkRec> = Vec::new();
     let n_proc = if skip_proc { 0 } else { 10 };
+    // the houses standing so far in the plan frame: a courtyard drawn
+    // over another adds its zone and builds only the missing houses
+    let mut avoid: Vec<HouseQuad> = Vec::new();
     for blk in 0..(n_proc + user.blocks.len()) as u64 {
         let usr = blk >= n_proc as u64;
-        let (meshes, plan, edge, rep, foc) = build_block(
+        let q_user = if usr {
+            Some(user.blocks[(blk - n_proc as u64) as usize].as_slice())
+        } else {
+            None
+        };
+        let built = build_block(
             blk,
-            if usr {
-                Some(user.blocks[(blk - n_proc as u64) as usize])
-            } else {
-                None
-            },
+            q_user,
             &h_at,
             anchor,
             eu,
@@ -549,16 +896,29 @@ pub fn load_scene(
             wl,
             focus.is_none(),
             focus_blk,
+            &user.roads,
+            &avoid,
         );
-        village.extend(meshes);
-        plan_pts.push(plan);
-        if let Some(e) = edge {
+        let first = village.len();
+        village.extend(built.meshes);
+        plan_pts.push(built.plan);
+        if let Some(e) = built.edge {
             blk_edges.push(e);
         }
-        report.extend(rep);
-        if let Some(f) = foc {
+        report.extend(built.report);
+        if let Some(f) = built.focus {
             focus = Some(f);
         }
+        if usr {
+            avoid.extend_from_slice(&built.houses);
+        }
+        blk_records.push(BlkRec {
+            blk,
+            q: built.q_plan,
+            usr,
+            entries: (first..village.len()).collect(),
+            houses: built.houses,
+        });
     }
     // ---- procedural modern streets ---------------------------------------
     // One street along the block fronts, with cross lanes through the gaps
@@ -653,24 +1013,44 @@ pub fn load_scene(
             roads_idx = Some(village.len());
             village.push((rmesh, rtexs, [0.0, 0.0, 0.0], 0.0));
         }
-        // ---- the editor's parks: the drawn contour is the outline
+        // ---- the editor's parks: the drawn contour is the outline; a
+        // road running through a park cuts it into separate gardens, each
+        // fenced on its own (a park drawn over a road splits the same way:
+        // the road stays, the green parts around it remain)
         for (pi, park) in user.parks.iter().enumerate() {
-            let (pmesh, ptexs) = kolomna_render::summer_garden::build_garden(
-                &h_at,
-                anchor,
-                mn,
-                eu,
-                nvec,
-                &kolomna_render::summer_garden::Params {
-                    centre: [0.0, 0.0],
-                    ru: 0.0,
-                    rv: 0.0,
-                    seed: 0xD00D_0000 + pi as u64,
-                    outline: park.clone(),
-                },
+            let parts = kolomna_render::streets::split_outline_by_chains(
+                park,
+                &user.roads,
+                PARK_MARGIN,
             );
-            println!("drawn park {}: {} outline points", pi + 1, park.len());
-            village.push((pmesh, ptexs, [0.0, 0.0, 0.0], 0.0));
+            let first = village.len();
+            for (pj, part) in parts.iter().enumerate() {
+                let (pmesh, ptexs) = kolomna_render::summer_garden::build_garden(
+                    &h_at,
+                    anchor,
+                    mn,
+                    eu,
+                    nvec,
+                    &kolomna_render::summer_garden::Params {
+                        centre: [0.0, 0.0],
+                        ru: 0.0,
+                        rv: 0.0,
+                        seed: 0xD00D_0000 + (pi * 16 + pj) as u64,
+                        outline: part.clone(),
+                    },
+                );
+                village.push((pmesh, ptexs, [0.0, 0.0, 0.0], 0.0));
+            }
+            println!(
+                "drawn park {}: {} outline points -> {} garden(s)",
+                pi + 1,
+                park.len(),
+                parts.len()
+            );
+            park_records.push(ParkRec {
+                outline: park.clone(),
+                entries: (first..village.len()).collect(),
+            });
         }
     }
 
@@ -685,60 +1065,16 @@ pub fn load_scene(
     // Outer lines are pushed ~0.9 m out and inner ones ~0.6 m into the
     // courtyard so they stay visible on the ground instead of hiding under
     // the walls. One mesh, one 256x1 two-colour texture, uv picks the colour.
-    let mut pal_px = Vec::with_capacity(256 * 4);
-    for x in 0..256usize {
-        let c = if x < 128 { [220u8, 60, 60] } else { [60, 200, 220] };
-        pal_px.extend_from_slice(&[c[0], c[1], c[2], 255]);
-    }
-    let mut bld = kolomna_render::procgen::Builder::new();
-    for (outer, inner) in &plan_pts {
-        for (ring, uv, off) in [
-            (outer, [[0.25f32, 0.25f32]; 4], 0.9f32),
-            (inner, [[0.75f32, 0.25f32]; 4], -0.6f32),
-        ] {
-            for i in 0..4 {
-                let p0 = ring[i];
-                let p1 = ring[(i + 1) % 4];
-                let d = [p1[0] - p0[0], p1[1] - p0[1]];
-                let l = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-3);
-                let (tx, ty) = (d[0] / l, d[1] / l);
-                // ccw ring: outward = (ty, -tx); outer lines go out, inner
-                // ones into the hole
-                let n_off = [ty * off, -tx * off];
-                let perp = [-ty * 0.16, tx * 0.16]; // 32 cm wide ribbon
-                let n_seg = (l / 1.5).ceil().max(1.0) as usize;
-                for s in 0..n_seg {
-                    let t0 = s as f32 / n_seg as f32;
-                    let t1 = (s + 1) as f32 / n_seg as f32;
-                    let a = [p0[0] + d[0] * t0 + n_off[0], p0[1] + d[1] * t0 + n_off[1]];
-                    let e = [p0[0] + d[0] * t1 + n_off[0], p0[1] + d[1] * t1 + n_off[1]];
-                    let hh = |p: [f32; 2]| -> f32 {
-                        h_at(anchor[0] + p[0] / 16.0, anchor[1] + p[1] / 16.0) - mn + 0.35
-                    };
-                    let (ya, ye) = (hh(a), hh(e));
-                    let ax = anchor[0] * 16.0 + a[0];
-                    let az = anchor[1] * 16.0 + a[1];
-                    let ex = anchor[0] * 16.0 + e[0];
-                    let ez = anchor[1] * 16.0 + e[1];
-                    bld.quad(
-                        0,
-                        [
-                            [ax + perp[0], ya, az + perp[1]],
-                            [ex + perp[0], ye, ez + perp[1]],
-                            [ex - perp[0], ye, ez - perp[1]],
-                            [ax - perp[0], ya, az - perp[1]],
-                        ],
-                        uv,
-                    );
-                }
-            }
-        }
-    }
-    let plan_idx = if skip_proc {
-        0
+    let plan_idx = if plan_pts.is_empty() {
+        usize::MAX
     } else {
         let i = village.len();
-        village.push((bld.finish(1), vec![(256u32, 1u32, pal_px)], [0.0, 0.0, 0.0], 0.0));
+        village.push((
+            overlay_ribbons(&plan_pts, anchor, &h_at, mn),
+            plan_palette(),
+            [0.0, 0.0, 0.0],
+            0.0,
+        ));
         i
     };
     let focus = focus.unwrap_or([anchor[0], anchor[1], 0.0]);
@@ -762,6 +1098,8 @@ pub fn load_scene(
         roads_idx,
         streets_idx,
         net,
+        blk_records,
+        park_records,
         focus,
     })
 }
@@ -779,8 +1117,17 @@ pub fn shot(out: &str, city: &str, dat: &str, zoom: f32) -> Result<(), Box<dyn E
                 // a diagonal crossing the main street and the first chain:
                 // junction test coverage inside the demo
                 vec![[-30.0, -30.0], [30.0, 30.0]],
+                // roads right through the drawn courtyards and the drawn
+                // park: house clearing + garden splitting on show
+                vec![[330.0, 30.0], [335.0, 130.0]],
+                vec![[150.0, 60.0], [190.0, 210.0]],
             ],
-            blocks: vec![[[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]]],
+            blocks: vec![
+                vec![[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]],
+                // a second courtyard overlapping the first: its zone is
+                // added, the standing houses of the first are left alone
+                vec![[320.0, 80.0], [385.0, 75.0], [390.0, 125.0], [325.0, 130.0]],
+            ],
             parks: vec![vec![
                 [150.0, 90.0],
                 [220.0, 95.0],
@@ -1013,6 +1360,11 @@ impl Camera {
             self.target[1] += p * (self.tilt - self.tilt_applied);
             self.tilt_applied = self.tilt;
         }
+        // keep navigation over the map: clamp the pan centre (a little
+        // overscroll so the edge cliff stays reachable, never off into void)
+        let m = 6.0f32;
+        self.target[0] = self.target[0].clamp(-m, self.grid + m);
+        self.target[1] = self.target[1].clamp(-m, self.grid * self.tilt.max(0.2) + m);
         self.time += dt;
     }
 
@@ -2161,6 +2513,80 @@ impl ApplicationHandler for App {
             ];
             self.commit();
             println!("selftest: park commit OK");
+            // B5: a road across a drawn courtyard removes only its houses
+            let rec_i = self.scene.as_ref().unwrap().blk_records.len() - 1;
+            let before = self.scene.as_ref().unwrap().blk_records[rec_i].houses.len();
+            self.set_tool(1);
+            self.pts = vec![[330.0, 30.0], [335.0, 130.0]];
+            self.commit();
+            let after = self.scene.as_ref().unwrap().blk_records[rec_i].houses.len();
+            println!("selftest: courtyard houses {before} -> {after} after a road through it");
+            assert!(after < before, "the road through the courtyard removed no houses");
+            assert!(after > 0, "the road through the courtyard flattened the whole block");
+            // B8: a courtyard drawn over a courtyard refills only free slots
+            self.set_tool(2);
+            self.pts = vec![[320.0, 80.0], [385.0, 75.0], [390.0, 125.0], [325.0, 130.0]];
+            self.commit();
+            {
+                let scene = self.scene.as_ref().unwrap();
+                let nn = scene.blk_records.len();
+                let (r1, r2) = (&scene.blk_records[nn - 2], &scene.blk_records[nn - 1]);
+                let mut overlaps = 0usize;
+                for a in &r1.houses {
+                    for b in &r2.houses {
+                        if quads_overlap(a, b) {
+                            overlaps += 1;
+                        }
+                    }
+                }
+                println!(
+                    "selftest: courtyard over courtyard: {} + {} houses, {overlaps} overlap(s)",
+                    r1.houses.len(),
+                    r2.houses.len()
+                );
+                assert_eq!(overlaps, 0, "stacked houses in the overlap of two courtyards");
+                assert!(r2.houses.len() >= 4, "the second courtyard built nothing");
+            }
+            // B6: a road across a drawn park splits it into separate gardens
+            let parts_before = self
+                .scene
+                .as_ref()
+                .unwrap()
+                .park_records
+                .last()
+                .unwrap()
+                .entries
+                .len();
+            self.set_tool(1);
+            self.pts = vec![[150.0, 60.0], [190.0, 210.0]];
+            self.commit();
+            let parts_after = self
+                .scene
+                .as_ref()
+                .unwrap()
+                .park_records
+                .last()
+                .unwrap()
+                .entries
+                .len();
+            println!("selftest: park gardens {parts_before} -> {parts_after} after the road");
+            assert!(
+                parts_after > parts_before,
+                "the road through the park did not split it"
+            );
+            // B9: a courtyard/park vertex snaps onto the kerb edge of a road
+            {
+                let sp = self.shape_snap_point([336.0, 90.0]);
+                let (_, dd) = kolomna_render::streets::near_poly(&self.user.roads[3], sp);
+                println!(
+                    "selftest: shape snap probe (336.0, 90.0) -> ({:.2}, {:.2}), {dd:.2} m off the centreline",
+                    sp[0], sp[1]
+                );
+                assert!(
+                    (dd - 6.6).abs() < 1.2,
+                    "shape snap did not land on the kerb edge"
+                );
+            }
             // toolbar dispatch: every button must answer at its centre
             for (r, b) in ui_button_rects() {
                 let a = ui_action_at((r[0] + r[2] / 2.0) as f64, (r[1] + r[3] / 2.0) as f64);
@@ -2320,7 +2746,11 @@ impl ApplicationHandler for App {
                                             self.pts.push(p);
                                             self.last_live = Some(p);
                                             self.refresh_preview();
-                                        } else if !(self.tool == 2 && self.pts.len() >= 4) {
+                                        } else {
+                                            // courtyards and parks snap their
+                                            // corners onto the kerb edge of a
+                                            // road the cursor reaches
+                                            let p = self.shape_snap_point(p);
                                             self.pts.push(p);
                                             self.refresh_preview();
                                         }
@@ -2635,6 +3065,58 @@ impl App {
         best.map(|(q, _)| q).unwrap_or(p)
     }
 
+    /// Snap a block/park vertex onto a road's kerb edge once the cursor
+    /// comes within the road corridor: the vertex lands ~6.6 m off the
+    /// centre line on the side the cursor is on, so a courtyard wall or a
+    /// park fence stands right along the roadway.  The procedural grid
+    /// (main street, cross lanes) attracts the same way.
+    fn shape_snap_point(&self, p: [f32; 2]) -> [f32; 2] {
+        let mut best: Option<([f32; 2], f32)> = None;
+        for ch in &self.user.roads {
+            if ch.len() >= 2 {
+                let (q, d) = kolomna_render::streets::near_poly(ch, p);
+                if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
+                    best = Some((q, d));
+                }
+            }
+        }
+        if let Some(scene) = self.scene.as_ref() {
+            let net = &scene.net;
+            if net.main_t1 > net.main_t0 + 1.0 {
+                let main = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
+                let (q, d) = kolomna_render::streets::near_poly(&main, p);
+                if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
+                    best = Some((q, d));
+                }
+            }
+            for &(uc, _cr, _cw) in &net.cross {
+                for half in [
+                    [[uc, 3.5], [uc, net.cross_half]],
+                    [[uc, -net.cross_half], [uc, -3.5]],
+                ] {
+                    let (q, d) = kolomna_render::streets::near_poly(&half, p);
+                    if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
+                        best = Some((q, d));
+                    }
+                }
+            }
+        }
+        match best {
+            Some((q, d)) => {
+                // step off the centre line toward the cursor: the vertex
+                // lands on the outer kerb, not mid-asphalt
+                let dir = [p[0] - q[0], p[1] - q[1]];
+                let l = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-4);
+                if d < 0.5 {
+                    q
+                } else {
+                    [q[0] + dir[0] / l * 6.6, q[1] + dir[1] / l * 6.6]
+                }
+            }
+            None => p,
+        }
+    }
+
     /// The chains as they are on screen: committed roads + the chain being
     /// drawn, with its rubber-band point under the cursor.
     fn road_chains_live(&self) -> Vec<Vec<[f32; 2]>> {
@@ -2684,15 +3166,198 @@ impl App {
         }
     }
 
-    /// Once a chain is settled: rebuild the roads mesh and, when the chain
-    /// reached the grid, re-cut the grid streets at the junctions.
+    /// Once a chain is settled: rebuild the roads mesh, re-cut the grid
+    /// streets at the junctions and sweep the courtyards and parks the
+    /// fresh chain crosses (houses on the roadway go, gardens split).
     fn after_road_commit(&mut self) {
         self.last_live = None;
         self.refresh_roads_live();
         if self.chains_near_grid() {
             self.rebuild_streets();
         }
+        if let Some(ch) = self.user.roads.last().cloned() {
+            self.rebuild_blocks_on_roads(std::slice::from_ref(&ch));
+            self.rebuild_parks_on_roads(std::slice::from_ref(&ch));
+        }
         println!("дороги перестроены ({} цепочек)", self.user.roads.len());
+    }
+
+    /// Entries in the renderer's model list; live edits append here while
+    /// the CPU `scene.village` keeps the load-time list.
+    fn village_len(&self) -> usize {
+        self.renderer.as_ref().map(|r| r.village.len()).unwrap_or(0)
+    }
+
+    /// A fresh road sweeps the courtyards it reaches: every affected block
+    /// regenerates with the roads in hand (the filler drops exactly the
+    /// houses the roadway covers) and its old entries turn into blanks.
+    fn rebuild_blocks_on_roads(&mut self, trigger: &[Vec<[f32; 2]>]) {
+        let trig = smooth_roads(trigger);
+        if trig.is_empty() {
+            return;
+        }
+        let n_rec = self.scene.as_ref().map(|s| s.blk_records.len()).unwrap_or(0);
+        for ri in 0..n_rec {
+            let (needs, blk, q_user) = {
+                let scene = match self.scene.as_ref() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let rec = &scene.blk_records[ri];
+                let mut hit = ring_hits_roads(&rec.q, &trig, ROAD_CUT);
+                if !hit {
+                    'outer: for h in &rec.houses {
+                        for rp in &trig {
+                            if quad_path_dist(h, rp) < ROAD_CUT {
+                                hit = true;
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+                (
+                    hit,
+                    rec.blk,
+                    if rec.usr { Some(rec.q.clone()) } else { None },
+                )
+            };
+            if !needs {
+                continue;
+            }
+            let t0 = Instant::now();
+            let built = {
+                let scene = match self.scene.as_ref() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let h_at = Self::scene_h_at(scene);
+                // houses of the OTHER drawn courtyards stay: only free
+                // slots fill (the block's own houses must not block it)
+                let avoid: Vec<HouseQuad> = scene
+                    .blk_records
+                    .iter()
+                    .enumerate()
+                    .filter(|(k, r)| *k != ri && r.usr)
+                    .flat_map(|(_, r)| r.houses.iter().copied())
+                    .collect();
+                build_block(
+                    blk,
+                    q_user.as_deref(),
+                    &h_at,
+                    scene.anchor,
+                    scene.eu,
+                    scene.nvec,
+                    scene.mn,
+                    scene.wl,
+                    false,
+                    0,
+                    &self.user.roads,
+                    &avoid,
+                )
+            };
+            let old = self
+                .scene
+                .as_ref()
+                .map(|s| s.blk_records[ri].entries.clone())
+                .unwrap_or_default();
+            let n_new = built.meshes.len();
+            let n_houses = built.houses.len();
+            let first = self.village_len();
+            if let Some(s) = self.scene.as_mut() {
+                // live edits land in the renderer only: `scene.village` stays
+                // the load-time list (its meshes are never clonable)
+                let rec = &mut s.blk_records[ri];
+                rec.entries = (first..first + n_new).collect();
+                rec.houses = built.houses.clone();
+            }
+            if let Some(r) = self.renderer.as_mut() {
+                for &ix in &old {
+                    let (bm, bt) = blank_mesh();
+                    r.replace_village_mesh(ix, bm, bt);
+                }
+                for (mesh, texs, pos, rot) in built.meshes {
+                    r.add_village_mesh(mesh, texs, pos, rot);
+                }
+            }
+            println!(
+                "блок {blk} перестроен за {:.2} с ({n_houses} домов)",
+                t0.elapsed().as_secs_f32()
+            );
+        }
+    }
+
+    /// A fresh road cuts the parks it reaches: every affected park is
+    /// re-split against all the chains, its old gardens blanked and the
+    /// new parts appended.
+    fn rebuild_parks_on_roads(&mut self, trigger: &[Vec<[f32; 2]>]) {
+        let trig = smooth_roads(trigger);
+        if trig.is_empty() {
+            return;
+        }
+        let n = self.scene.as_ref().map(|s| s.park_records.len()).unwrap_or(0);
+        for pi in 0..n {
+            let (needs, outline, old) = {
+                let scene = match self.scene.as_ref() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let rec = &scene.park_records[pi];
+                (
+                    ring_hits_roads(&rec.outline, &trig, PARK_MARGIN),
+                    rec.outline.clone(),
+                    rec.entries.clone(),
+                )
+            };
+            if !needs {
+                continue;
+            }
+            let parts = kolomna_render::streets::split_outline_by_chains(
+                &outline,
+                &self.user.roads,
+                PARK_MARGIN,
+            );
+            let mut new_meshes = Vec::new();
+            for (pj, part) in parts.iter().enumerate() {
+                let (mesh, texs) = {
+                    let scene = match self.scene.as_ref() {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    let h_at = Self::scene_h_at(scene);
+                    kolomna_render::summer_garden::build_garden(
+                        &h_at,
+                        scene.anchor,
+                        scene.mn,
+                        scene.eu,
+                        scene.nvec,
+                        &kolomna_render::summer_garden::Params {
+                            centre: [0.0, 0.0],
+                            ru: 0.0,
+                            rv: 0.0,
+                            seed: 0xD00D_0000 + (pi * 16 + pj) as u64,
+                            outline: part.clone(),
+                        },
+                    )
+                };
+                new_meshes.push((mesh, texs));
+            }
+            let n_new = new_meshes.len();
+            let first = self.village_len();
+            if let Some(s) = self.scene.as_mut() {
+                // renderer-only edits (see rebuild_blocks_on_roads)
+                s.park_records[pi].entries = (first..first + n_new).collect();
+            }
+            if let Some(r) = self.renderer.as_mut() {
+                for &ix in &old {
+                    let (bm, bt) = blank_mesh();
+                    r.replace_village_mesh(ix, bm, bt);
+                }
+                for (m, t) in new_meshes {
+                    r.add_village_mesh(m, t, [0.0, 0.0, 0.0], 0.0);
+                }
+            }
+            println!("парк {}: дорога разрезала — {n_new} сад(ов)", pi + 1);
+        }
     }
 
     /// Rough test: does any drawn chain reach the procedural grid?
@@ -2769,8 +3434,8 @@ impl App {
     fn hint_text(&self) -> &'static str {
         match self.tool {
             1 => "ДОРОГИ: ЛКМ точка (снап к дорогам) · ПКМ убрать · Esc закончить",
-            2 => "КВАРТАЛЫ: 4 клика · Enter — готово · ПКМ — отмена",
-            3 => "ПАРКИ: клики по контуру · Enter — готово · ПКМ — отмена",
+            2 => "КВАРТАЛЫ: ≥3 клика (снап к дорогам) · Enter — готово · ПКМ — отмена",
+            3 => "ПАРКИ: клики по контуру (снап к дорогам) · Enter — готово · ПКМ — отмена",
             _ => "ЛКМ — обзор · кнопки вверху: дороги · кварталы · парки · B — границы дворов",
         }
     }
@@ -2797,13 +3462,13 @@ impl App {
                 return;
             }
             2 => {
-                if self.pts.len() == 4 {
+                if self.pts.len() >= 3 {
                     let mut q = self.pts.clone();
                     fix_ccw(&mut q);
-                    self.user.blocks.push([q[0], q[1], q[2], q[3]]);
+                    self.user.blocks.push(q);
                     made = true;
                 } else {
-                    println!("квартал: нужно ровно 4 клика (сейчас {})", self.pts.len());
+                    println!("квартал: нужно хотя бы 3 клика (сейчас {})", self.pts.len());
                 }
             }
             3 => {
@@ -2854,40 +3519,60 @@ impl App {
         }
     }
 
-    /// Append only the park that was just committed.
+    /// Append only the park that was just committed: the roads running
+    /// through it cut it into separate gardens, each built and appended on
+    /// its own (the same split a full reload would produce).
     fn commit_park(&mut self) {
         let t0 = Instant::now();
-        let (mesh, texs) = {
-            let scene = match self.scene.as_ref() {
-                Some(s) => s,
-                None => return,
+        let pi = self.user.parks.len() - 1;
+        let parts = kolomna_render::streets::split_outline_by_chains(
+            self.user.parks.last().unwrap(),
+            &self.user.roads,
+            PARK_MARGIN,
+        );
+        let mut new_meshes = Vec::new();
+        for (pj, part) in parts.iter().enumerate() {
+            let (mesh, texs) = {
+                let scene = match self.scene.as_ref() {
+                    Some(s) => s,
+                    None => return,
+                };
+                let h_at = Self::scene_h_at(scene);
+                kolomna_render::summer_garden::build_garden(
+                    &h_at,
+                    scene.anchor,
+                    scene.mn,
+                    scene.eu,
+                    scene.nvec,
+                    &kolomna_render::summer_garden::Params {
+                        centre: [0.0, 0.0],
+                        ru: 0.0,
+                        rv: 0.0,
+                        seed: 0xD00D_0000 + (pi * 16 + pj) as u64,
+                        outline: part.clone(),
+                    },
+                )
             };
-            let park = match self.user.parks.last() {
-                Some(p) => p,
-                None => return,
-            };
-            let h_at = Self::scene_h_at(scene);
-            kolomna_render::summer_garden::build_garden(
-                &h_at,
-                scene.anchor,
-                scene.mn,
-                scene.eu,
-                scene.nvec,
-                &kolomna_render::summer_garden::Params {
-                    centre: [0.0, 0.0],
-                    ru: 0.0,
-                    rv: 0.0,
-                    seed: 0xD00D_0000 + self.user.parks.len() as u64,
-                    outline: park.clone(),
-                },
-            )
-        };
+            new_meshes.push((mesh, texs));
+        }
+        let n_new = new_meshes.len();
+        let first = self.village_len();
+        if let Some(s) = self.scene.as_mut() {
+            // renderer-only edits (see commit_quarter)
+            s.park_records.push(ParkRec {
+                outline: self.user.parks.last().unwrap().clone(),
+                entries: (first..first + n_new).collect(),
+            });
+        }
         if let Some(r) = self.renderer.as_mut() {
-            r.add_village_mesh(mesh, texs, [0.0, 0.0, 0.0], 0.0);
+            for (m, t) in new_meshes {
+                r.add_village_mesh(m, t, [0.0, 0.0, 0.0], 0.0);
+            }
         }
         println!(
-            "парк добавлен за {:.2} с (всего парков {})",
+            "парк добавлен за {:.2} с ({} сад(ов), всего парков {})",
             t0.elapsed().as_secs_f32(),
+            n_new,
             self.user.parks.len()
         );
     }
@@ -2896,22 +3581,30 @@ impl App {
     /// runs directly (no save parse, no scene scan) and its houses become
     /// regular village entries.  The block index matches the one a full
     /// reload would give it, so reloads reproduce the very same buildings.
+    /// Roads already drawn cut through the fresh block and the houses of
+    /// the other drawn courtyards are left standing: only free slots fill.
     fn commit_quarter(&mut self) {
         let t0 = Instant::now();
         let q = match self.user.blocks.last() {
-            Some(q) => *q,
+            Some(q) => q.clone(),
             None => return,
         };
         let blk = 10 + (self.user.blocks.len() - 1) as u64;
-        let meshes = {
+        let built = {
             let scene = match self.scene.as_ref() {
                 Some(s) => s,
                 None => return,
             };
             let h_at = Self::scene_h_at(scene);
+            let avoid: Vec<HouseQuad> = scene
+                .blk_records
+                .iter()
+                .filter(|r| r.usr)
+                .flat_map(|r| r.houses.iter().copied())
+                .collect();
             build_block(
                 blk,
-                Some(q),
+                Some(&q),
                 &h_at,
                 scene.anchor,
                 scene.eu,
@@ -2920,17 +3613,30 @@ impl App {
                 scene.wl,
                 false,
                 0,
+                &self.user.roads,
+                &avoid,
             )
-            .0
         };
-        let n = meshes.len();
+        let n = built.meshes.len();
+        let first = self.village_len();
+        if let Some(s) = self.scene.as_mut() {
+            // live edits land in the renderer only: `scene.village` stays the
+            // load-time list (its meshes are never clonable)
+            s.blk_records.push(BlkRec {
+                blk,
+                q: built.q_plan.clone(),
+                usr: true,
+                entries: (first..first + n).collect(),
+                houses: built.houses.clone(),
+            });
+        }
         if let Some(r) = self.renderer.as_mut() {
-            for (mesh, texs, pos, rot) in meshes {
+            for (mesh, texs, pos, rot) in built.meshes {
                 r.add_village_mesh(mesh, texs, pos, rot);
             }
         }
         println!(
-            "квартал добавлен за {:.2} с ({} элементов, всего кварталов {})",
+            "квартал добавлен за {:.2} с ({} домов, всего кварталов {})",
             t0.elapsed().as_secs_f32(),
             n,
             self.user.blocks.len()
