@@ -224,6 +224,9 @@ fn build_block(
     let u_off = if usr { 0.0 } else { ((blk / 2) as f32 - 2.0) * 56.0 };
     let seed_b = if usr { 90_000 + blk * 131 } else { 9000 + blk * 131 };
     let mut rng = kolomna_render::procgen::Rng::new(seed_b + 7);
+    // a separate stream for the roster dice, so the bay/arch roll can
+    // never shift the layout the block planner rolls from `rng`
+    let mut brng = kolomna_render::procgen::Rng::new(seed_b + 501);
 
     // the block plan: an irregular polygon (frame: a along the street, b
     // inward), every vertex jittered — never a neat rectangle.  A user
@@ -441,9 +444,12 @@ fn build_block(
         if i == street_side {
             let mut order: Vec<usize> = (0..k).collect();
             order.sort_by(|&a, &b| widths[b].partial_cmp(&widths[a]).unwrap());
-            // the gallery splits deterministically so the variants sit
-            // side by side for comparison:
-            // 0,2 roman portico · 1,3 bay windows · 4 plain = arch house
+            // the roster keeps its deterministic core (the roman portico on
+            // the widest facade of a roman block, the carriage arch of the
+            // plain blocks) while the row mixes variants on top: a bay
+            // block may carry TWO bay facades side by side, a plain block
+            // occasionally gains one on a narrower piece — never the arch
+            // candidate (a bay house carries no parade entrance)
             let kind = blk % 5;
             let rom = if kind == 0 || kind == 2 {
                 order.iter().copied().find(|&j| widths[j] >= 14.0)
@@ -453,11 +459,13 @@ fn build_block(
             if let Some(r) = rom {
                 romanj[r] = true;
             }
-            if rom.is_none()
-                && (kind == 1 || kind == 3)
-                && std::env::var("KOLOMNA_NOBAYS").is_err()
-            {
-                if let Some(b) = order.iter().copied().find(|&j| widths[j] >= 14.0) {
+            let bays_ok = rom.is_none() && std::env::var("KOLOMNA_NOBAYS").is_err();
+            if bays_ok && (kind == 1 || kind == 3) {
+                for &j in order.iter().filter(|&&j| widths[j] >= 14.0).take(2) {
+                    bayj[j] = true;
+                }
+            } else if bays_ok && kind == 4 && order.len() >= 2 && brng.f() < 0.35 {
+                if let Some(b) = order[1..].iter().copied().find(|&j| widths[j] >= 14.0) {
                     bayj[b] = true;
                 }
             }
@@ -465,8 +473,8 @@ fn build_block(
             // the arch goes only to a PLAIN street piece — a roman/bay
             // house never doubles as the arch house, and on k=1 parade
             // blocks the courtyard stays archless
-            if rom.is_none() && !bayj.iter().any(|&b| b) {
-                if let Some(p) = order.iter().copied().find(|&j| widths[j] >= 12.0) {
+            if rom.is_none() {
+                if let Some(p) = order.iter().copied().find(|&j| widths[j] >= 12.0 && !bayj[j]) {
                     archj[p] = true;
                 }
             }

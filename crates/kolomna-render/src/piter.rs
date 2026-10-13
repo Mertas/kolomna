@@ -90,6 +90,24 @@ impl Palette {
         ];
         let h = hues[r.below(5) as usize];
         let d = r.below(25) as i32 - 12;
+        // iron roofing tones: green 45%, zinc grey 30%, red-brown 15%,
+        // graphite 10% — rows of same-shape roofs still read varied
+        let roofs: [[u32; 2]; 4] = [
+            [0x5d7b6a, 0x6b8b78], // oxidised green (Clicker base)
+            [0x6d7478, 0x7d868a], // zinc grey
+            [0x6e4a3a, 0x7d5a48], // painted red-brown
+            [0x4e5a5a, 0x606c6c], // dark graphite
+        ];
+        let rk = r.below(10);
+        let rf = roofs[if rk < 5 {
+            0
+        } else if rk < 8 {
+            1
+        } else if rk < 9 {
+            2
+        } else {
+            3
+        } as usize];
         Palette {
             wall: shift(rgb(h[0]), d),
             wall_light: shift(rgb(h[1]), d),
@@ -97,8 +115,8 @@ impl Palette {
             basement: shift(rgb(0x7a7060), d / 2),
             brick: shift(rgb(0x8b3a2a), d / 2),
             brick_dark: shift(rgb(0x732d1b), d / 2),
-            roof: shift(rgb(0x5d7b6a), d / 2),
-            roof_hl: shift(rgb(0x6b8b78), d / 2),
+            roof: shift(rgb(rf[0]), d / 2),
+            roof_hl: shift(rgb(rf[1]), d / 2),
             frame: rgb(0x3a3028),
             glass: shift(rgb(0x7ba4b5), d / 3),
             glass_hl: rgb(0x8fb8c8),
@@ -1364,12 +1382,16 @@ impl Manor {
 
         // ---- walls, per floor, per 2 m tile ------------------------------
         let mut y = 0.0f32;
+        // rusticated ground floor: 70% keep the deep stone joints, the
+        // rest carry smooth plaster — both stood in Petersburg, and the
+        // mix breaks the "one template" look of a street row
+        let rust_on = r.f() < 0.70;
         for fi in 0..n_floors {
             let fh = self.heights[fi];
             let (mat_wall, mat_win) = match fi {
                 0 => (M_BASE, M_BASE_WIN),
                 1 => (
-                    M_RUST,
+                    if rust_on { M_RUST } else { M_BASE },
                     if r.f() < 0.55 {
                         M_WIN_SANDRIK
                     } else {
@@ -1574,8 +1596,17 @@ impl Manor {
         band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas, nor);
 
         // ---- balconies ----------------------------------------------------
-        let balcony_floor = if r.f() < 0.75 { Some(2usize) } else { None };
-        if let Some(bf) = balcony_floor {
+        // none / one floor of balconies / two stacked floors — the same
+        // facade reads differently once the ironwork differs
+        let bal = r.f();
+        let balcony_floors: Vec<usize> = if bal < 0.22 {
+            Vec::new()
+        } else if bal < 0.80 || n_floors <= 3 {
+            vec![2]
+        } else {
+            vec![2, 3]
+        };
+        for &bf in &balcony_floors {
             if bf < n_floors {
                 let y0: f32 = self.heights[..bf].iter().sum();
                 for (wi, &wt) in self.win_tiles.iter().enumerate() {
@@ -1705,6 +1736,23 @@ impl Manor {
         if !self.roman && !no_parade {
             let dt = self.door_tile;
             let xc = 2.0 * dt as f32 + 1.0;
+            // a pair of pilasters flanking the door (a lighter, non-Roman
+            // reading of the portal — the canopy already crowns it)
+            if r.f() < 0.45 {
+                let py1 = self.heights[0] + 0.42;
+                for sx in [xc - 1.42f32, xc + 1.42] {
+                    self.b.quad(
+                        M_STONE,
+                        [
+                            [sx - 0.14, 0.16, d + 0.10],
+                            [sx + 0.14, 0.16, d + 0.10],
+                            [sx + 0.14, py1, d + 0.10],
+                            [sx - 0.14, py1, d + 0.10],
+                        ],
+                        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                    );
+                }
+            }
             // three SOLID steps: tread, riser and side cheeks per step,
             // sunk into the ground (-1.2) so nothing hollow shows from the
             // sides or below (the user caught flat risers reading as cardboard)
@@ -1801,9 +1849,14 @@ impl Manor {
         }
 
         // ---- roof ---------------------------------------------------------
+        // four silhouettes: hipped / gabled along the street / gabled with
+        // the shchipets end to the street / flat with a parapet
         let rh = if r.f() < 0.5 { 3.6 } else { 4.2 };
         let y1 = y_wall_top + rh;
-        let hipped = r.f() < 0.6;
+        let rt = r.f();
+        let flat = rt < 0.13;
+        let hipped = !flat && rt < 0.55;
+        let gz = !flat && !hipped && rt >= 0.83; // ridge along z (across)
         let zm = d / 2.0;
         let inset = if hipped { (d * 0.42).min(w * 0.28) } else { 0.0 };
         let roof_uv = |len: f32, dep: f32| {
@@ -1814,7 +1867,111 @@ impl Manor {
                 [0.0, dep / 2.0],
             ]
         };
-        if hipped {
+        if flat {
+            // flat metal deck, a low parapet and its stone coping
+            let par_h = 0.62f32;
+            let par_o = 0.12f32;
+            self.b.quad(
+                M_ROOF,
+                [
+                    [-0.05, y_wall_top + 0.02, d + 0.05],
+                    [w + 0.05, y_wall_top + 0.02, d + 0.05],
+                    [w + 0.05, y_wall_top + 0.02, -0.05],
+                    [-0.05, y_wall_top + 0.02, -0.05],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, d / 2.0], [0.0, d / 2.0]],
+            );
+            // parapet walls just outside the facade plane
+            for (pq, uu) in [
+                (
+                    [
+                        [-par_o, y_wall_top, d + par_o],
+                        [w + par_o, y_wall_top, d + par_o],
+                        [w + par_o, y_wall_top + par_h, d + par_o],
+                        [-par_o, y_wall_top + par_h, d + par_o],
+                    ],
+                    w / 2.0,
+                ),
+                (
+                    [
+                        [w + par_o, y_wall_top, -par_o],
+                        [-par_o, y_wall_top, -par_o],
+                        [-par_o, y_wall_top + par_h, -par_o],
+                        [w + par_o, y_wall_top + par_h, -par_o],
+                    ],
+                    w / 2.0,
+                ),
+                (
+                    [
+                        [-par_o, y_wall_top, -par_o],
+                        [-par_o, y_wall_top, d + par_o],
+                        [-par_o, y_wall_top + par_h, d + par_o],
+                        [-par_o, y_wall_top + par_h, -par_o],
+                    ],
+                    d / 2.0,
+                ),
+                (
+                    [
+                        [w + par_o, y_wall_top, d + par_o],
+                        [w + par_o, y_wall_top, -par_o],
+                        [w + par_o, y_wall_top + par_h, -par_o],
+                        [w + par_o, y_wall_top + par_h, d + par_o],
+                    ],
+                    d / 2.0,
+                ),
+            ] {
+                self.b.quad(
+                    M_WALL,
+                    pq,
+                    [[0.0, 0.0], [uu, 0.0], [uu, 1.0], [0.0, 1.0]],
+                );
+            }
+            // coping: flat caps overhanging the parapet
+            for (pq, cu, cv) in [
+                (
+                    [
+                        [-par_o - 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                        [w + par_o + 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                        [w + par_o + 0.07, y_wall_top + par_h, d + par_o - 0.07],
+                        [-par_o - 0.07, y_wall_top + par_h, d + par_o - 0.07],
+                    ],
+                    w / 2.0,
+                    0.28,
+                ),
+                (
+                    [
+                        [w + par_o + 0.07, y_wall_top + par_h, -par_o - 0.07],
+                        [-par_o - 0.07, y_wall_top + par_h, -par_o - 0.07],
+                        [-par_o - 0.07, y_wall_top + par_h, -par_o + 0.07],
+                        [w + par_o + 0.07, y_wall_top + par_h, -par_o + 0.07],
+                    ],
+                    w / 2.0,
+                    0.28,
+                ),
+                (
+                    [
+                        [-par_o - 0.07, y_wall_top + par_h, -par_o - 0.07],
+                        [-par_o - 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                        [-par_o + 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                        [-par_o + 0.07, y_wall_top + par_h, -par_o - 0.07],
+                    ],
+                    d / 2.0,
+                    0.28,
+                ),
+                (
+                    [
+                        [w + par_o + 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                        [w + par_o + 0.07, y_wall_top + par_h, -par_o - 0.07],
+                        [w + par_o - 0.07, y_wall_top + par_h, -par_o - 0.07],
+                        [w + par_o - 0.07, y_wall_top + par_h, d + par_o + 0.07],
+                    ],
+                    d / 2.0,
+                    0.28,
+                ),
+            ] {
+                self.b.quad(M_BAND, pq, [[0.0, 0.0], [cu, 0.0], [cu, cv], [0.0, cv]]);
+            }
+        } else if hipped {
             // south slope
             self.b.quad(
                 M_ROOF,
@@ -1856,6 +2013,50 @@ impl Manor {
                     [w - inset, y1, zm],
                 ],
                 [[0.0, 0.0], [d / 2.0, 0.0], [d / 4.0, 1.6]],
+            );
+        } else if gz {
+            // gable across: the ridge runs along z, the slopes fall east
+            // and west, and the street facade carries the triangular
+            // shchipets between them
+            let xm = w / 2.0;
+            self.b.quad(
+                M_ROOF,
+                [
+                    [-0.25, y_wall_top, -0.35],
+                    [-0.25, y_wall_top, d + 0.35],
+                    [xm, y1, d + 0.35],
+                    [xm, y1, -0.35],
+                ],
+                roof_uv(d, w / 2.0),
+            );
+            self.b.quad(
+                M_ROOF,
+                [
+                    [w + 0.25, y_wall_top, d + 0.35],
+                    [w + 0.25, y_wall_top, -0.35],
+                    [xm, y1, -0.35],
+                    [xm, y1, d + 0.35],
+                ],
+                roof_uv(d, w / 2.0),
+            );
+            // shchipets (triangular gable ends), street side and yard side
+            self.b.tri(
+                M_WALL,
+                [
+                    [-0.02, y_wall_top, d + 0.02],
+                    [w + 0.02, y_wall_top, d + 0.02],
+                    [xm, y1 - 0.15, d + 0.02],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 4.0, 1.0]],
+            );
+            self.b.tri(
+                M_WALL,
+                [
+                    [w + 0.02, y_wall_top, -0.02],
+                    [-0.02, y_wall_top, -0.02],
+                    [xm, y1 - 0.15, -0.02],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 4.0, 1.0]],
             );
         } else {
             // gable: two full slopes + gable walls at the ends
@@ -1900,22 +2101,42 @@ impl Manor {
         }
 
         // ---- chimneys ------------------------------------------------------
-        let chimneys = if n_floors <= 4 { 1 } else { 2 };
+        let chimneys = if n_floors <= 3 {
+            1
+        } else if w >= 24.0 && r.f() < 0.5 {
+            3
+        } else {
+            2
+        };
+        // the flues ride the ridge the house actually got (along z for the
+        // across gable, a spread row for wide houses)
         let chim_x: Vec<f32> = (0..chimneys)
             .map(|c| {
-                if chimneys == 1 {
+                if gz || chimneys == 1 {
                     w * 0.5
-                } else {
+                } else if chimneys == 2 {
                     w * (0.28 + 0.44 * c as f32)
+                } else {
+                    w * (0.22 + 0.28 * c as f32)
                 }
             })
             .collect();
-        for &cx in &chim_x {
-            chimney(&mut self.b, cx, zm, y1 - 0.4, 1.7, 0.38);
+        let y0ch = if flat { y_wall_top + 0.10 } else { y1 - 0.4 };
+        for ci in 0..chimneys {
+            let cz = if gz {
+                if chimneys == 1 {
+                    d * 0.55
+                } else {
+                    d * (0.30 + 0.40 * ci as f32)
+                }
+            } else {
+                zm
+            };
+            chimney(&mut self.b, chim_x[ci], cz, y0ch, 1.7, 0.38);
         }
 
-        // ---- dormers on the front slope -------------------------------------
-        {
+        // ---- dormers on the front slope (sloped roofs only) ------------------
+        if !flat && !gz {
             let dormers = if tiles >= 10 { 3 } else { 2 };
             for i in 0..dormers {
                 let dx = w * (i as f32 + 1.0) / (dormers as f32 + 1.0);
@@ -1931,27 +2152,30 @@ impl Manor {
         }
 
         // ---- weather-vane on the ridge end ----------------------------------
-        if r.f() < 0.6 {
-            let vx = inset;
+        if !flat && r.f() < 0.6 {
+            // on an across-gable (ridge along z) the vane moves to the
+            // north ridge end; otherwise it keeps the western one
+            let vx = if gz { w / 2.0 } else { inset };
+            let vz = if gz { -0.30 } else { zm - 0.04 };
             let vy0 = y1 - 0.3;
             let vy1 = y1 + 1.6;
             self.b.quad(
                 M_IRON,
                 [
-                    [vx - 0.04, vy0, zm - 0.04],
-                    [vx + 0.04, vy0, zm - 0.04],
-                    [vx + 0.04, vy1, zm - 0.04],
-                    [vx - 0.04, vy1, zm - 0.04],
+                    [vx - 0.04, vy0, vz],
+                    [vx + 0.04, vy0, vz],
+                    [vx + 0.04, vy1, vz],
+                    [vx - 0.04, vy1, vz],
                 ],
                 [[0.0, 0.0], [1.0, 0.0], [1.0, 4.0], [0.0, 4.0]],
             );
             self.b.quad(
                 M_IRON,
                 [
-                    [vx, vy1 - 0.35, zm - 0.04],
-                    [vx, vy1 - 0.35, zm + 0.51],
-                    [vx, vy1 + 0.05, zm + 0.26],
-                    [vx, vy1 + 0.05, zm - 0.04],
+                    [vx, vy1 - 0.35, vz],
+                    [vx, vy1 - 0.35, vz + 0.55],
+                    [vx, vy1 + 0.05, vz + 0.30],
+                    [vx, vy1 + 0.05, vz],
                 ],
                 [[0.0, 0.0], [1.0, 0.0], [0.7, 1.0], [0.0, 1.0]],
             );
