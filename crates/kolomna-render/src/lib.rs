@@ -540,9 +540,13 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             );
             let wn = [out_xy[0], out_xy[1], 0.0];
             // cut-soil wall: the rim line falls vertically to the board
+            // (six verts per quad: TriangleList consumes triples, a 4-vert
+            // quad would feed its partner triangle from the next quad)
             for (pos, layer, uv) in [
                 ([p0[0], p0[1], z0], l0, uvw(p0, z0)),
                 ([p1[0], p1[1], z1], l1, uvw(p1, z1)),
+                ([p1[0], p1[1], board_z], l1, uvw(p1, board_z)),
+                ([p0[0], p0[1], z0], l0, uvw(p0, z0)),
                 ([p1[0], p1[1], board_z], l1, uvw(p1, board_z)),
                 ([p0[0], p0[1], board_z], l0, uvw(p0, board_z)),
             ] {
@@ -554,7 +558,7 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                     nrm: wn,
                 });
             }
-            // the level wooden ring around the map
+            // the level wooden ring around the map (six verts per quad)
             for (pos, uv) in [
                 (
                     [p0[0], p0[1], board_z],
@@ -563,6 +567,14 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 (
                     [p1[0], p1[1], board_z],
                     [p1[0] / REPEAT_CELLS, p1[1] / REPEAT_CELLS],
+                ),
+                (
+                    [q1[0], q1[1], board_z],
+                    [q1[0] / REPEAT_CELLS, q1[1] / REPEAT_CELLS],
+                ),
+                (
+                    [p0[0], p0[1], board_z],
+                    [p0[0] / REPEAT_CELLS, p0[1] / REPEAT_CELLS],
                 ),
                 (
                     [q1[0], q1[1], board_z],
@@ -582,9 +594,12 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
                 });
             }
             // wooden fascia: the ring's outer edge drops as one solid side
+            // (six verts per quad)
             for (pos, uv) in [
                 ([q0[0], q0[1], board_z], uvw(q0, board_z)),
                 ([q1[0], q1[1], board_z], uvw(q1, board_z)),
+                ([q1[0], q1[1], board_z - fascia_z], uvw(q1, board_z - fascia_z)),
+                ([q0[0], q0[1], board_z], uvw(q0, board_z)),
                 ([q1[0], q1[1], board_z - fascia_z], uvw(q1, board_z - fascia_z)),
                 ([q0[0], q0[1], board_z - fascia_z], uvw(q0, board_z - fascia_z)),
             ] {
@@ -648,6 +663,11 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
             for (pos, uv) in [
                 ([e0[0], e0[1], board_z], uvz(e0, board_z)),
                 ([e1[0], e1[1], board_z], uvz(e1, board_z)),
+                (
+                    [e1[0], e1[1], board_z - fascia_z],
+                    uvz(e1, board_z - fascia_z),
+                ),
+                ([e0[0], e0[1], board_z], uvz(e0, board_z)),
                 (
                     [e1[0], e1[1], board_z - fascia_z],
                     uvz(e1, board_z - fascia_z),
