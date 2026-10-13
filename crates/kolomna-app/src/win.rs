@@ -1099,6 +1099,14 @@ pub fn shot(out: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
                 // park: house clearing + garden splitting on show
                 vec![[330.0, 30.0], [335.0, 130.0]],
                 vec![[150.0, 60.0], [190.0, 210.0]],
+                // a loop crossing itself: the self-crossing grows a full
+                // four-arm junction (rounded corners, signals, zebras)
+                vec![[-180.0, 40.0], [-120.0, 100.0], [-180.0, 150.0], [-250.0, 95.0], [-148.0, 41.0]],
+                // a T: this stub's end lands on the first chain's leg
+                vec![[60.0, 200.0], [80.5, 135.0]],
+                // mostly re-covering the first chain: the duplicated part
+                // must not be drawn again, only the fresh tail shows
+                vec![[-40.5, 128.5], [40.5, 148.5], [95.0, 190.0]],
             ],
             blocks: vec![
                 vec![[300.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]],
@@ -2667,7 +2675,7 @@ impl ApplicationHandler for App {
                                     // roads: Esc ends the chain (the mode
                                     // stays); another Esc then exits
                                     if self.pts.len() >= 2 {
-                                        self.user.roads.push(std::mem::take(&mut self.pts));
+                                        self.commit_road_chain();
                                         self.after_road_commit();
                                     } else if !self.pts.is_empty() {
                                         self.pts.clear();
@@ -3312,6 +3320,29 @@ impl App {
         println!("дороги перестроены ({} цепочек)", self.user.roads.len());
     }
 
+    /// Push the pending `pts` as a road chain, minus the stretches that
+    /// merely re-cover roadway that already exists: those are dropped here
+    /// (and skipped by the mesh builder) so a redrawn road never lands on
+    /// top of the old one — only genuinely new pieces become roads.
+    fn commit_road_chain(&mut self) {
+        let (kept, skipped) = {
+            let scene = match self.scene.as_ref() {
+                Some(s) => s,
+                None => return,
+            };
+            kolomna_render::streets::split_duplicate(&self.pts, &self.user.roads, &scene.net)
+        };
+        self.pts.clear();
+        if skipped > 0.5 && std::env::var("KOLOMNA_EDIT_TEST").is_ok() {
+            println!("road commit: {:.0} m уже существующей дороги пропущено", skipped);
+        }
+        for k in kept {
+            if k.len() >= 2 {
+                self.user.roads.push(k);
+            }
+        }
+    }
+
     /// Entries in the renderer's model list; live edits append here while
     /// the CPU `scene.village` keeps the load-time list.
     fn village_len(&self) -> usize {
@@ -3551,7 +3582,7 @@ impl App {
     fn set_tool(&mut self, t: u8) {
         // leaving the road tool settles the chain that is being drawn
         if self.tool == 1 && t != 1 && self.pts.len() >= 2 {
-            self.user.roads.push(std::mem::take(&mut self.pts));
+            self.commit_road_chain();
             self.after_road_commit();
         }
         self.tool = t;
@@ -3605,7 +3636,7 @@ impl App {
             1 => {
                 // Enter settles the chain exactly like Esc (the mode stays)
                 if self.pts.len() >= 2 {
-                    self.user.roads.push(std::mem::take(&mut self.pts));
+                    self.commit_road_chain();
                     self.after_road_commit();
                 } else {
                     println!("дорога: нужно хотя бы 2 точки (Esc — закончить)");

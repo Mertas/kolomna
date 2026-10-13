@@ -23,6 +23,7 @@ pub const M_LEAF2: u32 = 8;
 pub const M_SIGN: u32 = 9;
 pub const M_WOOD: u32 = 10;
 pub const M_WHITE: u32 = 11;
+pub const M_LIGHTS: u32 = 12;
 
 const ROAD_H: f32 = 0.14; // roadway sits this high above the highest ground
 const KERB_H: f32 = 0.15; // kerb / sidewalk step above the roadway
@@ -415,7 +416,7 @@ pub fn build_streets(
         }
     }
 
-    (b.finish(12), textures())
+    (b.finish(13), textures())
 }
 
 // ------------------------------------------------------------- textures ----
@@ -538,6 +539,10 @@ fn vunit(a: [f32; 2]) -> [f32; 2] {
 
 fn vperp(a: [f32; 2]) -> [f32; 2] {
     [-a[1], a[0]]
+}
+
+fn vdot(a: [f32; 2], b: [f32; 2]) -> f32 {
+    a[0] * b[0] + a[1] * b[1]
 }
 
 /// Oriented box between two plan points (as in the garden): sides, caps, top.
@@ -1422,6 +1427,672 @@ pub fn build_roads(
     build_roads_ext(h_at, anchor, mn, eu, nvec, chains, &[], net)
 }
 
+// ---------------------------------------------------------------- junctions --
+//
+// A junction is emitted wherever two drawn roads cross (or a road crosses
+// itself) and wherever a free end lands on another way.  For every corner
+// sector between two arms the roadway pocket is filled in, the kerb line is
+// rounded with a fillet arc and the two sidewalks are joined corner-to-corner
+// with drop skirts; zebra crossings with stop lines go on every qualifying
+// arm and traffic lights stand on the right side of each signalised approach.
+
+struct JEv {
+    q: [f32; 2],
+    arms: Vec<([f32; 2], f32, f32)>, // unit dir away from q, kerb half-width, walk half-width
+}
+
+fn ev_key(i: usize, j: usize) -> u64 {
+    if i <= j {
+        ((i as u64) << 32) | j as u64
+    } else {
+        ((j as u64) << 32) | i as u64
+    }
+}
+
+fn push_ev(
+    evs: &mut Vec<JEv>,
+    keys: &mut Vec<(u64, [f32; 2])>,
+    key: u64,
+    q: [f32; 2],
+    arms: Vec<([f32; 2], f32, f32)>,
+) {
+    if keys.iter().any(|&(k, qq)| k == key && vlen(vsub(qq, q)) < 2.5) {
+        return;
+    }
+    keys.push((key, q));
+    evs.push(JEv { q, arms });
+}
+
+/// Top-facing triangle: winding forced to match the roadway slabs.
+fn tri_j(b: &mut Builder, mat: u32, p: [[f32; 3]; 3], uv: [[f32; 2]; 3]) {
+    let s = (p[1][0] - p[0][0]) * (p[2][2] - p[0][2]) - (p[1][2] - p[0][2]) * (p[2][0] - p[0][0]);
+    if s >= 0.0 {
+        b.tri(mat, [p[0], p[1], p[2]], [uv[0], uv[1], uv[2]]);
+    } else {
+        b.tri(mat, [p[0], p[2], p[1]], [uv[0], uv[2], uv[1]]);
+    }
+}
+
+/// Top-facing quad: same winding rule as `tri_j`.
+fn top_quad_j(b: &mut Builder, mat: u32, mut p: [[f32; 3]; 4], mut uv: [[f32; 2]; 4]) {
+    let s = (p[1][0] - p[0][0]) * (p[2][2] - p[0][2]) - (p[1][2] - p[0][2]) * (p[2][0] - p[0][0]);
+    if s < 0.0 {
+        p = [p[3], p[2], p[1], p[0]];
+        uv = [uv[3], uv[2], uv[1], uv[0]];
+    }
+    b.quad(mat, p, uv);
+}
+
+/// Vertical quad whose horizontal normal faces `out`.
+fn face_quad_j(b: &mut Builder, mat: u32, mut p: [[f32; 3]; 4], mut uv: [[f32; 2]; 4], out: [f32; 2]) {
+    let e1 = [p[1][0] - p[0][0], p[1][1] - p[0][1], p[1][2] - p[0][2]];
+    let e2 = [p[2][0] - p[0][0], p[2][1] - p[0][1], p[2][2] - p[0][2]];
+    let nx = e1[1] * e2[2] - e1[2] * e2[1];
+    let nz = e1[0] * e2[1] - e1[1] * e2[0];
+    if nx * out[0] + nz * out[1] < 0.0 {
+        p = [p[3], p[2], p[1], p[0]];
+        uv = [uv[3], uv[2], uv[1], uv[0]];
+    }
+    b.quad(mat, p, uv);
+}
+
+/// Ear-clipping triangulation of a simple polygon (plan coords).
+fn poly_tris(poly: &[[f32; 2]]) -> Vec<[usize; 3]> {
+    let mut pts: Vec<[f32; 2]> = Vec::with_capacity(poly.len());
+    for &p in poly {
+        if pts.last().map(|q: &[f32; 2]| vlen(vsub(*q, p)) > 1e-4).unwrap_or(true) {
+            pts.push(p);
+        }
+    }
+    while pts.len() > 1 && vlen(vsub(pts[0], pts[pts.len() - 1])) < 1e-4 {
+        pts.pop();
+    }
+    let n = pts.len();
+    if n < 3 {
+        return Vec::new();
+    }
+    let area: f32 = (0..n)
+        .map(|i| {
+            let a = pts[i];
+            let b = pts[(i + 1) % n];
+            a[0] * b[1] - a[1] * b[0]
+        })
+        .sum();
+    let mut idx: Vec<usize> = (0..n).collect();
+    if area < 0.0 {
+        idx.reverse();
+    }
+    let mut out = Vec::new();
+    let mut guard = 0;
+    while idx.len() > 3 && guard < 512 {
+        guard += 1;
+        let m = idx.len();
+        let mut clipped = false;
+        for i in 0..m {
+            let ia = idx[(i + m - 1) % m];
+            let ib = idx[i];
+            let ic = idx[(i + 1) % m];
+            let (a, b, c) = (pts[ia], pts[ib], pts[ic]);
+            let cr = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if cr <= 1e-7 {
+                continue;
+            }
+            let mut ok = true;
+            for &k in &idx {
+                if k == ia || k == ib || k == ic {
+                    continue;
+                }
+                let p = pts[k];
+                let d1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+                let d2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+                let d3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+                if d1 >= -1e-6 && d2 >= -1e-6 && d3 >= -1e-6 {
+                    ok = false;
+                    break;
+                }
+            }
+            if ok {
+                out.push([ia, ib, ic]);
+                idx.remove(i);
+                clipped = true;
+                break;
+            }
+        }
+        if !clipped {
+            break;
+        }
+    }
+    if idx.len() == 3 {
+        out.push([idx[0], idx[1], idx[2]]);
+    }
+    out
+}
+
+/// Roadway top height at a plan point: the highest ground across the slab.
+fn slab_top(ctx: &Ctx, p: [f32; 2], dir: [f32; 2], hr: f32) -> f32 {
+    let n = vperp(dir);
+    let mut h = ctx.hh(p[0], p[1]);
+    h = h.max(ctx.hh(p[0] + n[0] * hr, p[1] + n[1] * hr));
+    h = h.max(ctx.hh(p[0] - n[0] * hr, p[1] - n[1] * hr));
+    h + ROAD_H
+}
+
+/// Traffic light: cast-iron pole with a three-lens head facing `face`.
+fn traffic_light(b: &mut Builder, ctx: &Ctx, base: [f32; 2], z: f32, face: [f32; 2]) {
+    let f = vunit(face);
+    let s = vperp(f);
+    if std::env::var("KOLOMNA_J_DEBUG").is_ok() {
+        eprintln!("  light at ({:.1},{:.1}) face ({:.2},{:.2})", base[0], base[1], f[0], f[1]);
+    }
+    let lp = |a: f32, c: f32| -> [f32; 2] { vadd(base, vadd(vmul(f, a), vmul(s, c))) };
+    cyl(b, ctx, base, 0.062, 0.05, z - 0.35, z + 3.22, 8, M_IRON, 1.0);
+    let (bd, bw) = (0.095f32, 0.155f32);
+    obb(b, ctx, lp(-bd, 0.0), lp(bd, 0.0), bw * 2.0, z + 2.30, z + 3.16, M_IRON, 0.35);
+    for (k, lz) in [(0usize, 2.98f32), (1, 2.73), (2, 2.48)] {
+        let vc = 1.0 - (k as f32 * 64.0 + 32.0) / 192.0;
+        let lc = lp(bd + 0.016, 0.0);
+        let c1 = vadd(lc, vmul(s, -0.11));
+        let c2 = vadd(lc, vmul(s, 0.11));
+        b.quad(
+            M_LIGHTS,
+            [
+                ctx.pt(c1[0], c1[1], z + lz - 0.11),
+                ctx.pt(c2[0], c2[1], z + lz - 0.11),
+                ctx.pt(c2[0], c2[1], z + lz + 0.11),
+                ctx.pt(c1[0], c1[1], z + lz + 0.11),
+            ],
+            [
+                [0.125, vc - 0.125],
+                [0.875, vc - 0.125],
+                [0.875, vc + 0.125],
+                [0.125, vc + 0.125],
+            ],
+        );
+    }
+}
+
+/// Zebra crossing and stop line on one arm of a junction.
+fn zebra_stop(b: &mut Builder, ctx: &Ctx, ev: &JEv, i: usize) {
+    let (du, hru, _hwu) = ev.arms[i];
+    if hru < 3.0 {
+        return;
+    }
+    let mut bstop = 0.0f32;
+    for (k, &(dw, hrw, _)) in ev.arms.iter().enumerate() {
+        if k == i {
+            continue;
+        }
+        let cr = (du[0] * dw[1] - du[1] * dw[0]).abs();
+        if cr < 0.2 {
+            continue;
+        }
+        bstop = bstop.max(hrw / cr.max(0.34));
+    }
+    if bstop < 0.5 {
+        return;
+    }
+    let s_z = (bstop + 1.7).min(14.0);
+    if std::env::var("KOLOMNA_J_DEBUG").is_ok() {
+        eprintln!("  zebra arm ({:.2},{:.2}) s {:.1}..{:.1}", du[0], du[1], s_z - 2.0, s_z + 2.0);
+    }
+    let nrm = vperp(du);
+    let zh = |p: [f32; 2]| -> f32 { slab_top(ctx, p, du, hru) + 0.055 };
+    let pt = |s: f32, x: f32| -> [f32; 2] { vadd(ev.q, vadd(vmul(du, s), vmul(nrm, x))) };
+    let mut x = -hru + 0.2;
+    while x + 0.5 <= hru - 0.2 + 0.01 {
+        let (q0, q1) = (pt(s_z - 2.0, x), pt(s_z + 2.0, x));
+        let (q2, q3) = (pt(s_z + 2.0, x + 0.5), pt(s_z - 2.0, x + 0.5));
+        top_quad_j(
+            b,
+            M_PAINT,
+            [
+                ctx.pt(q0[0], q0[1], zh(q0)),
+                ctx.pt(q1[0], q1[1], zh(q1)),
+                ctx.pt(q2[0], q2[1], zh(q2)),
+                ctx.pt(q3[0], q3[1], zh(q3)),
+            ],
+            [
+                [q0[0] / 2.0, q0[1] / 2.0],
+                [q1[0] / 2.0, q1[1] / 2.0],
+                [q2[0] / 2.0, q2[1] / 2.0],
+                [q3[0] / 2.0, q3[1] / 2.0],
+            ],
+        );
+        x += 1.0;
+    }
+    // stop line on the approach side (right of the inbound direction)
+    if hru > 1.5 {
+        let (t0, t1) = (s_z + 2.15, s_z + 2.5);
+        let (q0, q1) = (pt(t0, -0.25), pt(t1, -0.25));
+        let (q2, q3) = (pt(t1, -(hru - 0.25)), pt(t0, -(hru - 0.25)));
+        top_quad_j(
+            b,
+            M_PAINT,
+            [
+                ctx.pt(q0[0], q0[1], zh(q0)),
+                ctx.pt(q1[0], q1[1], zh(q1)),
+                ctx.pt(q2[0], q2[1], zh(q2)),
+                ctx.pt(q3[0], q3[1], zh(q3)),
+            ],
+            [[0.0, 0.0], [0.35, 0.0], [0.35, 1.0], [0.0, 1.0]],
+        );
+    }
+}
+
+/// One corner of a junction: fillet arc between two kerb lines, pocket
+/// asphalt, rounded kerb ring, sidewalk fill, signals.
+#[allow(clippy::too_many_arguments)]
+fn corner_patch(
+    b: &mut Builder,
+    ctx: &Ctx,
+    q: [f32; 2],
+    du: [f32; 2],
+    hru: f32,
+    hwu: f32,
+    dv: [f32; 2],
+    hrv: f32,
+    hwv: f32,
+    th: f32,
+    jh: f32,
+) {
+    use std::f32::consts::{PI, TAU};
+    let mut nu = vperp(du);
+    if vdot(nu, dv) < 0.0 {
+        nu = vmul(nu, -1.0);
+    }
+    let mut nv = vperp(dv);
+    if vdot(nv, du) < 0.0 {
+        nv = vmul(nv, -1.0);
+    }
+    let lu = vadd(q, vmul(nu, hru));
+    let lv = vadd(q, vmul(nv, hrv));
+    let Some(pc) = line_int2(lu, du, lv, dv) else {
+        return;
+    };
+    let r = (14.0 * (th * 0.5).tan()).clamp(1.5, 7.0);
+    let cu = vadd(lu, vmul(nu, r));
+    let cv = vadd(lv, vmul(nv, r));
+    let Some(c) = line_int2(cu, du, cv, dv) else {
+        return;
+    };
+    let tu = vsub(c, vmul(nu, r));
+    let tv = vsub(c, vmul(nv, r));
+    let a0 = (tu[1] - c[1]).atan2(tu[0] - c[0]);
+    let a1 = (tv[1] - c[1]).atan2(tv[0] - c[0]);
+    let mut da = a1 - a0;
+    while da > PI {
+        da -= TAU;
+    }
+    while da < -PI {
+        da += TAU;
+    }
+    if da.abs() < 1e-3 {
+        return;
+    }
+    {
+        let am = a0 + da * 0.5;
+        let midr = [c[0] + am.cos() * r, c[1] + am.sin() * r];
+        if vdot(vsub(midr, c), vsub(pc, c)) < 0.0 {
+            da = if da > 0.0 { da - TAU } else { da + TAU };
+        }
+    }
+    let steps = ((da.abs() / (PI / 14.0)).ceil() as usize).clamp(4, 22);
+    let arc = |k: usize| -> f32 { a0 + da * (k as f32 / steps as f32) };
+    if std::env::var("KOLOMNA_J_DEBUG").is_ok() {
+        eprintln!(
+            "  corner th={:.0}deg r={:.2} c=({:.1},{:.1}) pc=({:.1},{:.1})",
+            th.to_degrees(),
+            r,
+            c[0],
+            c[1],
+            pc[0],
+            pc[1]
+        );
+    }
+    let rw = (r - KERB_W).max(0.25);
+    let hw_t = jh + KERB_H - 0.002;
+    let tail = 6.0f32;
+    // ---- asphalt pocket: fan from the sharp corner onto the fillet arc
+    for k in 0..steps {
+        let (aa, ab) = (arc(k), arc(k + 1));
+        let (pa, pb) = (
+            [c[0] + aa.cos() * r, c[1] + aa.sin() * r],
+            [c[0] + ab.cos() * r, c[1] + ab.sin() * r],
+        );
+        tri_j(
+            b,
+            M_ASPHALT,
+            [
+                ctx.pt(pc[0], pc[1], jh),
+                ctx.pt(pa[0], pa[1], jh),
+                ctx.pt(pb[0], pb[1], jh),
+            ],
+            [
+                [pc[0] / 4.0, pc[1] / 4.0],
+                [pa[0] / 4.0, pa[1] / 4.0],
+                [pb[0] / 4.0, pb[1] / 4.0],
+            ],
+        );
+    }
+    // ---- rounded kerb ring [rw, r] and its face down to the local ground
+    for k in 0..steps {
+        let (aa, ab) = (arc(k), arc(k + 1));
+        let (oa, ob) = (aa.cos(), aa.sin());
+        let (oa1, ob1) = (ab.cos(), ab.sin());
+        let q0 = [c[0] + oa * r, c[1] + ob * r];
+        let q1 = [c[0] + oa1 * r, c[1] + ob1 * r];
+        let s0 = [c[0] + oa * rw, c[1] + ob * rw];
+        let s1 = [c[0] + oa1 * rw, c[1] + ob1 * rw];
+        top_quad_j(
+            b,
+            M_KERB,
+            [
+                ctx.pt(s0[0], s0[1], hw_t),
+                ctx.pt(s1[0], s1[1], hw_t),
+                ctx.pt(q1[0], q1[1], hw_t),
+                ctx.pt(q0[0], q0[1], hw_t),
+            ],
+            [
+                [s0[0] / 2.0, s0[1] / 2.0],
+                [s1[0] / 2.0, s1[1] / 2.0],
+                [q1[0] / 2.0, q1[1] / 2.0],
+                [q0[0] / 2.0, q0[1] / 2.0],
+            ],
+        );
+        let z0 = ctx.hh(q0[0], q0[1]) - 0.5;
+        let z1 = ctx.hh(q1[0], q1[1]) - 0.5;
+        let mid = [(q0[0] + q1[0]) * 0.5 - c[0], (q0[1] + q1[1]) * 0.5 - c[1]];
+        face_quad_j(
+            b,
+            M_KERB,
+            [
+                ctx.pt(q0[0], q0[1], hw_t),
+                ctx.pt(q1[0], q1[1], hw_t),
+                ctx.pt(q1[0], q1[1], z1),
+                ctx.pt(q0[0], q0[1], z0),
+            ],
+            [
+                [k as f32 * 0.4, 1.0],
+                [(k + 1) as f32 * 0.4, 1.0],
+                [(k + 1) as f32 * 0.4, 0.0],
+                [k as f32 * 0.4, 0.0],
+            ],
+            vunit(mid),
+        );
+    }
+    // ---- sidewalk fill: arc at rw joined corner-to-corner with both walks
+    let tu2 = vadd(c, vmul(nu, -rw));
+    let tv2 = vadd(c, vmul(nv, -rw));
+    let p1b = vadd(tu2, vmul(du, tail));
+    let p2b = vadd(tv2, vmul(dv, tail));
+    let p1 = vadd(p1b, vmul(nu, (hwu - hru - KERB_W).max(0.15)));
+    let p2 = vadd(p2b, vmul(nv, (hwv - hrv - KERB_W).max(0.15)));
+    let Some(p3) = line_int2(
+        vadd(lu, vmul(nu, hwu - hru)),
+        du,
+        vadd(lv, vmul(nv, hwv - hrv)),
+        dv,
+    ) else {
+        return;
+    };
+    let mut poly: Vec<[f32; 2]> = Vec::with_capacity(steps + 6);
+    poly.push(tu2);
+    for k in 1..steps {
+        let a = arc(k);
+        poly.push([c[0] + a.cos() * rw, c[1] + a.sin() * rw]);
+    }
+    poly.push(tv2);
+    poly.push(p2b);
+    poly.push(p2);
+    poly.push(p3);
+    poly.push(p1);
+    poly.push(p1b);
+    for t in poly_tris(&poly) {
+        let (a, bp, cp) = (poly[t[0]], poly[t[1]], poly[t[2]]);
+        tri_j(
+            b,
+            M_WALK,
+            [
+                ctx.pt(a[0], a[1], hw_t),
+                ctx.pt(bp[0], bp[1], hw_t),
+                ctx.pt(cp[0], cp[1], hw_t),
+            ],
+            [
+                [a[0] / 2.0, a[1] / 2.0],
+                [bp[0] / 2.0, bp[1] / 2.0],
+                [cp[0] / 2.0, cp[1] / 2.0],
+            ],
+        );
+    }
+    // skirt the outer boundary edges down to the ground
+    let am = a0 + da * 0.5;
+    let refp = [c[0] + am.cos() * (rw * 0.6), c[1] + am.sin() * (rw * 0.6)];
+    for k in steps..poly.len() {
+        let a = poly[k];
+        let bp = poly[(k + 1) % poly.len()];
+        let e = vsub(bp, a);
+        if vlen(e) < 0.05 {
+            continue;
+        }
+        let nrm = vperp(vunit(e));
+        let mid = [(a[0] + bp[0]) * 0.5, (a[1] + bp[1]) * 0.5];
+        let outward = if vdot(nrm, vsub(mid, refp)) > 0.0 {
+            nrm
+        } else {
+            vmul(nrm, -1.0)
+        };
+        let (z0, z1) = (ctx.hh(a[0], a[1]) - 0.5, ctx.hh(bp[0], bp[1]) - 0.5);
+        face_quad_j(
+            b,
+            M_WALK,
+            [
+                ctx.pt(a[0], a[1], hw_t),
+                ctx.pt(bp[0], bp[1], hw_t),
+                ctx.pt(bp[0], bp[1], z1),
+                ctx.pt(a[0], a[1], z0),
+            ],
+            [
+                [a[0] / 2.0, 0.9],
+                [bp[0] / 2.0, 0.9],
+                [bp[0] / 2.0, 0.0],
+                [a[0] / 2.0, 0.0],
+            ],
+            outward,
+        );
+    }
+    // ---- signals: the arm's own right side of this corner gets a pole
+    if hru >= 3.0 && hrv >= 3.0 && r > 2.6 {
+        let rv_u = [du[1], -du[0]];
+        if vdot(nu, rv_u) > 0.2 {
+            let aa = arc(1);
+            let pos = vadd(c, vmul([aa.cos(), aa.sin()], -(rw - 0.55)));
+            traffic_light(b, ctx, pos, hw_t, du);
+        }
+        let rv_v = [dv[1], -dv[0]];
+        if vdot(nv, rv_v) > 0.2 {
+            let aa = arc(steps - 1);
+            let pos = vadd(c, vmul([aa.cos(), aa.sin()], -(rw - 0.55)));
+            traffic_light(b, ctx, pos, hw_t, dv);
+        }
+    }
+}
+
+/// All corner corners + markings of one junction event.
+fn junction_patch(b: &mut Builder, ctx: &Ctx, ev: &JEv) {
+    if ev.arms.len() < 2 {
+        return;
+    }
+    let q = ev.q;
+    let mut jh = f32::MIN;
+    for &(d, hrw, hww) in &ev.arms {
+        for t in [hrw, hww] {
+            for s in [-t, t] {
+                let p = [q[0] + d[0] * s, q[1] + d[1] * s];
+                jh = jh.max(ctx.hh(p[0], p[1]));
+            }
+        }
+    }
+    let jh = jh + ROAD_H;
+    let mut idx: Vec<usize> = (0..ev.arms.len()).collect();
+    idx.sort_by(|&x, &y| {
+        let (a, c) = (ev.arms[x].0, ev.arms[y].0);
+        a[1].atan2(a[0])
+            .partial_cmp(&c[1].atan2(c[0]))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    let n = idx.len();
+    if std::env::var("KOLOMNA_J_DEBUG").is_ok() {
+        eprintln!("junction at ({:.1},{:.1}): {n} arms, floor {jh:.2}", q[0], q[1]);
+    }
+    for k in 0..n {
+        let iu = idx[k];
+        let iv = idx[(k + 1) % n];
+        let (du, hru, hwu) = ev.arms[iu];
+        let (dv, hrv, hwv) = ev.arms[iv];
+        let cross = du[0] * dv[1] - du[1] * dv[0];
+        let dotp = du[0] * dv[0] + du[1] * dv[1];
+        let mut th = cross.atan2(dotp);
+        if th < 0.0 {
+            th += std::f32::consts::TAU;
+        }
+        if th > std::f32::consts::PI - 0.09 || th < 0.14 {
+            continue;
+        }
+        corner_patch(b, ctx, q, du, hru, hwu, dv, hrv, hwv, th, jh);
+    }
+    for k in 0..n {
+        zebra_stop(b, ctx, ev, idx[k]);
+    }
+}
+
+/// Split a freshly drawn chain where it merely re-covers existing ways:
+/// samples within `DUP_D` of an existing way that run parallel to it
+/// (|dot| > 0.9) are dropped; the remaining runs are returned as new chains.
+/// Also returns the total skipped length (metres).
+pub fn split_duplicate(
+    chain: &[[f32; 2]],
+    roads: &[Vec<[f32; 2]>],
+    net: &Params,
+) -> (Vec<Vec<[f32; 2]>>, f32) {
+    const DUP_D: f32 = 2.4;
+    const DUP_PAR: f32 = 0.9;
+    if chain.len() < 2 {
+        return (Vec::new(), 0.0);
+    }
+    let mut main_pts = [[0.0f32, 0.0], [0.0, 0.0]];
+    if net.main_t1 > net.main_t0 + 1.0 {
+        main_pts = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
+    }
+    let mut lane_pts: Vec<[[f32; 2]; 2]> = Vec::new();
+    for &(uc, _cr, _cw) in &net.cross {
+        lane_pts.push([[uc, 3.5], [uc, net.cross_half.max(3.6)]]);
+        lane_pts.push([[uc, -net.cross_half.max(3.6)], [uc, -3.5]]);
+    }
+    let mut ways: Vec<&[[f32; 2]]> = Vec::new();
+    for r in roads {
+        if r.len() >= 2 {
+            ways.push(r);
+        }
+    }
+    ways.push(&main_pts);
+    for lp in &lane_pts {
+        ways.push(lp);
+    }
+    // resample the chain at 2 m
+    let step = 2.0f32;
+    let mut pts: Vec<[f32; 2]> = vec![chain[0]];
+    let mut dirs: Vec<[f32; 2]> = vec![[0.0, 0.0]];
+    {
+        let mut carry = 0.0f32;
+        for k in 0..chain.len() - 1 {
+            let (a, e) = (chain[k], chain[k + 1]);
+            let d = vsub(e, a);
+            let l = vlen(d);
+            if l < 1e-4 {
+                continue;
+            }
+            let u = vunit(d);
+            let mut s = step - carry;
+            while s < l {
+                pts.push(vadd(a, vmul(u, s)));
+                dirs.push(u);
+                s += step;
+            }
+            carry = (carry + l) % step;
+        }
+        let last = chain[chain.len() - 1];
+        if vlen(vsub(*pts.last().unwrap(), last)) > 0.4 {
+            pts.push(last);
+            dirs.push(vunit(vsub(last, chain[chain.len() - 2])));
+        } else if pts.len() >= 2 {
+            let l = pts.len() - 1;
+            pts[l] = last;
+        }
+    }
+    // classify samples: covered by an existing way or by an earlier accepted stretch
+    let mut covered = vec![false; pts.len()];
+    let mut prev: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    for k in 0..pts.len() {
+        let p = pts[k];
+        let d = dirs[k];
+        let mut cov = false;
+        for w in &ways {
+            let (np, dd) = near_poly(w, p);
+            if dd < DUP_D && vdot(d, dir_at(w, np)).abs() > DUP_PAR {
+                cov = true;
+                break;
+            }
+        }
+        if !cov {
+            for (pp, pd) in &prev {
+                if vlen(vsub(*pp, p)) < DUP_D && vdot(d, *pd).abs() > DUP_PAR {
+                    cov = true;
+                    break;
+                }
+            }
+        }
+        if !cov {
+            prev.push((p, d));
+        }
+        covered[k] = cov;
+    }
+    // bridge hairline holes so a run is not split by a single noisy sample
+    for k in 1..covered.len().saturating_sub(1) {
+        if covered[k] && !covered[k - 1] && !covered[k + 1] {
+            covered[k] = false;
+        }
+    }
+    let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
+    let mut skipped = 0.0f32;
+    let mut k = 0;
+    while k < pts.len() {
+        if covered[k] {
+            skipped += step;
+            k += 1;
+            continue;
+        }
+        let start = k;
+        while k < pts.len() && !covered[k] {
+            k += 1;
+        }
+        let run = &pts[start..k];
+        if run.len() >= 2 && (run.len() as f32) * step >= 2.5 {
+            let mut v = run.to_vec();
+            if start == 0 {
+                v[0] = chain[0];
+            }
+            if k == pts.len() {
+                let l = v.len();
+                v[l - 1] = chain[chain.len() - 1];
+            }
+            out.push(v);
+        } else {
+            skipped += run.len() as f32 * step;
+        }
+    }
+    (out, skipped)
+}
+
 /// [`build_roads`] + extra way clearers: polylines the given chains must keep
 /// clear of (junctions trim kerbs/walks, free ends extend T-attachments)
 /// WITHOUT being triangulated themselves — the live stroke preview passes the
@@ -1452,21 +2123,168 @@ pub fn build_roads_ext(
         }
     };
 
+    let mut main_pts = [[0.0f32, 0.0], [0.0, 0.0]];
+    if net.main_t1 > net.main_t0 + 1.0 {
+        main_pts = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
+    }
+    let mut lane_pts: Vec<[[f32; 2]; 2]> = Vec::new();
+    for &(uc, _cr, _cw) in &net.cross {
+        lane_pts.push([[uc, 3.5], [uc, net.cross_half.max(3.6)]]);
+        lane_pts.push([[uc, -net.cross_half.max(3.6)], [uc, -3.5]]);
+    }
+    // ---- junction events: every crossing between ways where at least one
+    // side is a drawn chain (crossings, chain×chain, self-crossings, T-hits)
+    struct Way<'a> {
+        pts: &'a [[f32; 2]],
+        hr: f32,
+        hw: f32,
+        chain: bool,
+    }
+    let mut ways_j: Vec<Way> = Vec::new();
+    for ch in chains.iter() {
+        if ch.len() >= 2 {
+            ways_j.push(Way {
+                pts: ch,
+                hr,
+                hw,
+                chain: true,
+            });
+        }
+    }
+    for ch in extra {
+        if ch.len() >= 2 {
+            ways_j.push(Way {
+                pts: ch,
+                hr,
+                hw,
+                chain: false,
+            });
+        }
+    }
+    if net.main_t1 > net.main_t0 + 1.0 {
+        ways_j.push(Way {
+            pts: &main_pts,
+            hr,
+            hw,
+            chain: false,
+        });
+    }
+    for (k, lp) in lane_pts.iter().enumerate() {
+        let lw = net.cross[k / 2];
+        ways_j.push(Way {
+            pts: lp,
+            hr: lw.1,
+            hw: lw.2,
+            chain: false,
+        });
+    }
+    let mut evs: Vec<JEv> = Vec::new();
+    let mut ev_keys: Vec<(u64, [f32; 2])> = Vec::new();
+    for i in 0..ways_j.len() {
+        for j in i + 1..ways_j.len() {
+            if !ways_j[i].chain && !ways_j[j].chain {
+                continue;
+            }
+            let (wa, wb) = (&ways_j[i], &ways_j[j]);
+            for s in 0..wa.pts.len().saturating_sub(1) {
+                for t in 0..wb.pts.len().saturating_sub(1) {
+                    if let Some((q, _ta, _tb)) =
+                        seg_int(wa.pts[s], wa.pts[s + 1], wb.pts[t], wb.pts[t + 1])
+                    {
+                        let di = vunit(vsub(wa.pts[s + 1], wa.pts[s]));
+                        let dj = vunit(vsub(wb.pts[t + 1], wb.pts[t]));
+                        push_ev(
+                            &mut evs,
+                            &mut ev_keys,
+                            ev_key(i, j),
+                            q,
+                            vec![
+                                (di, wa.hr, wa.hw),
+                                (vmul(di, -1.0), wa.hr, wa.hw),
+                                (dj, wb.hr, wb.hw),
+                                (vmul(dj, -1.0), wb.hr, wb.hw),
+                            ],
+                        );
+                    }
+                }
+            }
+        }
+    }
+    // self-crossings of a chain
+    for i in 0..ways_j.len() {
+        if !ways_j[i].chain {
+            continue;
+        }
+        let wa = &ways_j[i];
+        for s in 0..wa.pts.len().saturating_sub(1) {
+            for t in (s + 2)..wa.pts.len().saturating_sub(1) {
+                if let Some((q, _ta, _tb)) =
+                    seg_int(wa.pts[s], wa.pts[s + 1], wa.pts[t], wa.pts[t + 1])
+                {
+                    let di = vunit(vsub(wa.pts[s + 1], wa.pts[s]));
+                    let dj = vunit(vsub(wa.pts[t + 1], wa.pts[t]));
+                    if vdot(di, dj).abs() > 0.985 {
+                        continue;
+                    }
+                    push_ev(
+                        &mut evs,
+                        &mut ev_keys,
+                        ev_key(i, i),
+                        q,
+                        vec![
+                            (di, wa.hr, wa.hw),
+                            (vmul(di, -1.0), wa.hr, wa.hw),
+                            (dj, wa.hr, wa.hw),
+                            (vmul(dj, -1.0), wa.hr, wa.hw),
+                        ],
+                    );
+                }
+            }
+        }
+    }
+    // free ends landing on another way join as three-arm junctions
+    for i in 0..ways_j.len() {
+        if !ways_j[i].chain {
+            continue;
+        }
+        let wa = &ways_j[i];
+        let endn = wa.pts.len() - 1;
+        for isp in [true, false] {
+            let ep = wa.pts[if isp { 0 } else { endn }];
+            for (j, wb) in ways_j.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                let (np, d) = near_poly(wb.pts, ep);
+                if d > 0.45 {
+                    continue;
+                }
+                let dird = if isp {
+                    vunit(vsub(wa.pts[1], wa.pts[0]))
+                } else {
+                    vunit(vsub(wa.pts[endn], wa.pts[endn - 1]))
+                };
+                let db = dir_at(wb.pts, np);
+                push_ev(
+                    &mut evs,
+                    &mut ev_keys,
+                    ev_key(i, j),
+                    np,
+                    vec![
+                        (dird, wa.hr, wa.hw),
+                        (db, wb.hr, wb.hw),
+                        (vmul(db, -1.0), wb.hr, wb.hw),
+                    ],
+                );
+            }
+        }
+    }
     for (ci, ch) in chains.iter().enumerate() {
         if ch.len() < 2 {
             continue;
         }
         // the ways this chain must keep clear of: every other chain, the
         // main street and the cross lanes (raw polylines + half-widths)
-        let mut main_pts = [[0.0f32, 0.0], [0.0, 0.0]];
-        if net.main_t1 > net.main_t0 + 1.0 {
-            main_pts = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
-        }
-        let mut lane_pts: Vec<[[f32; 2]; 2]> = Vec::new();
-        for &(uc, _cr, _cw) in &net.cross {
-            lane_pts.push([[uc, 3.5], [uc, net.cross_half.max(3.6)]]);
-            lane_pts.push([[uc, -net.cross_half.max(3.6)], [uc, -3.5]]);
-        }
         let mut clearers: Vec<(&[[f32; 2]], f32, f32)> = Vec::new();
         for (oj, och) in chains.iter().enumerate() {
             if oj != ci && och.len() >= 2 {
@@ -1544,18 +2362,45 @@ pub fn build_roads_ext(
         let band_hit = |s0: &St, s1: &St, x0: f32, x1: f32| -> bool {
             for (st, x) in [(s0, x0), (s0, x1), (s1, x0), (s1, x1)] {
                 let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
-                if blocked(q, 0.0) {
+                // the margin leaves room for the junction fillet arcs
+                if blocked(q, 4.0) {
                     return true;
                 }
             }
             false
         };
+        // never redraw roadway that already exists: pairs running parallel
+        // (|dot| > 0.9) within 2.4 m of another way or of an earlier stretch
+        // of this same chain are skipped entirely
+        let mut dup_prev: Vec<([f32; 2], [f32; 2])> = Vec::new();
         for j in 0..stns.len() - 1 {
             let (a, e) = (&stns[j], &stns[j + 1]);
             let st3 = |st: &St, x: f32, z: f32| -> [f32; 3] {
                 let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
                 ctx.pt(q[0], q[1], z)
             };
+            let mid = [(a.p[0] + e.p[0]) * 0.5, (a.p[1] + e.p[1]) * 0.5];
+            let pdir = vunit(vsub(e.p, a.p));
+            let mut dup = false;
+            for &(pp, pd) in &dup_prev {
+                if vlen(vsub(pp, mid)) < 2.4 && vdot(pdir, pd).abs() > 0.9 {
+                    dup = true;
+                    break;
+                }
+            }
+            if !dup {
+                for &(opts, _ohr, _ohw) in &clearers {
+                    let (np, d) = near_poly(opts, mid);
+                    if d < 2.4 && vdot(pdir, dir_at(opts, np)).abs() > 0.9 {
+                        dup = true;
+                        break;
+                    }
+                }
+            }
+            if dup {
+                continue;
+            }
+            dup_prev.push((mid, pdir));
             let kp = !band_hit(a, e, hr, hw);
             let kn = !band_hit(a, e, -hw, -hr);
             // roadway slab
@@ -1685,9 +2530,50 @@ pub fn build_roads_ext(
             &|q: [f32; 2]| blocked(q, 0.6),
         );
     }
-    (b.finish(12), textures())
+    // junction patches: pocket asphalt, fillet kerbs, sidewalk fills, zebra
+    // crossings with stop lines and traffic lights on every crossing
+    for ev in &evs {
+        junction_patch(&mut b, &ctx, ev);
+    }
+    (b.finish(13), textures())
 }
 
+
+/// Traffic-light lenses: three vertical zones (red / amber / green discs on
+/// a near-black housing face); lens quads sample the centre of their zone.
+fn tex_lights() -> (u32, u32, Vec<u8>) {
+    let mut v = Vec::with_capacity(64 * 192 * 4);
+    for y in 0..192u32 {
+        for x in 0..64u32 {
+            let zone = y / 64; // 0 red (top), 1 amber, 2 green
+            let cy = (zone * 64) as i32 + 32;
+            let dx = x as i32 - 32;
+            let dy = y as i32 - cy;
+            let r2 = dx * dx + dy * dy;
+            let bg = 24 + (hash2(x + 900, y + 901) % 7) as i32 - 3;
+            if r2 < 26 * 26 {
+                let t = (r2 as f32 / (26.0 * 26.0)).sqrt();
+                let bright = (100.0 - t * 55.0) as i32;
+                let (base, hi) = match zone {
+                    0 => ((196, 44, 36), (255, 96, 78)),
+                    1 => ((216, 156, 34), (255, 208, 96)),
+                    _ => ((52, 168, 84), (128, 235, 140)),
+                };
+                push(
+                    &mut v,
+                    base.0 * bright / 100 + hi.0 * (100 - bright) / 100,
+                    base.1 * bright / 100 + hi.1 * (100 - bright) / 100,
+                    base.2 * bright / 100 + hi.2 * (100 - bright) / 100,
+                );
+            } else if r2 < 30 * 30 {
+                push(&mut v, 12, 13, 15);
+            } else {
+                push(&mut v, bg, bg + 1, bg + 3);
+            }
+        }
+    }
+    (64, 192, v)
+}
 
 /// Cast iron: near-black with a cold sheen and fine grain.
 fn tex_iron() -> (u32, u32, Vec<u8>) {
@@ -1813,6 +2699,7 @@ pub fn textures() -> Vec<(u32, u32, Vec<u8>)> {
         tex_sign(),
                 tex_wood(),
                 tex_white(),
+                tex_lights(),
             ]
         })
         .clone()
