@@ -83,11 +83,14 @@ pub struct Scene {
     mn: f32,
     /// water surface level (metres)
     wl: f32,
-    /// smoothed height grid (metres, water-clamped) — the exact field the
-    /// mesh is built from; the camera raycasts it for the rotation pivot
+    /// smoothed height grid (metres, water-clamped) — the exact 4 m field the
+    /// render mesh is built from; every consumer samples it (roads, houses,
+    /// gardens, picking, the camera raycast for the rotation pivot)
     sm: Vec<f32>,
-    /// grid side length of `sm`
+    /// grid side length of `sm` (4 m nodes; `kf` maps 16 m grid cells into it)
     n: usize,
+    /// coarse-cell (16 m) coordinates -> `sm` cell coordinates
+    kf: f32,
     /// plan frame: cell coords of plan (0,0) and its orthonormal axes
     anchor: [f32; 2],
     eu: [f32; 2],
@@ -781,15 +784,15 @@ pub fn load_scene(user: &UserPlan, skip_proc: bool) -> Result<Scene, Box<dyn Err
         .unwrap_or(0x5EED_1957);
     let world = kolomna_render::terrain_gen::generate(seed);
     let terrain = world.coarse;
-    let n = grid_side(&terrain);
-    if n * n != terrain.len() {
+    let cn = grid_side(&terrain);
+    if cn * cn != terrain.len() {
         return Err(format!("terrain grid is not square ({} values)", terrain.len()).into());
     }
     let mn = world.mn;
     let mx = world.mx;
     let wl = world.wl;
     println!(
-        "terrain: {n}x{n} generated (seed {seed:#x}), altitude {mn:.1}..{mx:.1} m, water surface {wl:.2} m"
+        "terrain: {cn}x{cn} generated (seed {seed:#x}), altitude {mn:.1}..{mx:.1} m, water surface {wl:.2} m"
     );
 
     let atlas = kolomna_render::terrain_gen::terrain_textures();
@@ -809,7 +812,16 @@ pub fn load_scene(user: &UserPlan, skip_proc: bool) -> Result<Scene, Box<dyn Err
     // ---- terrain field + mesh (the houses adapt to it, not vice versa) ---
     // the render mesh samples the generator at 4 m so slopes stay smooth
     let base = build_mesh(&world.fine, mn, mx, wl);
-    let sm = smooth_field(&terrain, wl);
+    // The height field EVERY consumer samples (roads, houses, gardens, plan
+    // rings, the camera raycast): the same 4 m grid `build_mesh` smooths and
+    // renders — NOT the 16 m `world.coarse` copy, which misses metre-scale
+    // relief. Roads posed on the coarse field sat up to ~2 m off the drawn
+    // surface on hills: terrain punched through the asphalt (holes) and the
+    // kerbs floated between section stations.
+    let sm = smooth_field(&world.fine, wl);
+    let n = grid_side(&sm);
+    // coarse-cell (16 m grid) coordinates -> `sm` cell coordinates
+    let kf = (n - 1) as f32 / (cn - 1) as f32;
     println!("mesh: {} triangles", base.len() / 3);
 
     // ---- two Petersburg courtyards (дворы-колодцы) beside the street ------
@@ -826,8 +838,8 @@ pub fn load_scene(user: &UserPlan, skip_proc: bool) -> Result<Scene, Box<dyn Err
         sample_h(
             &sm,
             n,
-            x.clamp(0.0, (n - 1) as f32),
-            z.clamp(0.0, (n - 1) as f32),
+            x.clamp(0.0, (cn - 1) as f32) * kf,
+            z.clamp(0.0, (cn - 1) as f32) * kf,
         )
     };
     let nvec = [-dz, dx]; // road normal
@@ -1070,12 +1082,13 @@ pub fn load_scene(user: &UserPlan, skip_proc: bool) -> Result<Scene, Box<dyn Err
     Ok(Scene {
         base,
         atlas,
-        grid: (n - 1) as f32,
+        grid: (cn - 1) as f32,
         zspan: (mx - mn) * ZSCALE,
         mn,
         wl,
         sm,
         n,
+        kf,
         anchor,
         eu,
         nvec,
@@ -1384,9 +1397,7 @@ impl Camera {
     /// lands where the user clicked).
     fn set_pivot_from_screen(
         &mut self,
-        sm: &[f32],
-        n: usize,
-        mn: f32,
+        scene: &Scene,
         px: f64,
         py: f64,
         win: (f64, f64),
@@ -1405,7 +1416,7 @@ impl Camera {
         for _ in 0..20 {
             let cx = (s + a).clamp(0.0, self.grid);
             let cy = (s - a).clamp(0.0, self.grid);
-            let zmesh = (sample_h(sm, n, cx, cy) - mn) * ZSCALE;
+            let zmesh = (hx(scene, cx, cy) - scene.mn) * ZSCALE;
             s = ((b + zmesh) / t).clamp(0.0, smax);
         }
         // The ray inversion yields camera-rotated ("rp") coordinates, but the
@@ -1435,6 +1446,20 @@ fn sample_h(sm: &[f32], n: usize, cx: f32, cy: f32) -> f32 {
     let h01 = sm[(y0 + 1) * n + x0];
     let h11 = sm[(y0 + 1) * n + x0 + 1];
     (h00 * (1.0 - fx) + h10 * fx) * (1.0 - fy) + (h01 * (1.0 - fx) + h11 * fx) * fy
+}
+
+/// Height at COARSE-cell (16 m scene grid) coordinates, sampled from the very
+/// field the render mesh is built from (the 4 m grid in `Scene.sm`). The 16 m
+/// `world.coarse` copy misses metre-scale relief — roads/houses posed on it
+/// punched holes and floated on uneven ground.
+fn hx(scene: &Scene, cx: f32, cy: f32) -> f32 {
+    let b = (scene.n - 1) as f32 / scene.kf;
+    sample_h(
+        &scene.sm,
+        scene.n,
+        cx.clamp(0.0, b) * scene.kf,
+        cy.clamp(0.0, b) * scene.kf,
+    )
 }
 
 // ------------------------------------------------------------- renderer ----
@@ -2483,9 +2508,15 @@ impl ApplicationHandler for App {
                     &self.user.roads,
                     &scene.net,
                 );
-                let boxes = [(0.0f32, 0.0f32, 4.5f32), (100.0, 100.0, 4.5f32)];
+                // the boxes cover the carriageway interiors: the corner
+                // fillet rings legitimately curve to ~4.35 m from the centre,
+                // so they sit outside; kerb-ish geometry within the roadway
+                // square itself would be a leak
+                let boxes = [(0.0f32, 0.0f32, 3.4f32), (100.0, 100.0, 3.4f32)];
                 let mut bad = 0usize;
                 let mut asph = 0usize;
+                let mut dbg: Vec<(f32, f32, u32, f32, f32)> = Vec::new();
+                let mut dbg_tri: Vec<[(f32, f32); 3]> = Vec::new();
                 for part in &mesh.parts {
                     let kerbish = part.texture == 1 || part.texture == 2;
                     let is_a = part.texture == 0;
@@ -2506,6 +2537,23 @@ impl ApplicationHandler for App {
                             if (uu - bu).abs() < bh && (vv - bv).abs() < bh {
                                 if kerbish {
                                     bad += 1;
+                                    if dbg.len() < 80 {
+                                        dbg.push((uu, vv, part.texture, bu, bv));
+                                        let t0 = i0 + ((k - i0) / 3) * 3;
+                                        let mut tri = [(0.0f32, 0.0f32); 3];
+                                        for (m, kk) in (t0..t0 + 3).enumerate() {
+                                            let pv = mesh.verts[mesh.indices[kk] as usize].pos;
+                                            let w2 = [
+                                                pv[0] - scene.anchor[0] * 16.0,
+                                                pv[2] - scene.anchor[1] * 16.0,
+                                            ];
+                                            tri[m] = (
+                                                w2[0] * scene.eu[0] + w2[1] * scene.eu[1],
+                                                w2[0] * scene.nvec[0] + w2[1] * scene.nvec[1],
+                                            );
+                                        }
+                                        dbg_tri.push(tri);
+                                    }
                                 } else {
                                     asph += 1;
                                 }
@@ -2517,6 +2565,17 @@ impl ApplicationHandler for App {
                     "selftest: junction boxes kerb/walk verts {}, asphalt verts {}",
                     bad, asph
                 );
+                if bad > 0 {
+                    for (i, (uu, vv, tex, bu, bv)) in dbg.iter().enumerate() {
+                        println!("badbox u={uu:7.2} v={vv:7.2} tex={tex} box=({bu},{bv})");
+                        if let Some(t) = dbg_tri.get(i) {
+                            println!(
+                                "  tri ({:7.2},{:7.2}) ({:7.2},{:7.2}) ({:7.2},{:7.2})",
+                                t[0].0, t[0].1, t[1].0, t[1].1, t[2].0, t[2].1
+                            );
+                        }
+                    }
+                }
                 assert_eq!(bad, 0, "kerb/walk geometry inside a junction box");
                 assert!(asph > 0, "no asphalt inside a junction box");
                 // snap probe: a point near road 1 lands on its centreline
@@ -2531,6 +2590,76 @@ impl ApplicationHandler for App {
                 );
             }
             println!("selftest: junctions OK");
+            // a chain crossing itself must grow a junction of its own
+            println!("selftest: self-crossing commit ...");
+            let ev0 = {
+                let np = self
+                    .scene
+                    .as_ref()
+                    .map(|s| s.net.clone())
+                    .unwrap_or_default();
+                kolomna_render::streets::net_cuts(&np, &self.user.roads).events
+            };
+            self.set_tool(1);
+            self.pts = vec![
+                [-180.0, 40.0],
+                [-120.0, 100.0],
+                [-180.0, 150.0],
+                [-250.0, 95.0],
+                [-148.0, 41.0],
+            ];
+            self.commit();
+            {
+                let scene = self.scene.as_ref().unwrap();
+                let np = scene.net.clone();
+                let cuts = kolomna_render::streets::net_cuts(&np, &self.user.roads);
+                println!(
+                    "selftest: self-crossing junctions {ev0} -> {} event(s)",
+                    cuts.events
+                );
+                assert!(
+                    cuts.events > ev0,
+                    "the self-crossing produced no new junction"
+                );
+                // mesh-level: the crossing carries traffic lights of its own
+                let h_at = Self::scene_h_at(scene);
+                let (mesh, _) = kolomna_render::streets::build_roads(
+                    &h_at,
+                    scene.anchor,
+                    scene.mn,
+                    scene.eu,
+                    scene.nvec,
+                    &self.user.roads,
+                    &scene.net,
+                );
+                let mut near = 0usize;
+                for part in &mesh.parts {
+                    if part.texture != 12 {
+                        continue;
+                    }
+                    let i0 = part.first_index as usize;
+                    let i1 = i0 + part.index_count as usize;
+                    for k in i0..i1 {
+                        let vx = mesh.verts[mesh.indices[k] as usize].pos;
+                        let w = [
+                            vx[0] - scene.anchor[0] * 16.0,
+                            vx[2] - scene.anchor[1] * 16.0,
+                        ];
+                        let uu = w[0] * scene.eu[0] + w[1] * scene.eu[1];
+                        let vv = w[0] * scene.nvec[0] + w[1] * scene.nvec[1];
+                        // the poles of a crossing this size sit along the
+                        // legs a good deal out (≈19–23 m from the centre):
+                        // we only need to see that THIS crossing's lights exist
+                        if (uu + 168.3).abs() < 26.0 && (vv - 51.7).abs() < 26.0 {
+                            near += 1;
+                            break;
+                        }
+                    }
+                }
+                println!("selftest: self-crossing lights near the crossing: {near}");
+                assert!(near > 0, "no traffic lights at the self-crossing junction");
+            }
+            println!("selftest: self-crossing OK");
             println!("selftest: courtyard commit ...");
             self.set_tool(2);
             self.pts = vec![[310.0, 60.0], [360.0, 55.0], [365.0, 105.0], [305.0, 110.0]];
@@ -2612,7 +2741,15 @@ impl ApplicationHandler for App {
             // B9: a courtyard/park vertex snaps onto the kerb edge of a road
             {
                 let sp = self.shape_snap_point([336.0, 90.0]);
-                let (_, dd) = kolomna_render::streets::near_poly(&self.user.roads[3], sp);
+                // nearest chain, not a fixed index: earlier sections may
+                // insert more roads, and the probe must not go stale
+                let (_, dd) = self
+                    .user
+                    .roads
+                    .iter()
+                    .map(|ch| kolomna_render::streets::near_poly(ch, sp))
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+                    .unwrap();
                 println!(
                     "selftest: shape snap probe (336.0, 90.0) -> ({:.2}, {:.2}), {dd:.2} m off the centreline",
                     sp[0], sp[1]
@@ -2776,9 +2913,7 @@ impl ApplicationHandler for App {
                                     self.cursor,
                                 ) {
                                     cam.set_pivot_from_screen(
-                                        &scene.sm,
-                                        scene.n,
-                                        scene.mn,
+                                        scene,
                                         px,
                                         py,
                                         self.win_size,
@@ -2970,9 +3105,8 @@ fn preview_mesh(scene: &Scene, pts: &[[f32; 2]]) -> Option<kolomna_render::model
             scene.eu[0] * u + scene.nvec[0] * v,
             scene.eu[1] * u + scene.nvec[1] * v,
         ];
-        let h = sample_h(
-            &scene.sm,
-            scene.n,
+        let h = hx(
+            scene,
             scene.anchor[0] + w[0] / 16.0,
             scene.anchor[1] + w[1] / 16.0,
         ) - scene.mn
@@ -3048,7 +3182,7 @@ impl App {
         for _ in 0..20 {
             let cx = (s + a).clamp(0.0, cam.grid);
             let cy = (s - a).clamp(0.0, cam.grid);
-            let zmesh = (sample_h(&scene.sm, scene.n, cx, cy) - scene.mn) * ZSCALE;
+            let zmesh = (hx(scene, cx, cy) - scene.mn) * ZSCALE;
             s = ((b + zmesh) / t).clamp(0.0, smax);
         }
         let rp = [s + a, s - a];
@@ -3703,10 +3837,7 @@ impl App {
 
     /// The scene's cell-space height sampler (what the generators take).
     fn scene_h_at(scene: &Scene) -> impl Fn(f32, f32) -> f32 + '_ {
-        let n = scene.n;
-        move |x: f32, z: f32| {
-            sample_h(&scene.sm, n, x.clamp(0.0, (n - 1) as f32), z.clamp(0.0, (n - 1) as f32))
-        }
+        move |x: f32, z: f32| hx(scene, x, z)
     }
 
     /// Append only the park that was just committed: the roads running

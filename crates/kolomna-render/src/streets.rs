@@ -1339,6 +1339,24 @@ pub fn net_cuts(p: &Params, chains: &[Vec<[f32; 2]>]) -> NetCuts {
         let lw = p.cross[k / 2];
         ways.push(JWay { pts: &lane_pts[k], hr: lw.1, hw: lw.2, kind: WKind::Lane(k / 2) });
     }
+    // self-crossings of a chain: same enumeration the mesh's junction pass
+    // uses, so the counters match what build_roads will actually draw
+    for w in ways.iter() {
+        if !matches!(w.kind, WKind::Chain(_)) {
+            continue;
+        }
+        for s in 0..w.pts.len() - 1 {
+            for t in (s + 2)..w.pts.len() - 1 {
+                if seg_int(w.pts[s], w.pts[s + 1], w.pts[t], w.pts[t + 1]).is_some() {
+                    let di = vunit(vsub(w.pts[s + 1], w.pts[s]));
+                    let dj = vunit(vsub(w.pts[t + 1], w.pts[t]));
+                    if vdot(di, dj).abs() <= 0.995 {
+                        cuts.events += 1;
+                    }
+                }
+            }
+        }
+    }
     for i in 0..ways.len() {
         for j in (i + 1)..ways.len() {
             if !matches!(ways[i].kind, WKind::Chain(_)) && !matches!(ways[j].kind, WKind::Chain(_)) {
@@ -1694,6 +1712,7 @@ fn corner_patch(
     hwv: f32,
     th: f32,
     jh: f32,
+    others: &[[f32; 2]],
 ) {
     use std::f32::consts::{PI, TAU};
     let mut nu = vperp(du);
@@ -1715,6 +1734,13 @@ fn corner_patch(
     let Some(c) = line_int2(cu, du, cv, dv) else {
         return;
     };
+    // a junction owns a 10.5 m disk — the same reach its kerb cuts use:
+    // this fillet must never intrude into a neighbouring junction's zone,
+    // where the two patches would double up and the sector gap of one
+    // junction would get rounded by the other's arc
+    if others.iter().any(|&o| vlen(vsub(c, o)) < 10.5) {
+        return;
+    }
     let tu = vsub(c, vmul(nu, r));
     let tv = vsub(c, vmul(nv, r));
     let a0 = (tu[1] - c[1]).atan2(tu[0] - c[0]);
@@ -1918,7 +1944,7 @@ fn corner_patch(
 }
 
 /// All corner corners + markings of one junction event.
-fn junction_patch(b: &mut Builder, ctx: &Ctx, ev: &JEv) {
+fn junction_patch(b: &mut Builder, ctx: &Ctx, ev: &JEv, others: &[[f32; 2]]) {
     if ev.arms.len() < 2 {
         return;
     }
@@ -1958,7 +1984,7 @@ fn junction_patch(b: &mut Builder, ctx: &Ctx, ev: &JEv) {
         if th > std::f32::consts::PI - 0.09 || th < 0.14 {
             continue;
         }
-        corner_patch(b, ctx, q, du, hru, hwu, dv, hrv, hwv, th, jh);
+        corner_patch(b, ctx, q, du, hru, hwu, dv, hrv, hwv, th, jh, others);
     }
     for k in 0..n {
         zebra_stop(b, ctx, ev, idx[k]);
@@ -2289,7 +2315,7 @@ pub fn build_roads_ext(
                 {
                     let di = vunit(vsub(wa.pts[s + 1], wa.pts[s]));
                     let dj = vunit(vsub(wa.pts[t + 1], wa.pts[t]));
-                    if vdot(di, dj).abs() > 0.985 {
+                    if vdot(di, dj).abs() > 0.995 {
                         continue;
                     }
                     push_ev(
@@ -2419,11 +2445,32 @@ pub fn build_roads_ext(
         }
         let total = stns[stns.len() - 1].s;
         // a sidewalk band (kerb + walk of one side) dies where it would run
-        // into another way's corridor; the roadway slab never dies
+        // into another way's corridor; the roadway slab never dies.
+        // A free END of a way blocks its own mouth corridor beyond the end
+        // (the extension slab that crosses the attached way) plus a short
+        // backsplash; the mouth FLANKS are waived so the attached way's
+        // sidewalk is not undercut to either side of a T-attachment.
         let blocked = |p: [f32; 2], m: f32| -> bool {
-            clearers
-                .iter()
-                .any(|&(opts, _ohr, ohw)| near_poly(opts, p).1 < ohw + m)
+            clearers.iter().any(|&(opts, _ohr, ohw)| {
+                let r = ohw + m;
+                let (q, d) = near_poly(opts, p);
+                if d >= r {
+                    return false;
+                }
+                let n = opts.len();
+                let behind = if n >= 2 && vlen(vsub(q, opts[0])) < 1e-3 {
+                    let i0 = vunit(vsub(opts[1], opts[0]));
+                    let lat = vdot(vsub(p, opts[0]), vperp(i0)).abs();
+                    vdot(vsub(p, opts[0]), i0) < -1.6 && lat > 3.8
+                } else if n >= 2 && vlen(vsub(q, opts[n - 1])) < 1e-3 {
+                    let i0 = vunit(vsub(opts[n - 2], opts[n - 1]));
+                    let lat = vdot(vsub(p, opts[n - 1]), vperp(i0)).abs();
+                    vdot(vsub(p, opts[n - 1]), i0) < -1.6 && lat > 3.8
+                } else {
+                    false
+                };
+                !behind
+            })
         };
         let band_hit = |s0: &St, s1: &St, x0: f32, x1: f32| -> bool {
             for (st, x) in [(s0, x0), (s0, x1), (s1, x0), (s1, x1)] {
@@ -2450,9 +2497,15 @@ pub fn build_roads_ext(
             let mid = [(a.p[0] + e.p[0]) * 0.5, (a.p[1] + e.p[1]) * 0.5];
             let s_mid = (a.s + e.s) * 0.5;
             let pdir = vunit(vsub(e.p, a.p));
+            // never blank the pavement right around a junction: the pocket
+            // and fillet patches need the slab under them (a shallow-angle
+            // crossing would otherwise have its centre eaten by the
+            // parallel-duplicate guard)
+            let near_junc = evs.iter().any(|ev| vlen(vsub(ev.q, mid)) < 9.0);
             let mut dup = false;
             for &(pp, pd, ps) in &dup_prev {
-                if vlen(vsub(pp, mid)) < 2.4
+                if !near_junc
+                    && vlen(vsub(pp, mid)) < 2.4
                     && vdot(pdir, pd).abs() > 0.9
                     && (s_mid - ps).abs() > 6.0
                 {
@@ -2463,7 +2516,7 @@ pub fn build_roads_ext(
             if !dup {
                 for &(opts, _ohr, _ohw) in &clearers {
                     let (np, d) = near_poly(opts, mid);
-                    if d < 2.4 && vdot(pdir, dir_at(opts, np)).abs() > 0.9 {
+                    if !near_junc && d < 2.4 && vdot(pdir, dir_at(opts, np)).abs() > 0.9 {
                         dup = true;
                         break;
                     }
@@ -2599,13 +2652,18 @@ pub fn build_roads_ext(
             total,
             &get,
             &corners,
-            &|q: [f32; 2]| blocked(q, 0.6),
+            &|q: [f32; 2]| blocked(q, 4.8),
         );
     }
     // junction patches: pocket asphalt, fillet kerbs, sidewalk fills, zebra
     // crossings with stop lines and traffic lights on every crossing
     for ev in &evs {
-        junction_patch(&mut b, &ctx, ev);
+        let others: Vec<[f32; 2]> = evs
+            .iter()
+            .filter(|o| !std::ptr::eq(*o, ev))
+            .map(|o| o.q)
+            .collect();
+        junction_patch(&mut b, &ctx, ev, &others);
     }
     (b.finish(13), textures())
 }
