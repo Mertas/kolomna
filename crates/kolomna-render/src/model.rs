@@ -76,7 +76,17 @@ fn vs_model(@location(0) pp: vec3<f32>, @location(1) uv: vec2<f32>, @location(2)
     // fast and free: pure vertex-shader displacement, no CPU work per frame
     let tw = params.time;
     var wp = pp;
-    if (anim >= 3.0) {
+    if (anim >= 4.0) {
+        // editor snap marker: spins about its own centre and breathes
+        let a = tw * 1.15;
+        let ca2 = cos(a);
+        let sa2 = sin(a);
+        let px = wp.x * ca2 - wp.z * sa2;
+        let pz = wp.x * sa2 + wp.z * ca2;
+        let br = 1.0 + 0.09 * sin(tw * 3.2);
+        wp.x = px * br;
+        wp.z = pz * br;
+    } else if (anim >= 3.0) {
         // falling water sheet: the bottom sways, the rim edge stays put
         let w = clamp(anim - 3.0, 0.0, 1.0);
         let ph = h21(floor(vec2<f32>(pp.x, pp.z) * 2.13)) * 6.28318;
@@ -135,7 +145,9 @@ fn vs_model(@location(0) pp: vec3<f32>, @location(1) uv: vec2<f32>, @location(2)
 fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
     var uv2 = in.uv;
     var shim = 0.0;
-    if (in.anim >= 3.0) {
+    if (in.anim >= 4.0) {
+        // snap marker: steady uv — its life is in the vertex spin
+    } else if (in.anim >= 3.0) {
         // falling sheet: the streams run down fast with a lateral waver
         uv2.y = uv2.y + params.time * 1.35;
         uv2.x = uv2.x + sin(params.time * 2.3 + uv2.y * 9.0) * 0.010;
@@ -165,9 +177,13 @@ fn fs_model(in: VsOut) -> @location(0) vec4<f32> {
     let n = normalize(in.nrm);
     let l = normalize(vec3<f32>(-0.40, -0.55, 0.85));
     var lit = 0.60 + 0.50 * max(abs(dot(n, l)), 0.0);
+    if (in.anim >= 4.0) {
+        // the snap marker breathes
+        lit = lit * (0.78 + 0.34 * sin(params.time * 3.2));
+    }
     var rgb = t.rgb;
     var alpha = 1.0;
-    if (in.anim >= 1.0) {
+    if (in.anim >= 1.0 && in.anim < 4.0) {
         // ---- realistic water: rippled normals, sun glints, fresnel sky ----
         let ce2 = sqrt(max(1.0 - params.tilt * params.tilt, 0.01));
         let tk2 = params.tilt / ce2;
@@ -216,9 +232,10 @@ pub struct ModelVertex {
     pub pos: [f32; 3],
     pub uv: [f32; 2],
     pub nrm: [f32; 3],
-    /// water animation channel: 0 static; 1..1.9 basin/tier water ripples;
+    /// animation channel: 0 static; 1..1.9 basin/tier water ripples;
     /// 2..2.9 fountain jet (fraction = height along the column); 3..3.9 a
-    /// falling water sheet (fraction = height along the sheet)
+    /// falling water sheet (fraction = height along the sheet); 4.0 the
+    /// editor's snap marker (spun and breathed in the vertex shader)
     pub anim: f32,
 }
 

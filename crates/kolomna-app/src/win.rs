@@ -1514,6 +1514,10 @@ struct Renderer {
     roads_live_idx: Option<usize>,
     /// the editor's in-progress sketch (drawn over the ground)
     preview: Option<ModelRenderer>,
+    /// the animated snap marker under the block/park cursor
+    snap_marker: Option<ModelRenderer>,
+    /// whether the snap marker should be drawn this frame
+    snap_marker_on: bool,
     ui: UiRenderer,
     msaa_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
@@ -1591,6 +1595,8 @@ impl Renderer {
             roads_idx: scene.roads_idx,
             roads_live_idx: None,
             preview: None,
+            snap_marker: None,
+            snap_marker_on: false,
             ui,
             msaa_view,
             depth_view,
@@ -1598,26 +1604,66 @@ impl Renderer {
     }
 
     /// The editor's in-progress sketch: a flat orange ribbon over the
-    /// ground (None clears it).
+    /// ground (None clears it).  The renderer is created once and then only
+    /// its geometry is swapped, so the sketch can follow the cursor.
     fn set_preview(&mut self, mesh: Option<kolomna_render::model::ModelMesh>) {
-        self.preview = mesh.map(|m| {
-            let tex: Vec<u8> = [255u8, 150, 40, 255]
-                .iter()
-                .copied()
-                .cycle()
-                .take(4 * 4 * 4)
-                .collect();
-            let r = ModelRenderer::new(
-                &self.device,
-                &self.queue,
-                self.config.format,
-                4,
-                &m,
-                &[(4u32, 4u32, tex)],
-            );
-            r.set_placement(&self.queue, [0.0, 0.0, 0.0], 0.0, 0.0);
-            r
-        });
+        let Some(m) = mesh else {
+            self.preview = None;
+            return;
+        };
+        if let Some(r) = self.preview.as_mut() {
+            r.set_mesh(&self.device, &m);
+            return;
+        }
+        let tex: Vec<u8> = [255u8, 150, 40, 255]
+            .iter()
+            .copied()
+            .cycle()
+            .take(4 * 4 * 4)
+            .collect();
+        let r = ModelRenderer::new(
+            &self.device,
+            &self.queue,
+            self.config.format,
+            4,
+            &m,
+            &[(4u32, 4u32, tex)],
+        );
+        r.set_placement(&self.queue, [0.0, 0.0, 0.0], 0.0, 0.0);
+        self.preview = Some(r);
+    }
+
+    /// The animated ground marker under the block/park cursor (None hides
+    /// it): created lazily, then only re-placed — the spin and the breath
+    /// run in the shader (anim 4).
+    fn set_snap_marker(&mut self, at: Option<[f32; 3]>) {
+        match at {
+            Some(pos) => {
+                if self.snap_marker.is_none() {
+                    let mesh = snap_marker_mesh();
+                    let tex: Vec<u8> = [255u8, 182, 52, 255]
+                        .iter()
+                        .copied()
+                        .cycle()
+                        .take(4 * 4 * 4)
+                        .collect();
+                    let r = ModelRenderer::new(
+                        &self.device,
+                        &self.queue,
+                        self.config.format,
+                        4,
+                        &mesh,
+                        &[(4u32, 4u32, tex)],
+                    );
+                    self.snap_marker = Some(r);
+                }
+                if let Some(r) = self.snap_marker.as_ref() {
+                    r.set_placement(&self.queue, pos, 0.0, 0.0);
+                }
+                self.snap_marker_on = true;
+            }
+            None => self.snap_marker_on = false,
+        }
     }
 
     /// Swap in a freshly generated village (the editor's commits): the
@@ -1704,6 +1750,9 @@ impl Renderer {
         if let Some(p) = &self.preview {
             p.set_params(&self.queue, &params);
         }
+        if let Some(m) = &self.snap_marker {
+            m.set_params(&self.queue, &params);
+        }
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t)
@@ -1766,6 +1815,11 @@ impl Renderer {
             }
             if let Some(p) = &self.preview {
                 p.draw(&mut pass);
+            }
+            if self.snap_marker_on {
+                if let Some(m) = &self.snap_marker {
+                    m.draw(&mut pass);
+                }
             }
             self.ui.draw(&self.queue, &mut pass, w, h, ui_state);
         }
@@ -2357,6 +2411,8 @@ struct App {
     user: UserPlan,
     /// last live-preview road point (throttles per-cursor rebuilds)
     last_live: Option<[f32; 2]>,
+    /// last sketch cursor point of the block/park tools (throttle)
+    last_shape: Option<[f32; 2]>,
     /// KOLOMNA_FRAMES: exit cleanly after N rendered frames (render smoke)
     frame_stop: Option<u32>,
     frames_done: u32,
@@ -2759,6 +2815,62 @@ impl ApplicationHandler for App {
                     "shape snap did not land on the kerb edge"
                 );
             }
+            // B10: the snap lookup the sketch/marker both ride on: engages
+            // near a road, stays off far away, and the marker seats on the
+            // ground at the snapped point
+            {
+                let near = self.shape_snap_lookup([336.0, 90.0]);
+                assert!(near.is_some(), "snap did not engage near the road");
+                assert!(
+                    self.shape_snap_lookup([700.0, 700.0]).is_none(),
+                    "snap engaged far away from every road"
+                );
+                let q = near.unwrap();
+                let scene = self.scene.as_ref().unwrap();
+                let pos = self
+                    .snap_marker_pos(q)
+                    .expect("snap marker has no placement");
+                let h = hx(scene, pos[0], pos[1]) - scene.mn;
+                assert!(
+                    (pos[2] - (h + 0.25) * ZSCALE).abs() < 1e-4,
+                    "snap marker is not seated on the ground"
+                );
+                println!(
+                    "selftest: snap marker at ({:.2}, {:.2}, {:.3}) — engaged at ({:.2}, {:.2})",
+                    pos[0], pos[1], pos[2], q[0], q[1]
+                );
+            }
+            // B11: the sketch rubber-band: the preview outline gains the
+            // cursor vertex, snapped to the road when the cursor reaches
+            // one, and the ground marker lights exactly with that snap
+            {
+                self.set_tool(2);
+                self.pts = vec![[332.0, 78.0], [344.0, 78.0], [344.0, 94.0]];
+                self.cursor = Some((self.win_size.0 * 0.5, self.win_size.1 * 0.5));
+                let before = self.pts.len();
+                let (pv, snap) = self.sketch_pts();
+                assert!(
+                    pv.len() >= before,
+                    "the rubber band dropped the clicked points"
+                );
+                self.refresh_preview();
+                let on = self
+                    .renderer
+                    .as_ref()
+                    .map(|r| r.snap_marker_on)
+                    .unwrap_or(false);
+                assert_eq!(
+                    on,
+                    snap.is_some(),
+                    "the snap marker's lit state disagrees with the sketch snap"
+                );
+                println!(
+                    "selftest: sketch {before} clicked -> {} pt(s) with the cursor, snap {}, marker lit {on}",
+                    pv.len(),
+                    snap.is_some()
+                );
+                self.last_shape = None;
+            }
             // timings: the live stroke preview must rebuild instantly
             {
                 self.tool = 1;
@@ -3023,6 +3135,32 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+                // block/park sketch: the rubber band up to the cursor, its
+                // road snap and the ground marker follow too (throttled like
+                // the road stroke)
+                if self.tool >= 2 {
+                    if let Some((raw, _)) = self.shape_cursor() {
+                        let far = self
+                            .last_shape
+                            .map(|q| {
+                                let dx = raw[0] - q[0];
+                                let dy = raw[1] - q[1];
+                                dx * dx + dy * dy > 0.36
+                            })
+                            .unwrap_or(true);
+                        if far {
+                            self.last_shape = Some(raw);
+                            self.refresh_preview();
+                        }
+                    }
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor = None;
+                if self.tool >= 2 {
+                    self.last_shape = None;
+                    self.refresh_preview();
+                }
             }
             WindowEvent::Resized(size) => {
                 self.win_size = (size.width as f64, size.height as f64);
@@ -3151,6 +3289,46 @@ fn preview_mesh(scene: &Scene, pts: &[[f32; 2]]) -> Option<kolomna_render::model
     Some(b.finish(1))
 }
 
+/// The editor's snap marker: a broken ring around a centre dot, spun and
+/// breathed by the model shader (anim 4) so the snap target reads as a
+/// living thing on the ground.
+fn snap_marker_mesh() -> kolomna_render::model::ModelMesh {
+    let mut b = kolomna_render::procgen::Builder::new();
+    b.anim(4.0);
+    let tau = std::f32::consts::TAU;
+    let (r0, r1) = (2.55f32, 3.05f32);
+    for seg in 0..4 {
+        let a0 = seg as f32 * tau / 4.0 + 0.38;
+        let a1 = a0 + tau / 4.0 - 0.76;
+        let n = 6usize;
+        for k in 0..n {
+            let t0 = a0 + (a1 - a0) * k as f32 / n as f32;
+            let t1 = a0 + (a1 - a0) * (k + 1) as f32 / n as f32;
+            let q = |r: f32, t: f32| -> [f32; 3] { [r * t.cos(), 0.0, r * t.sin()] };
+            b.quad(
+                0,
+                [q(r0, t0), q(r0, t1), q(r1, t1), q(r1, t0)],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            );
+        }
+    }
+    let rd = 0.52f32;
+    for k in 0..8 {
+        let t0 = k as f32 / 8.0 * tau;
+        let t1 = (k + 1) as f32 / 8.0 * tau;
+        b.tri(
+            0,
+            [
+                [0.0, 0.0, 0.0],
+                [rd * t1.cos(), 0.0, rd * t1.sin()],
+                [rd * t0.cos(), 0.0, rd * t0.sin()],
+            ],
+            [[0.5, 0.5], [1.0, 1.0], [0.0, 0.0]],
+        );
+    }
+    b.finish(1)
+}
+
 /// Positive (CCW) winding in the plan frame; the block filler and the park
 /// outline both expect it, so a right-to-left drawing works as well.
 fn fix_ccw(pts: &mut [[f32; 2]]) {
@@ -3206,16 +3384,25 @@ impl App {
     fn refresh_preview(&mut self) {
         if self.tool == 1 {
             self.refresh_live_stroke();
+            if let Some(r) = self.renderer.as_mut() {
+                r.set_snap_marker(None);
+            }
             self.update_title();
             return;
         }
+        // block/park tools: the sketch carries the rubber band up to the
+        // cursor, snapped to the nearest road when the cursor reaches one;
+        // the animated ground marker shows where that snap lands
+        let (pv, snap) = self.sketch_pts();
         let mesh = if let (Some(s), Some(_)) = (self.scene.as_ref(), self.renderer.as_ref()) {
-            preview_mesh(s, &self.pts)
+            preview_mesh(s, &pv)
         } else {
             None
         };
+        let marker = snap.and_then(|q| self.snap_marker_pos(q));
         if let Some(r) = self.renderer.as_mut() {
             r.set_preview(mesh);
+            r.set_snap_marker(marker);
         }
         self.update_title();
     }
@@ -3269,16 +3456,21 @@ impl App {
     /// Snap a block/park vertex onto a road's kerb edge once the cursor
     /// comes within the road corridor: the vertex lands ~6.6 m off the
     /// centre line on the side the cursor is on, so a courtyard wall or a
-    /// park fence stands right along the roadway.  The procedural grid
-    /// (main street, cross lanes) attracts the same way.
-    fn shape_snap_point(&self, p: [f32; 2]) -> [f32; 2] {
+    /// park fence stands right along the roadway.  `None` when no road is
+    /// within reach — the sketch uses that to light up the snap marker.
+    /// The procedural grid (main street, cross lanes) attracts the same way.
+    fn shape_snap_lookup(&self, p: [f32; 2]) -> Option<[f32; 2]> {
+        let reach = 10.0f32;
         let mut best: Option<([f32; 2], f32)> = None;
+        let take = |q: [f32; 2], d: f32, best: &mut Option<([f32; 2], f32)>| {
+            if d < reach && best.map(|b| d < b.1).unwrap_or(true) {
+                *best = Some((q, d));
+            }
+        };
         for ch in &self.user.roads {
             if ch.len() >= 2 {
                 let (q, d) = kolomna_render::streets::near_poly(ch, p);
-                if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
-                    best = Some((q, d));
-                }
+                take(q, d, &mut best);
             }
         }
         if let Some(scene) = self.scene.as_ref() {
@@ -3286,9 +3478,7 @@ impl App {
             if net.main_t1 > net.main_t0 + 1.0 {
                 let main = [[net.main_t0, 0.0], [net.main_t1, 0.0]];
                 let (q, d) = kolomna_render::streets::near_poly(&main, p);
-                if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
-                    best = Some((q, d));
-                }
+                take(q, d, &mut best);
             }
             for &(uc, _cr, _cw) in &net.cross {
                 for half in [
@@ -3296,26 +3486,70 @@ impl App {
                     [[uc, -net.cross_half], [uc, -3.5]],
                 ] {
                     let (q, d) = kolomna_render::streets::near_poly(&half, p);
-                    if d < 8.0 && best.map(|b| d < b.1).unwrap_or(true) {
-                        best = Some((q, d));
+                    take(q, d, &mut best);
+                }
+            }
+        }
+        let (q, d) = best?;
+        // step off the centre line toward the cursor: the vertex
+        // lands on the outer kerb, not mid-asphalt
+        let dir = [p[0] - q[0], p[1] - q[1]];
+        let l = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-4);
+        if d < 0.5 {
+            Some(q)
+        } else {
+            Some([q[0] + dir[0] / l * 6.6, q[1] + dir[1] / l * 6.6])
+        }
+    }
+
+    /// The vertex actually committed: the snap when a road is in reach.
+    fn shape_snap_point(&self, p: [f32; 2]) -> [f32; 2] {
+        self.shape_snap_lookup(p).unwrap_or(p)
+    }
+
+    /// (raw, snapped) plan points under the cursor for the block/park
+    /// tools: `snapped` is Some while the cursor reaches a road's kerb.
+    fn shape_cursor(&self) -> Option<([f32; 2], Option<[f32; 2]>)> {
+        let (px, py) = self.cursor?;
+        let p = self.screen_to_plan(px, py)?;
+        Some((p, self.shape_snap_lookup(p)))
+    }
+
+    /// The sketch outline the block/park preview draws: the clicked points
+    /// plus the cursor vertex — snapped onto a road's kerb when the cursor
+    /// reaches one (returns that snap too, for the ground marker).
+    fn sketch_pts(&self) -> (Vec<[f32; 2]>, Option<[f32; 2]>) {
+        let mut pv = self.pts.clone();
+        let mut snap: Option<[f32; 2]> = None;
+        if self.tool >= 2 {
+            if let Some((raw, s)) = self.shape_cursor() {
+                let q = s.unwrap_or(raw);
+                if let Some(&l) = pv.last() {
+                    let dx = q[0] - l[0];
+                    let dy = q[1] - l[1];
+                    if dx * dx + dy * dy > 0.09 {
+                        pv.push(q);
                     }
                 }
+                snap = s;
             }
         }
-        match best {
-            Some((q, d)) => {
-                // step off the centre line toward the cursor: the vertex
-                // lands on the outer kerb, not mid-asphalt
-                let dir = [p[0] - q[0], p[1] - q[1]];
-                let l = (dir[0] * dir[0] + dir[1] * dir[1]).sqrt().max(1e-4);
-                if d < 0.5 {
-                    q
-                } else {
-                    [q[0] + dir[0] / l * 6.6, q[1] + dir[1] / l * 6.6]
-                }
-            }
-            None => p,
-        }
+        (pv, snap)
+    }
+
+    /// Placement of the snap marker at a plan point: world metres -> cell
+    /// coordinates plus the scaled ground height (the village's own
+    /// convention), lifted a touch over the ground.
+    fn snap_marker_pos(&self, p: [f32; 2]) -> Option<[f32; 3]> {
+        let scene = self.scene.as_ref()?;
+        let w = [
+            scene.eu[0] * p[0] + scene.nvec[0] * p[1],
+            scene.eu[1] * p[0] + scene.nvec[1] * p[1],
+        ];
+        let cx = scene.anchor[0] + w[0] / 16.0;
+        let cy = scene.anchor[1] + w[1] / 16.0;
+        let h = hx(scene, cx, cy) - scene.mn;
+        Some([cx, cy, (h + 0.25) * ZSCALE])
     }
 
     /// The chain being drawn right now: the clicked points + the rubber-band
@@ -3989,6 +4223,7 @@ pub fn run() -> Result<(), Box<dyn Error>> {
         pts: Vec::new(),
         user: UserPlan::default(),
         last_live: None,
+        last_shape: None,
         frame_stop: std::env::var("KOLOMNA_FRAMES")
             .ok()
             .and_then(|s| s.parse().ok()),
