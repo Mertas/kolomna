@@ -1998,11 +1998,19 @@ pub fn split_duplicate(
     for lp in &lane_pts {
         ways.push(lp);
     }
-    // resample the chain at 2 m
+    // resample the chain at 2 m for the coverage classification; the kept
+    // runs are later sliced out of the ORIGINAL chain so corner vertices
+    // survive (a resampled run would chamfer every turn)
     let step = 2.0f32;
     let mut pts: Vec<[f32; 2]> = vec![chain[0]];
     let mut dirs: Vec<[f32; 2]> = vec![[0.0, 0.0]];
+    let mut samps: Vec<f32> = vec![0.0];
+    let mut total = 0.0f32;
+    for i in 1..chain.len() {
+        total += vlen(vsub(chain[i], chain[i - 1]));
+    }
     {
+        let mut base = 0.0f32;
         let mut carry = 0.0f32;
         for k in 0..chain.len() - 1 {
             let (a, e) = (chain[k], chain[k + 1]);
@@ -2016,22 +2024,28 @@ pub fn split_duplicate(
             while s < l {
                 pts.push(vadd(a, vmul(u, s)));
                 dirs.push(u);
+                samps.push(base + s);
                 s += step;
             }
+            base += l;
             carry = (carry + l) % step;
         }
         let last = chain[chain.len() - 1];
         if vlen(vsub(*pts.last().unwrap(), last)) > 0.4 {
             pts.push(last);
             dirs.push(vunit(vsub(last, chain[chain.len() - 2])));
+            samps.push(total);
         } else if pts.len() >= 2 {
             let l = pts.len() - 1;
             pts[l] = last;
+            samps[l] = total;
         }
     }
     // classify samples: covered by an existing way or by an earlier accepted stretch
+    // (the same-chain check needs real arc separation — two neighbours 2 m
+    // apart are the same ribbon, not a doubled-back one)
     let mut covered = vec![false; pts.len()];
-    let mut prev: Vec<([f32; 2], [f32; 2])> = Vec::new();
+    let mut prev: Vec<([f32; 2], [f32; 2], f32)> = Vec::new();
     for k in 0..pts.len() {
         let p = pts[k];
         let d = dirs[k];
@@ -2044,15 +2058,18 @@ pub fn split_duplicate(
             }
         }
         if !cov {
-            for (pp, pd) in &prev {
-                if vlen(vsub(*pp, p)) < DUP_D && vdot(d, *pd).abs() > DUP_PAR {
+            for (pp, pd, ps) in &prev {
+                if vlen(vsub(*pp, p)) < DUP_D
+                    && vdot(d, *pd).abs() > DUP_PAR
+                    && (samps[k] - ps).abs() > 6.0
+                {
                     cov = true;
                     break;
                 }
             }
         }
         if !cov {
-            prev.push((p, d));
+            prev.push((p, d, samps[k]));
         }
         covered[k] = cov;
     }
@@ -2061,6 +2078,26 @@ pub fn split_duplicate(
         if covered[k] && !covered[k - 1] && !covered[k + 1] {
             covered[k] = false;
         }
+    }
+    // point at arc length s along the source chain
+    fn pt_at(chain: &[[f32; 2]], s: f32) -> [f32; 2] {
+        let mut base = 0.0f32;
+        for i in 0..chain.len().saturating_sub(1) {
+            let l = vlen(vsub(chain[i + 1], chain[i]));
+            if base + l >= s || i + 2 == chain.len() {
+                let f = if l > 1e-4 {
+                    ((s - base) / l).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                return [
+                    chain[i][0] + (chain[i + 1][0] - chain[i][0]) * f,
+                    chain[i][1] + (chain[i + 1][1] - chain[i][1]) * f,
+                ];
+            }
+            base += l;
+        }
+        chain[chain.len() - 1]
     }
     let mut out: Vec<Vec<[f32; 2]>> = Vec::new();
     let mut skipped = 0.0f32;
@@ -2075,19 +2112,48 @@ pub fn split_duplicate(
         while k < pts.len() && !covered[k] {
             k += 1;
         }
-        let run = &pts[start..k];
-        if run.len() >= 2 && (run.len() as f32) * step >= 2.5 {
-            let mut v = run.to_vec();
-            if start == 0 {
-                v[0] = chain[0];
+        // the run window along the ORIGINAL chain: from the midpoint before
+        // its first sample to the midpoint after its last one — the original
+        // corner vertices live inside and are kept verbatim
+        let s_a = if start == 0 {
+            0.0
+        } else {
+            0.5 * (samps[start - 1] + samps[start])
+        };
+        let s_b = if k >= pts.len() {
+            total
+        } else {
+            0.5 * (samps[k - 1] + samps[k])
+        };
+        let mut v: Vec<[f32; 2]> = vec![pt_at(chain, s_a)];
+        {
+            let mut base = 0.0f32;
+            for i in 1..chain.len().saturating_sub(1) {
+                base += vlen(vsub(chain[i], chain[i - 1]));
+                if base > s_a + 0.05 && base < s_b - 0.05 {
+                    v.push(chain[i]);
+                }
             }
-            if k == pts.len() {
-                let l = v.len();
-                v[l - 1] = chain[chain.len() - 1];
+        }
+        let e = pt_at(chain, s_b);
+        if v
+            .last()
+            .map(|q| vlen(vsub(*q, e)) > 0.05)
+            .unwrap_or(true)
+        {
+            v.push(e);
+        }
+        let l = {
+            let mut s = 0.0f32;
+            for w in v.windows(2) {
+                s += vlen(vsub(w[1], w[0]));
             }
+            s
+        };
+        if v.len() >= 2 && l >= 2.5 {
             out.push(v);
         } else {
-            skipped += run.len() as f32 * step;
+            skipped += l;
         }
     }
     (out, skipped)
@@ -2370,9 +2436,11 @@ pub fn build_roads_ext(
             false
         };
         // never redraw roadway that already exists: pairs running parallel
-        // (|dot| > 0.9) within 2.4 m of another way or of an earlier stretch
-        // of this same chain are skipped entirely
-        let mut dup_prev: Vec<([f32; 2], [f32; 2])> = Vec::new();
+        // (|dot| > 0.9) within 2.4 m of another way, or of a stretch of this
+        // same chain at least 6 m away along the ribbon (arc separation — the
+        // neighbour pair 1.5 m back is the same ribbon, not a doubled one),
+        // are skipped entirely
+        let mut dup_prev: Vec<([f32; 2], [f32; 2], f32)> = Vec::new();
         for j in 0..stns.len() - 1 {
             let (a, e) = (&stns[j], &stns[j + 1]);
             let st3 = |st: &St, x: f32, z: f32| -> [f32; 3] {
@@ -2380,10 +2448,14 @@ pub fn build_roads_ext(
                 ctx.pt(q[0], q[1], z)
             };
             let mid = [(a.p[0] + e.p[0]) * 0.5, (a.p[1] + e.p[1]) * 0.5];
+            let s_mid = (a.s + e.s) * 0.5;
             let pdir = vunit(vsub(e.p, a.p));
             let mut dup = false;
-            for &(pp, pd) in &dup_prev {
-                if vlen(vsub(pp, mid)) < 2.4 && vdot(pdir, pd).abs() > 0.9 {
+            for &(pp, pd, ps) in &dup_prev {
+                if vlen(vsub(pp, mid)) < 2.4
+                    && vdot(pdir, pd).abs() > 0.9
+                    && (s_mid - ps).abs() > 6.0
+                {
                     dup = true;
                     break;
                 }
@@ -2400,7 +2472,7 @@ pub fn build_roads_ext(
             if dup {
                 continue;
             }
-            dup_prev.push((mid, pdir));
+            dup_prev.push((mid, pdir, s_mid));
             let kp = !band_hit(a, e, hr, hw);
             let kn = !band_hit(a, e, -hw, -hr);
             // roadway slab
