@@ -32,7 +32,8 @@ pub const M_WIN_PLAIN: u32 = 14; // yard-side window: bare frame, no trim
 pub const M_BLACK_DOOR: u32 = 15; // service entrance (black door)
 pub const M_STABLE: u32 = 16; // coach-house gates seen from the yard
 pub const M_STONE: u32 = 17; // pale smooth stone: columns, entablature, pediment
-pub const N_MATS: u32 = 18;
+pub const M_DENT: u32 = 18; // dentil course under the crowning cornice
+pub const N_MATS: u32 = 19;
 
 /// Clear height of the carriage arch (above the basement + piano nobile line).
 pub const ARCH_H: f32 = 4.6;
@@ -221,8 +222,9 @@ fn rusticate(img: &mut Img, base: [u8; 3], course: i32) {
 }
 
 /// Draw one window into the tile (style: 0 plain, 1 sandrik, 2 arch,
-/// 3 basement grille, 4 none).
-fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
+/// 3 basement grille, 4 none, 5 keystone lintel, 6 eyebrow hood; `glz`:
+/// 0 cross, 1 six-pane, 2 pair with a high transom).
+fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32, glz: u32) {
     let w = img.w as i32;
     let nl = shift(pal.wall_light, 22);
     let edge = shift(base, -52);
@@ -235,6 +237,8 @@ fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
         2 => 58,
         3 => img.h as i32 - 96,
         4 => 66,
+        5 => 64,
+        6 => 66,
         _ => 62,
     };
     // nalidnik: bright band with a dark contour so it reads when zoomed out
@@ -251,15 +255,32 @@ fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
         img.set(wx0 + 34 + k, wy0 + 30 - k, pal.glass_hl);
         img.set(wx0 + 35 + k, wy0 + 30 - k, pal.glass_hl);
     }
-    // frame + mullion + transom
+    // frame + glazing bars (three period patterns)
     let f = pal.frame;
     img.rect(wx0, wy0, wx1, wy0 + 4, f);
     img.rect(wx0, wy1 - 4, wx1, wy1, f);
     img.rect(wx0, wy0, wx0 + 4, wy1, f);
     img.rect(wx1 - 4, wy0, wx1, wy1, f);
     let mid = (wx0 + wx1) / 2;
-    img.rect(mid - 2, wy0, mid + 2, wy1, f);
-    img.rect(wx0, wy0 + 34, wx1, wy0 + 38, f);
+    match glz {
+        1 => {
+            // six panes: two mullions + transom
+            let m1 = wx0 + (wx1 - wx0) / 3;
+            let m2 = wx0 + 2 * (wx1 - wx0) / 3;
+            img.rect(m1 - 2, wy0, m1 + 2, wy1, f);
+            img.rect(m2 - 2, wy0, m2 + 2, wy1, f);
+            img.rect(wx0, wy0 + 34, wx1, wy0 + 38, f);
+        }
+        2 => {
+            // pair with a high transom (форточка)
+            img.rect(mid - 2, wy0, mid + 2, wy1, f);
+            img.rect(wx0, wy0 + 20, wx1, wy0 + 24, f);
+        }
+        _ => {
+            img.rect(mid - 2, wy0, mid + 2, wy1, f);
+            img.rect(wx0, wy0 + 34, wx1, wy0 + 38, f);
+        }
+    }
     // sill: plate + drip shadow
     img.rect(wx0 - 11, wy1, wx1 + 11, wy1 + 6, nl);
     img.rect(wx0 - 11, wy1 + 6, wx1 + 11, wy1 + 9, edge);
@@ -281,7 +302,26 @@ fn draw_window(img: &mut Img, pal: &Palette, base: [u8; 3], style: u32) {
         img.rect(mid - 8, wy0 - 14, mid + 8, wy0 + 2, nl);
         img.rect(mid - 4, wy0 - 10, mid + 4, wy0, edge);
     }
-    if style <= 2 {
+    if style == 5 {
+        // flat stone lintel on a pair of corbels, with a keystone
+        img.rect(wx0 - 19, wy0 - 20, wx1 + 19, wy0 - 11, nl);
+        img.rect(wx0 - 19, wy0 - 11, wx1 + 19, wy0 - 7, edge);
+        img.rect(wx0 - 17, wy0 - 7, wx0 - 10, wy0 + 2, nl);
+        img.rect(wx1 + 10, wy0 - 7, wx1 + 17, wy0 + 2, nl);
+        img.rect(mid - 9, wy0 - 28, mid + 9, wy0 - 9, nl);
+        img.rect(mid - 9, wy0 - 28, mid - 6, wy0 - 9, edge);
+        img.rect(mid + 6, wy0 - 28, mid + 9, wy0 - 9, edge);
+        img.rect(mid - 5, wy0 - 25, mid + 5, wy0 - 10, shift(nl, 4));
+    }
+    if style == 6 {
+        // browka: a shallow segmental hood with a shadow line beneath
+        for k in 0..10 {
+            let cut = ((10 - k) * (10 - k)) / 9;
+            img.rect(wx0 - 19 + cut, wy0 - 24 + k, wx1 + 19 - cut, wy0 - 17 + k, nl);
+        }
+        img.rect(wx0 - 13, wy0 - 15, wx1 + 13, wy0 - 11, edge);
+    }
+    if style != 3 && style != 4 {
         // apron panel with a gold rosette under the sill
         let ay0 = wy1 + 14;
         img.rect(mid - 26, ay0, mid + 26, ay0 + 30, nl);
@@ -306,6 +346,7 @@ fn tile_tex(
     base: [u8; 3],
     win: Option<u32>,
     rust_bg: bool,
+    glz: u32,
     r: &mut Rng,
 ) -> Vec<u8> {
     let mut img = Img::new(TEX_W, TEX_H, base);
@@ -315,14 +356,118 @@ fn tile_tex(
         img.noise(r, 4);
     }
     if let Some(style) = win {
-        draw_window(&mut img, pal, base, style);
+        draw_window(&mut img, pal, base, style, glz);
     }
     img.px
 }
 
-/// Entrance door: stone portal, two paneled leaves, arched radial transom,
-/// keystone, handle pair, lanterns on the reveals.
-fn door_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+/// Entrance door: three period drawings picked per house —
+/// 0 the ampire arched portal, 1 a classic dentil-cornice portal with
+/// medallions, 2 a glazed leaf pair with a low fanlight.
+fn door_tex(pal: &Palette, r: &mut Rng, style: u32) -> Vec<u8> {
+    match style {
+        1 => door_tex_classic(pal, r),
+        2 => door_tex_glazed(pal, r),
+        _ => door_tex_ampire(pal, r),
+    }
+}
+
+/// Classic: rectangular stone portal with a dentil cornice, two leaves of
+/// six raised panels with round medallions, a glazed rectangular transom.
+fn door_tex_classic(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, pal.basement);
+    rusticate(&mut img, pal.basement, 44);
+    img.noise(r, 3);
+    let dx0 = 34;
+    let dx1 = TEX_W as i32 - 34;
+    let dy1 = TEX_H as i32 - 10;
+    let cx = (dx0 + dx1) / 2;
+    // stone portal + dentil cornice over it
+    img.rect(dx0 - 16, 30, dx1 + 16, dy1 + 6, pal.wall_light);
+    img.rect(dx0 - 16, 30, dx0 - 10, dy1 + 6, pal.rust_dark);
+    img.rect(dx1 + 10, 30, dx1 + 16, dy1 + 6, pal.rust_dark);
+    let mut dd = dx0 - 14;
+    while dd < dx1 + 8 {
+        img.rect(dd, 30, dd + 6, 40, shift(pal.wall_light, -26));
+        dd += 10;
+    }
+    img.rect(dx0 - 16, 40, dx1 + 16, 48, shift(pal.wall_light, -12));
+    // glazed rectangular transom
+    img.rect(dx0, 48, dx1, 72, pal.glass);
+    img.rect(dx0, 48, dx1, 52, pal.frame);
+    img.rect(dx0, 68, dx1, 72, pal.frame);
+    img.rect(cx - 2, 48, cx + 2, 72, pal.frame);
+    img.rect(dx0, 58, dx1, 61, pal.frame);
+    // leaves: six raised panels, medallions above, handle pair
+    img.rect(dx0, 72, dx1, dy1, pal.door);
+    img.rect(cx - 2, 72, cx + 2, dy1, pal.frame);
+    for lx in [dx0 + 5, cx + 5] {
+        for py in [80, 104, 128] {
+            let ph = if py == 128 { 26 } else { 20 };
+            img.rect(lx - 1, py - 1, lx + 22, py + ph + 1, shift(pal.door, 12));
+            img.rect(lx + 1, py + 1, lx + 20, py + ph - 1, shift(pal.door, -10));
+        }
+        let mx = lx + 11;
+        img.rect(mx - 6, 73, mx + 6, 75, shift(pal.door, 24));
+        img.rect(mx - 8, 75, mx + 8, 78, shift(pal.door, 24));
+        img.rect(mx - 4, 77, mx + 4, 79, shift(pal.door, 24));
+    }
+    img.rect(cx - 11, 100, cx - 6, 108, pal.gold);
+    img.rect(cx + 6, 100, cx + 11, 108, pal.gold);
+    img.px
+}
+
+/// Glazed: a broad leaf pair with glazed heads under a low segmental
+/// fanlight, paneled below.
+fn door_tex_glazed(pal: &Palette, r: &mut Rng) -> Vec<u8> {
+    let mut img = Img::new(TEX_W, TEX_H, pal.basement);
+    rusticate(&mut img, pal.basement, 44);
+    img.noise(r, 3);
+    let dx0 = 36;
+    let dx1 = TEX_W as i32 - 36;
+    let dy1 = TEX_H as i32 - 10;
+    let cx = (dx0 + dx1) / 2;
+    img.rect(dx0 - 14, 34, dx1 + 14, dy1 + 6, pal.wall_light);
+    img.rect(dx0 - 14, 34, dx0 - 8, dy1 + 6, pal.rust_dark);
+    img.rect(dx1 + 8, 34, dx1 + 14, dy1 + 6, pal.rust_dark);
+    // low segmental fanlight (2 px rows) with radial spokes
+    for k in 0..14 {
+        let cut = ((14 - k) * 14) / 22;
+        img.rect(dx0 + cut, 34 + k * 2, dx1 - cut, 36 + k * 2, pal.glass);
+    }
+    for ang in -2..=2i32 {
+        let mut x = cx;
+        let mut y = 46;
+        for _ in 0..7 {
+            img.set(x, y, pal.frame);
+            x += ang;
+            y -= 2;
+        }
+    }
+    img.rect(dx0 - 6, 60, dx1 + 6, 66, shift(pal.wall_light, -14));
+    // leaves: glazed heads, three panels below
+    img.rect(dx0, 62, dx1, dy1, pal.door);
+    img.rect(cx - 2, 62, cx + 2, dy1, pal.frame);
+    for lx in [dx0, cx + 2] {
+        img.rect(lx + 6, 66, lx + 24, 104, pal.glass);
+        img.rect(lx + 6, 66, lx + 24, 70, pal.frame);
+        img.rect(lx + 6, 100, lx + 24, 104, pal.frame);
+        img.rect(lx + 14, 70, lx + 17, 100, pal.frame);
+    }
+    for lx in [dx0 + 5, cx + 7] {
+        for py in [112, 138] {
+            img.rect(lx - 1, py - 1, lx + 22, py + 25, shift(pal.door, 12));
+            img.rect(lx + 1, py + 1, lx + 20, py + 23, shift(pal.door, -10));
+        }
+    }
+    img.rect(cx - 11, 104, cx - 6, 112, pal.gold);
+    img.rect(cx + 6, 104, cx + 11, 112, pal.gold);
+    img.px
+}
+
+/// Ampire: the original arched portal with a radial transom, keystone and
+/// lanterns on the reveals.
+fn door_tex_ampire(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     let mut img = Img::new(TEX_W, TEX_H, pal.basement);
     rusticate(&mut img, pal.basement, 44);
     img.noise(r, 3);
@@ -463,10 +608,10 @@ fn iron_tex(pal: &Palette, r: &mut Rng) -> Vec<u8> {
     img.px
 }
 
-/// Cast-iron balcony railing with an alpha cut-out: rails, balusters with a
-/// mid bulge, meander touches under the top rail. Rendered with the model
-/// shader's alpha test.
-fn railing_tex(pal: &Palette) -> Vec<u8> {
+/// Cast-iron balcony railing with an alpha cut-out; `pat` picks the fill:
+/// 0 bar posts with scrolls, 1 diagonal lattice, 2 spear-topped posts.
+/// Rendered with the model shader's alpha test.
+fn railing_tex(pal: &Palette, pat: u32) -> Vec<u8> {
     let h = 64usize;
     let mut img = Img::new(TEX_S, h, [0, 0, 0]);
     for i in 0..TEX_S * h {
@@ -486,15 +631,44 @@ fn railing_tex(pal: &Palette) -> Vec<u8> {
             }
         }
     }
+    // shared rails
     put(&mut img, 0, 2, TEX_S as i32, 8, c);
     put(&mut img, 0, 54, TEX_S as i32, 62, c);
-    for x in (6..TEX_S as i32).step_by(16) {
-        put(&mut img, x, 6, x + 4, 56, c);
-        put(&mut img, x - 2, 26, x + 6, 34, shift(c, 22));
-    }
-    for x in (0..TEX_S as i32).step_by(32) {
-        put(&mut img, x, 10, x + 10, 13, c);
-        put(&mut img, x + 10, 10, x + 13, 20, c);
+    match pat {
+        1 => {
+            // diagonal lattice between the rails
+            for k in -6..14i32 {
+                let mut y = 8i32;
+                while y < 56 {
+                    let a = k * 16 + (y - 8);
+                    put(&mut img, a, y, a + 2, y + 2, c);
+                    let bb = k * 16 - (y - 8);
+                    put(&mut img, bb, y, bb + 2, y + 2, c);
+                    y += 2;
+                }
+            }
+        }
+        2 => {
+            // spear-topped posts, three rails
+            put(&mut img, 0, 22, TEX_S as i32, 26, c);
+            put(&mut img, 0, 40, TEX_S as i32, 44, c);
+            for x in (4..TEX_S as i32).step_by(12) {
+                put(&mut img, x, 8, x + 3, 56, c);
+                put(&mut img, x - 1, 4, x + 4, 8, c);
+                put(&mut img, x, 0, x + 3, 4, c);
+            }
+        }
+        _ => {
+            // the original: bar posts with scrolls
+            for x in (6..TEX_S as i32).step_by(16) {
+                put(&mut img, x, 6, x + 4, 56, c);
+                put(&mut img, x - 2, 26, x + 6, 34, shift(c, 22));
+            }
+            for x in (0..TEX_S as i32).step_by(32) {
+                put(&mut img, x, 10, x + 10, 13, c);
+                put(&mut img, x + 10, 10, x + 13, 20, c);
+            }
+        }
     }
     img.px
 }
@@ -523,6 +697,23 @@ fn band_tex(pal: &Palette) -> Vec<u8> {
     let mut img = Img::new(TEX_S, 32, pal.wall_light);
     img.line_h(0, TEX_S as i32, 0, shift(pal.wall_light, -30));
     img.line_h(0, TEX_S as i32, 20, shift(pal.wall_light, -20));
+    img.line_h(0, TEX_S as i32, 30, shift(pal.wall_light, -50));
+    img.px
+}
+
+/// Dentil course: the crowning-cornice variant of the band texture — a row
+/// of small brackets under the corona (сухарики).
+fn band_dent_tex(pal: &Palette) -> Vec<u8> {
+    let mut img = Img::new(TEX_S, 32, shift(pal.wall_light, -34));
+    img.line_h(0, TEX_S as i32, 0, shift(pal.wall_light, -46));
+    img.line_h(0, TEX_S as i32, 1, shift(pal.wall_light, -46));
+    let mut x = 2;
+    while x < TEX_S as i32 {
+        img.rect(x, 4, x + 10, 28, pal.wall_light);
+        img.rect(x + 10, 4, x + 12, 28, shift(pal.wall_light, -20));
+        x += 16;
+    }
+    img.line_h(0, TEX_S as i32, 28, shift(pal.wall_light, -50));
     img.line_h(0, TEX_S as i32, 30, shift(pal.wall_light, -50));
     img.px
 }
@@ -578,6 +769,19 @@ struct Manor {
     bays: bool,
     /// x-spans of the built bays — balconies keep off them
     bay_x: Vec<(f32, f32)>,
+    /// window "handwriting" of the house: drawing style for the upper
+    /// floors / the floor above the plinth / the archy variant, and the
+    /// glazing pattern they all share
+    wstyle_up: u32,
+    wstyle_s: u32,
+    wstyle_a: u32,
+    glz: u32,
+    /// entrance door drawing 0..2
+    door_style: u32,
+    /// balcony railing pattern 0..2
+    rail_pat: u32,
+    /// dentil course on the crowning cornice
+    dent: bool,
 }
 
 /// Basement plinth that follows the real ground instead of a fixed depth.
@@ -1342,6 +1546,25 @@ pub fn generate_manor(
         }
     }
 
+    // facade "handwriting": a window-trim family + a glazing pattern, a door
+    // and a railing drawing — houses on one street stop reading as copies
+    let fam = r.below(10);
+    let (wstyle_up, wstyle_s, wstyle_a) = if fam < 5 {
+        (0, 1, 2) // classic: sandrik under the parade floor, plain above
+    } else if fam < 8 {
+        (6, 1, 2) // two-tier: eyebrow hoods above, sandrik below
+    } else {
+        (5, 5, 5) // keystone lintels all the way up
+    };
+    let glz = match r.below(10) {
+        0..=5 => 0,
+        6..=7 => 1,
+        _ => 2,
+    };
+    let door_style = r.below(3);
+    let rail_pat = r.below(3);
+    let dent = r.f() < 0.6;
+
     let mut m = Manor {
         b: Builder::new(),
         pal,
@@ -1359,6 +1582,13 @@ pub fn generate_manor(
         roman,
         bays,
         bay_x: Vec::new(),
+        wstyle_up,
+        wstyle_s,
+        wstyle_a,
+        glz,
+        door_style,
+        rail_pat,
+        dent,
     };
     m.build(&mut r);
     let texs = m.textures();
@@ -1546,11 +1776,11 @@ impl Manor {
         // ---- string courses between floors + stepped crowning cornice -----
         // the courses wrap the facades only: adjoining end walls are blank
         // firewalls and carry no trim; only a corner house trims its east end
-        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32, eas: bool, nor: bool| {
+        let band = |b: &mut Builder, yy: f32, out: f32, w: f32, d: f32, eas: bool, nor: bool, mat: u32| {
             let a = 0.0f32;
             // south
             b.quad(
-                M_BAND,
+                mat,
                 [
                     [-a, yy - 0.10, d + out],
                     [w + a, yy - 0.10, d + out],
@@ -1562,7 +1792,7 @@ impl Manor {
             // north: skipped on corner houses (that wall is a firewall)
             if nor {
                 b.quad(
-                    M_BAND,
+                    mat,
                     [
                         [w + a, yy - 0.10, -out],
                         [-a, yy - 0.10, -out],
@@ -1575,7 +1805,7 @@ impl Manor {
             // east: only when this end is a parade facade
             if eas {
                 b.quad(
-                    M_BAND,
+                    mat,
                     [
                         [w + out, yy - 0.10, d + a],
                         [w + out, yy - 0.10, -a],
@@ -1589,11 +1819,13 @@ impl Manor {
         let eas = self.corner;
         let nor = !self.corner;
         for k in 1..self.y_band.len() {
-            band(&mut self.b, self.y_band[k], 0.10, w, d, eas, nor);
+            band(&mut self.b, self.y_band[k], 0.10, w, d, eas, nor, M_BAND);
         }
-        // crowning cornice: two stepped bands overhanging the wall
-        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d, eas, nor);
-        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas, nor);
+        // crowning cornice: two stepped bands overhanging the wall; the
+        // lower one carries a dentil course on some houses
+        let cm = if self.dent { M_DENT } else { M_BAND };
+        band(&mut self.b, y_wall_top + 0.06, 0.24, w, d, eas, nor, cm);
+        band(&mut self.b, y_wall_top + 0.34, 0.38, w, d, eas, nor, M_BAND);
 
         // ---- balconies ----------------------------------------------------
         // none / one floor of balconies / two stacked floors — the same
@@ -1756,8 +1988,10 @@ impl Manor {
             // three SOLID steps: tread, riser and side cheeks per step,
             // sunk into the ground (-1.2) so nothing hollow shows from the
             // sides or below (the user caught flat risers reading as cardboard)
+            // some entrances get a wide perron flanked by stone pedestals
+            let wide = r.f() < 0.35;
             for s in 0..3 {
-                let sw = 1.9 - 0.18 * s as f32;
+                let sw = (if wide { 2.30 } else { 1.90 }) - 0.18 * s as f32;
                 let zh0 = d + 0.30 * (3 - s) as f32;
                 let zh1 = zh0 + 0.30;
                 let yt = 0.14 * (s + 1) as f32 + 0.16;
@@ -1795,28 +2029,99 @@ impl Manor {
                     );
                 }
             }
-            // canopy slab over the entrance + brackets
+            if wide {
+                // stone pedestals flanking the lowest step
+                let uv4 = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                for pxx in [xc - 2.66, xc + 2.66] {
+                    let (p0, p1) = (pxx - 0.20, pxx + 0.20);
+                    let (pz0, pz1) = (d + 0.72, d + 1.30);
+                    let py = 0.78f32;
+                    self.b.quad(M_BAND, [[p0, 0.0, pz1], [p1, 0.0, pz1], [p1, py, pz1], [p0, py, pz1]], uv4);
+                    self.b.quad(M_BAND, [[p1, 0.0, pz0], [p0, 0.0, pz0], [p0, py, pz0], [p1, py, pz0]], uv4);
+                    self.b.quad(M_BAND, [[p0, 0.0, pz0], [p0, 0.0, pz1], [p0, py, pz1], [p0, py, pz0]], uv4);
+                    self.b.quad(M_BAND, [[p1, 0.0, pz1], [p1, 0.0, pz0], [p1, py, pz0], [p1, py, pz1]], uv4);
+                    self.b.quad(
+                        M_BAND,
+                        [
+                            [p0 - 0.06, py, pz1 + 0.06],
+                            [p1 + 0.06, py, pz1 + 0.06],
+                            [p1 + 0.06, py, pz0 - 0.06],
+                            [p0 - 0.06, py, pz0 - 0.06],
+                        ],
+                        uv4,
+                    );
+                }
+            }
+            // canopy over the entrance: 0 flat slab on brackets, 1 gable domik
             let can_y = self.heights[0] + 0.55;
-            self.b.quad(
-                M_BAND,
-                [
-                    [xc - 1.6, can_y + 0.14, d],
-                    [xc - 1.6, can_y + 0.14, d + 1.25],
-                    [xc + 1.6, can_y + 0.14, d + 1.25],
-                    [xc + 1.6, can_y + 0.14, d],
-                ],
-                [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
-            );
-            self.b.quad(
-                M_BAND,
-                [
-                    [xc - 1.6, can_y, d + 1.25],
-                    [xc + 1.6, can_y, d + 1.25],
-                    [xc + 1.6, can_y + 0.14, d + 1.25],
-                    [xc - 1.6, can_y + 0.14, d + 1.25],
-                ],
-                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
-            );
+            let canopy = r.below(2);
+            let reach = if r.below(2) == 0 { 1.25 } else { 0.95 };
+            if canopy == 1 {
+                // gable canopy: two slopes to a ridge running out from the wall
+                let zf = d + reach;
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [xc - 1.6, can_y + 0.02, d],
+                        [xc - 1.6, can_y + 0.02, zf],
+                        [xc, can_y + 0.48, zf],
+                        [xc, can_y + 0.48, d],
+                    ],
+                    [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                );
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [xc + 1.6, can_y + 0.02, zf],
+                        [xc + 1.6, can_y + 0.02, d],
+                        [xc, can_y + 0.48, d],
+                        [xc, can_y + 0.48, zf],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+                // front gable board with the ridge bar over it
+                self.b.tri(
+                    M_BAND,
+                    [
+                        [xc - 1.6, can_y + 0.02, zf],
+                        [xc + 1.6, can_y + 0.02, zf],
+                        [xc, can_y + 0.48, zf],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [0.5, 1.0]],
+                );
+                self.b.quad(
+                    M_IRON,
+                    [
+                        [xc - 0.05, can_y + 0.50, zf],
+                        [xc + 0.05, can_y + 0.50, zf],
+                        [xc + 0.05, can_y + 0.50, d],
+                        [xc - 0.05, can_y + 0.50, d],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            } else {
+                // flat slab on cast-iron brackets
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [xc - 1.6, can_y + 0.14, d],
+                        [xc - 1.6, can_y + 0.14, d + reach],
+                        [xc + 1.6, can_y + 0.14, d + reach],
+                        [xc + 1.6, can_y + 0.14, d],
+                    ],
+                    [[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0]],
+                );
+                self.b.quad(
+                    M_BAND,
+                    [
+                        [xc - 1.6, can_y, d + reach],
+                        [xc + 1.6, can_y, d + reach],
+                        [xc + 1.6, can_y + 0.14, d + reach],
+                        [xc - 1.6, can_y + 0.14, d + reach],
+                    ],
+                    [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+                );
+            }
             for bx in [xc - 1.3, xc + 1.3] {
                 self.b.quad(
                     M_IRON,
@@ -1829,8 +2134,20 @@ impl Manor {
                     [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
                 );
             }
-            // wall lanterns beside the door
-            for lx in [xc - 1.35, xc + 1.35] {
+            // wall lanterns beside the door: a pair / one / none
+            let lant = r.below(10);
+            let lxs: Vec<f32> = if lant < 2 {
+                Vec::new()
+            } else if lant < 4 {
+                if r.below(2) == 0 {
+                    vec![xc - 1.35]
+                } else {
+                    vec![xc + 1.35]
+                }
+            } else {
+                vec![xc - 1.35, xc + 1.35]
+            };
+            for lx in lxs {
                 let ly = 2.5f32;
                 self.b.quad(
                     M_IRON,
@@ -2100,6 +2417,69 @@ impl Manor {
             );
         }
 
+        // ---- attic over the street cornice (some houses) --------------------
+        // a low stone shield with its coping — the classical Petersburg attic
+        // riding the crowning cornice; never on flat or across-gable roofs
+        if !flat && !gz && r.f() < 0.35 {
+            let ay0 = y_wall_top + 0.48;
+            let ay1 = ay0 + 0.64;
+            let zz = d + 0.28;
+            let a0 = 0.14f32;
+            let a1 = w - 0.14;
+            self.b.quad(
+                M_WALL,
+                [
+                    [a0, ay0, zz],
+                    [a1, ay0, zz],
+                    [a1, ay1, zz],
+                    [a0, ay1, zz],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 0.64], [0.0, 0.64]],
+            );
+            // returns standing on the cornice
+            self.b.quad(
+                M_WALL,
+                [
+                    [a0, ay0, zz - 0.30],
+                    [a0, ay0, zz],
+                    [a0, ay1, zz],
+                    [a0, ay1, zz - 0.30],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            );
+            self.b.quad(
+                M_WALL,
+                [
+                    [a1, ay0, zz],
+                    [a1, ay0, zz - 0.30],
+                    [a1, ay1, zz - 0.30],
+                    [a1, ay1, zz],
+                ],
+                [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            );
+            // coping: top slab with the front lip
+            self.b.quad(
+                M_BAND,
+                [
+                    [a0 - 0.07, ay1, zz + 0.08],
+                    [a1 + 0.07, ay1, zz + 0.08],
+                    [a1 + 0.07, ay1, zz - 0.34],
+                    [a0 - 0.07, ay1, zz - 0.34],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
+            );
+            self.b.quad(
+                M_BAND,
+                [
+                    [a0 - 0.07, ay1 - 0.12, zz + 0.08],
+                    [a1 + 0.07, ay1 - 0.12, zz + 0.08],
+                    [a1 + 0.07, ay1, zz + 0.08],
+                    [a0 - 0.07, ay1, zz + 0.08],
+                ],
+                [[0.0, 0.0], [w / 2.0, 0.0], [w / 2.0, 1.0], [0.0, 1.0]],
+            );
+        }
+
         // ---- chimneys ------------------------------------------------------
         let chimneys = if n_floors <= 3 {
             1
@@ -2262,31 +2642,32 @@ impl Manor {
         }
     }
 
-    /// All 14 house textures in material-slot order.
+    /// All house textures in material-slot order.
     fn textures(&self) -> Vec<(u32, u32, Vec<u8>)> {
         let pal = self.pal;
         let mut rr = Rng::new(0x7E57_0000 ^ ((self.tiles as u64) << 8) ^ self.heights.len() as u64);
         let wall = pal.wall;
         let base = pal.basement;
         let mut out = vec![
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, false, &mut rr)), // 0 M_WALL
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, true, &mut rr)),  // 1 M_RUST
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(0), false, &mut rr)), // 2 M_WIN
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(1), true, &mut rr)), // 3 M_WIN_SANDRIK
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(2), true, &mut rr)), // 4 M_WIN_ARCH
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, None, true, &mut rr)), // 5 M_BASE
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, Some(3), true, &mut rr)), // 6 M_BASE_WIN
-            (TEX_W as u32, TEX_H as u32, door_tex(&pal, &mut rr)),                    // 7 M_DOOR
-            (TEX_S as u32, TEX_S as u32, roof_tex(&pal, &mut rr)),                    // 8 M_ROOF
-            (TEX_S as u32, TEX_S as u32, brick_tex(&pal, &mut rr)),                   // 9 M_BRICK
-            (TEX_S as u32, TEX_S as u32, iron_tex(&pal, &mut rr)),                    // 10 M_IRON
-            (TEX_S as u32, 32, band_tex(&pal)),                                       // 11 M_BAND
-            (TEX_S as u32, TEX_S as u32, dormer_tex(&pal, &mut rr)),                  // 12 M_DORMER
-            (TEX_S as u32, 64, railing_tex(&pal)),                                    // 13 M_RAILING (alpha)
-            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(4), false, &mut rr)), // 14 M_WIN_PLAIN
-            (TEX_W as u32, TEX_H as u32, black_door_tex(&pal, &mut rr)),              // 15 M_BLACK_DOOR
-            (TEX_W as u32, TEX_H as u32, stable_tex(&pal, &mut rr)),                  // 16 M_STABLE
-            (TEX_S as u32, TEX_S as u32, stone_tex(&pal)),                            // 17 M_STONE
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, false, 0, &mut rr)), // 0 M_WALL
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, None, true, 0, &mut rr)), // 1 M_RUST
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(self.wstyle_up), false, self.glz, &mut rr)), // 2 M_WIN
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(self.wstyle_s), true, self.glz, &mut rr)), // 3 M_WIN_SANDRIK
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(self.wstyle_a), true, self.glz, &mut rr)), // 4 M_WIN_ARCH
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, None, true, 0, &mut rr)), // 5 M_BASE
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, base, Some(3), true, 0, &mut rr)), // 6 M_BASE_WIN
+            (TEX_W as u32, TEX_H as u32, door_tex(&pal, &mut rr, self.door_style)), // 7 M_DOOR
+            (TEX_S as u32, TEX_S as u32, roof_tex(&pal, &mut rr)), // 8 M_ROOF
+            (TEX_S as u32, TEX_S as u32, brick_tex(&pal, &mut rr)), // 9 M_BRICK
+            (TEX_S as u32, TEX_S as u32, iron_tex(&pal, &mut rr)), // 10 M_IRON
+            (TEX_S as u32, 32, band_tex(&pal)), // 11 M_BAND
+            (TEX_S as u32, TEX_S as u32, dormer_tex(&pal, &mut rr)), // 12 M_DORMER
+            (TEX_S as u32, 64, railing_tex(&pal, self.rail_pat)), // 13 M_RAILING (alpha)
+            (TEX_W as u32, TEX_H as u32, tile_tex(&pal, wall, Some(4), false, 0, &mut rr)), // 14 M_WIN_PLAIN
+            (TEX_W as u32, TEX_H as u32, black_door_tex(&pal, &mut rr)), // 15 M_BLACK_DOOR
+            (TEX_W as u32, TEX_H as u32, stable_tex(&pal, &mut rr)), // 16 M_STABLE
+            (TEX_S as u32, TEX_S as u32, stone_tex(&pal)), // 17 M_STONE
+            (TEX_S as u32, 32, band_dent_tex(&pal)), // 18 M_DENT
         ];
         // store every tile bottom-up (see `flip_rows`): without this the whole
         // facade renders vertically mirrored and the doors show upside down
