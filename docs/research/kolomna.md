@@ -97,11 +97,11 @@ XVIII–XIX веков описал М. И. Пыляев в книге «Ста�
 
 ## Sources
 
-[1] https://ru.wikipedia.org/wiki/Коломна_(исторический_район,_Санкт-Петербурга) — Коломна (исторический район, Санкт-Петербург) — Википедия
+[1] https://ru.wikipedia.org/wiki/Коломна_%28исторический_район,_Санкт-Петербурга%29 — Коломна (исторический район, Санкт-Петербург) — Википедия
 [2] https://ru.wikipedia.org/wiki/Домик_в_Коломне — Домик в Коломне — Википедия
 [3] https://arzamas.academy/micro/toponim/18 — Коломна — Arzamas (Топоним дня, А. Пиперски)
 [4] https://cyberleninka.ru/article/n/vsya-kolomna-i-peterburgskaya-priroda-zhivaya-domik-v-kolomne-a-s-pushkina-i-povest-n-v-gogolya-portret — Кошелев В. А. «…вся Коломна и петербургская природа живая…» — Проблемы исторической поэтики, 2018
 [5] https://gorbilet.ru/blog/interesnie-mesta/marshrut-po-pushkinskim-mestam-v-peterburge — Пушкин в Петербурге: маршрут — Горбилет
 [6] https://peterburg.center/ln/marshrut-po-pushkinskim-mestam-peterburg-pushkina.html — Маршрут по пушкинским местам — Peterburg.center
-[7] https://ru.wikisource.org/wiki/Домик_в_Коломне_(Пушкин) — Домик в Коломне (Пушкин) — Викитека
+[7] https://ru.wikisource.org/wiki/Домик_в_Коломне_%28Пушкин%29 — Домик в Коломне (Пушкин) — Викитека
 [8] https://www.livelib.ru/book/4355848/readpart-s-druzyami-po-sanktpeterburgu-kolomna-viktor-pivovarov — Пивоваров В. С друзьями по Санкт-Петербургу. Коломна
