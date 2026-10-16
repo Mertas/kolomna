@@ -1695,6 +1695,10 @@ fn zebra_stop(b: &mut Builder, ctx: &Ctx, ev: &JEv, i: usize) {
             [[0.0, 0.0], [0.35, 0.0], [0.35, 1.0], [0.0, 1.0]],
         );
     }
+    // the signal pole stands on the sidewalk at the end of the stop line,
+    // just behind the zebra on the right of the inbound direction
+    let spos = pt(s_z + 2.9, -(hru + 0.55));
+    traffic_light(b, ctx, spos, slab_top(ctx, spos, du, hru) + KERB_H, du);
 }
 
 /// One corner of a junction: fillet arc between two kerb lines, pocket
@@ -1925,21 +1929,6 @@ fn corner_patch(
             ],
             outward,
         );
-    }
-    // ---- signals: the arm's own right side of this corner gets a pole
-    if hru >= 3.0 && hrv >= 3.0 && r > 2.6 {
-        let rv_u = [du[1], -du[0]];
-        if vdot(nu, rv_u) > 0.2 {
-            let aa = arc(1);
-            let pos = vadd(c, vmul([aa.cos(), aa.sin()], -(rw - 0.55)));
-            traffic_light(b, ctx, pos, hw_t, du);
-        }
-        let rv_v = [dv[1], -dv[0]];
-        if vdot(nv, rv_v) > 0.2 {
-            let aa = arc(steps - 1);
-            let pos = vadd(c, vmul([aa.cos(), aa.sin()], -(rw - 0.55)));
-            traffic_light(b, ctx, pos, hw_t, dv);
-        }
     }
 }
 
@@ -2395,6 +2384,24 @@ pub fn build_roads_ext(
             let lw = net.cross[k / 2];
             clearers.push((lp, lw.1, lw.2));
         }
+        // where this chain crosses ITSELF the other pass must clear the
+        // sidewalk bands exactly like another way would: a chain is not in
+        // its own clearers, so collect its self-crossing points here
+        let mut self_x: Vec<[f32; 2]> = Vec::new();
+        for s in 0..ch.len().saturating_sub(1) {
+            for t in (s + 2)..ch.len().saturating_sub(1) {
+                if let Some((q, _ta, _tb)) =
+                    seg_int(ch[s], ch[s + 1], ch[t], ch[t + 1])
+                {
+                    let di = vunit(vsub(ch[s + 1], ch[s]));
+                    let dj = vunit(vsub(ch[t + 1], ch[t]));
+                    if vdot(di, dj).abs() > 0.995 {
+                        continue;
+                    }
+                    self_x.push(q);
+                }
+            }
+        }
         // T-attachments: a free end sitting on another way extends the slab
         // across that roadway (the point is appended before smoothing)
         let mut raw: Vec<[f32; 2]> = ch.to_vec();
@@ -2477,6 +2484,12 @@ pub fn build_roads_ext(
                 let q = [st.p[0] + st.n[0] * x, st.p[1] + st.n[1] * x];
                 // the margin leaves room for the junction fillet arcs
                 if blocked(q, 4.0) {
+                    return true;
+                }
+                // ...or into a corridor of another pass of this SAME chain
+                // (a chain is never in its own clearers, so its sidewalk
+                // bands must be cut at its self-crossings explicitly)
+                if self_x.iter().any(|&qx| vlen(vsub(qx, q)) < hw + 4.0) {
                     return true;
                 }
             }
@@ -2627,6 +2640,9 @@ pub fn build_roads_ext(
                 if blocked(mid, 2.0) {
                     continue;
                 }
+                if self_x.iter().any(|&qx| vlen(vsub(qx, mid)) < hw + 2.0) {
+                    continue;
+                }
                 quad_up(
                     &mut b,
                     M_PAINT,
@@ -2652,7 +2668,7 @@ pub fn build_roads_ext(
             total,
             &get,
             &corners,
-            &|q: [f32; 2]| blocked(q, 4.8),
+            &|q: [f32; 2]| blocked(q, 4.8) || self_x.iter().any(|&qx| vlen(vsub(qx, q)) < hw + 4.8),
         );
     }
     // junction patches: pocket asphalt, fillet kerbs, sidewalk fills, zebra
