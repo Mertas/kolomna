@@ -1,5 +1,0 @@
-[package]
-name = "kolomna-dbpf"
-version.workspace = true
-edition.workspace = true
-description = "DBPF archive reader (DBPF 1.0)"

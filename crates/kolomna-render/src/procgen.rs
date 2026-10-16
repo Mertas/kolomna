@@ -156,7 +156,7 @@ impl Builder {
 }
 
 /// Face normal in the renderer's mesh convention: model space is (x, y_up, z);
-/// `push_submesh` stores (n.x, n.z, n.y), so do the same.
+/// Model vertices store normals as (n.x, n.z, n.y), so do the same.
 fn face_n(p0: [f32; 3], p1: [f32; 3], p2: [f32; 3]) -> [f32; 3] {
     let u = [p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]];
     let v = [p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2]];

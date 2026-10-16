@@ -1,9 +1,0 @@
-[package]
-name = "kolomna-assets"
-version.workspace = true
-edition.workspace = true
-description = "Asset decoders for archive formats (FSH, 3DMD, RUL, Exemplar)"
-
-[dependencies]
-png = "0.17"
-kolomna-dbpf = { path = "../kolomna-dbpf" }

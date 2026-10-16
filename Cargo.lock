@@ -720,25 +720,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "kolomna-assets"
-version = "0.1.0"
-dependencies = [
- "kolomna-dbpf",
- "png 0.17.16",
-]
-
-[[package]]
-name = "kolomna-dbpf"
-version = "0.1.0"
-
-[[package]]
 name = "kolomna-render"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "kolomna-assets",
- "kolomna-dbpf",
- "png 0.18.1",
+ "png",
  "pollster",
  "wgpu",
 ]
@@ -1328,19 +1314,6 @@ name = "plain"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4596b6d070b27117e987119b4dac604f3c58cfb0b191112e24771b2faeac1a6"
-
-[[package]]
-name = "png"
-version = "0.17.16"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "82151a2fc869e011c153adc57cf2789ccb8d9906ce52c0b39a6b5697749d7526"
-dependencies = [
- "bitflags 1.3.2",
- "crc32fast",
- "fdeflate",
- "flate2",
- "miniz_oxide 0.8.9",
-]
 
 [[package]]
 name = "png"

@@ -1199,8 +1199,6 @@ pub fn shot(out: &str, zoom: f32) -> Result<(), Box<dyn Error>> {
         scene.wl,
         view,
         &placed,
-        None,
-        &[],
     )?;
     write_png(out, VIEW_W, VIEW_H, &rgba)?;
     println!("saved {out}");

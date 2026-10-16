@@ -1,23 +1,19 @@
-//! Model (3DMD) rendering: meshes from parsed models + a textured wgpu
-//! pipeline that shares the terrain camera (same `Params` uniform, same iso
-//! projection and along-ray depth, so models occlude correctly against terrain).
+//! Model rendering: procedural `ModelMesh` geometry (buildings, props,
+//! street furniture) + a textured wgpu pipeline that shares the terrain
+//! camera (same `Params` uniform, same iso projection and along-ray depth,
+//! so models occlude correctly against terrain).
 //!
-//! Model space conventions (from archived models):
-//! - x / z are horizontal in METRES, y is up in METRES (bbox matches the save's
-//!   occupied size in metres, e.g. 15.9 x 7 x 8 for a small house);
+//! Mesh space conventions:
+//! - x / z are horizontal in METRES, y is up in METRES;
 //! - one map cell = 16 m, mesh units = cells horizontally and
 //!   `metres * ZSCALE` vertically;
-//! - material texture ids are FSH instances inside group 1abe787d.
+//! - each textured submesh picks a slot in the texture array supplied to
+//!   the renderer.
 //!
-//! Each ANIM group's frame-0 block (vertexGroup, indexGroup, primGroup,
-//! materialGroup) yields one textured submesh; vanilla non-animated models
-//! have exactly one block. `render_scene_with_models` renders the terrain
-//! plus any number of placed models offscreen to RGBA8 (4x MSAA).
-
-use std::collections::BTreeMap;
+//! `render_scene_with_models` renders the terrain plus any number of placed
+//! models offscreen to RGBA8 (4x MSAA).
 
 use bytemuck::{Pod, Zeroable};
-use kolomna_assets::mesh3d;
 
 use crate::{Params, TerrainRenderer, Vertex};
 
@@ -109,7 +105,7 @@ fn vs_model(@location(0) pp: vec3<f32>, @location(1) uv: vec2<f32>, @location(2)
     }
     let p = wp;
     // model y-up metres -> scene z-up; horizontal metres -> cells (16 m)
-    // 3DMD buildings spin with the camera (spin = 1): the picked orientation
+    // Buildings spin with the camera (spin = 1): the picked orientation
     // variant always faces the viewer, its rot compensating the camera angle.
     // Full 3-D models (procedural houses, spin = 0) are world-fixed.
     let rot = mp.rot - params.angle * mp.spin;
@@ -244,7 +240,7 @@ pub struct ModelVertex {
 pub struct ModelParams {
     pub pos: [f32; 3],
     pub rot: f32,
-    /// 1.0 = spin with the camera (3DMD buildings), 0.0 = world-fixed
+    /// 1.0 = spin with the camera (buildings), 0.0 = world-fixed
     pub spin: f32,
     pub _p0: f32,
     pub _p1: f32,
@@ -262,110 +258,11 @@ pub struct ModelMesh {
     pub verts: Vec<ModelVertex>,
     pub indices: Vec<u32>,
     pub parts: Vec<ModelPart>,
-    /// unique FSH instance ids (group 1abe787d) used by the submeshes
+    /// unique texture ids used by the submeshes
     pub texture_ids: Vec<u32>,
     /// material slots (indices into `texture_ids`) that are WATER: they are
     /// drawn in a second blended pass after all opaque geometry
     pub water_slots: Vec<u32>,
-}
-
-fn slot_for(mesh: &mut ModelMesh, id: u32) -> u32 {
-    match mesh.texture_ids.iter().position(|&x| x == id) {
-        Some(k) => k as u32,
-        None => {
-            mesh.texture_ids.push(id);
-            (mesh.texture_ids.len() - 1) as u32
-        }
-    }
-}
-
-fn push_submesh(m: &mesh3d::Mesh3d, mesh: &mut ModelMesh, vg: usize, ig: usize, mg: usize) {
-    let (Some(vgrp), Some(igrp)) = (m.vertex_groups.get(vg), m.index_groups.get(ig)) else {
-        return;
-    };
-    if vgrp.verts.is_empty() || igrp.indices.is_empty() {
-        return;
-    }
-    let base = mesh.verts.len() as u32;
-    // per-vertex normals from face normals (model space, y-up)
-    let mut nrms = vec![[0.0f32; 3]; vgrp.verts.len()];
-    for t in igrp.indices.chunks_exact(3) {
-        let (a, b, c) = (t[0] as usize, t[1] as usize, t[2] as usize);
-        if a >= vgrp.verts.len() || b >= vgrp.verts.len() || c >= vgrp.verts.len() {
-            continue;
-        }
-        let pa = vgrp.verts[a].pos;
-        let pb = vgrp.verts[b].pos;
-        let pc = vgrp.verts[c].pos;
-        let u = [pb[0] - pa[0], pb[1] - pa[1], pb[2] - pa[2]];
-        let v = [pc[0] - pa[0], pc[1] - pa[1], pc[2] - pa[2]];
-        let n = [
-            u[1] * v[2] - u[2] * v[1],
-            u[2] * v[0] - u[0] * v[2],
-            u[0] * v[1] - u[1] * v[0],
-        ];
-        for &i in &[a, b, c] {
-            nrms[i][0] += n[0];
-            nrms[i][1] += n[1];
-            nrms[i][2] += n[2];
-        }
-    }
-    for (v, n) in vgrp.verts.iter().zip(nrms.iter()) {
-        let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1e-6);
-        mesh.verts.push(ModelVertex {
-            pos: v.pos,
-            uv: v.uv,
-            nrm: [n[0] / len, n[2] / len, n[1] / len],
-            anim: 0.0,
-        });
-    }
-    let tex_id = m
-        .material_groups
-        .get(mg)
-        .and_then(|g| g.textures.first())
-        .map(|t| t.id)
-        .unwrap_or(0);
-    let slot = slot_for(mesh, tex_id);
-    let first_index = mesh.indices.len() as u32;
-    for &i in &igrp.indices {
-        mesh.indices.push(base + i as u32);
-    }
-    mesh.parts.push(ModelPart {
-        first_index,
-        index_count: igrp.indices.len() as u32,
-        texture: slot,
-    });
-}
-
-/// Build a render mesh from a parsed 3DMD model (one textured submesh per
-/// ANIM group frame-0 block).
-pub fn mesh_from_mesh3d(m: &mesh3d::Mesh3d) -> ModelMesh {
-    let mut mesh = ModelMesh {
-        water_slots: Vec::new(),
-        verts: Vec::new(),
-        indices: Vec::new(),
-        parts: Vec::new(),
-        texture_ids: Vec::new(),
-    };
-    let mut any = false;
-    for g in &m.animation.groups {
-        if let Some(b) = g.blocks.first() {
-            push_submesh(m, &mut mesh, b[0] as usize, b[1] as usize, b[3] as usize);
-            any = true;
-        }
-    }
-    if !any {
-        // fallback: one submesh per group index
-        let n = m
-            .vertex_groups
-            .len()
-            .min(m.index_groups.len())
-            .min(m.material_groups.len().max(1));
-        for k in 0..n {
-            push_submesh(m, &mut mesh, k, k, k.min(m.material_groups.len().saturating_sub(1)));
-        }
-    }
-    mesh
 }
 
 impl ModelMesh {
@@ -818,7 +715,7 @@ pub struct PlacedModel<'a> {
     pub textures: &'a [(u32, u32, Vec<u8>)],
     pub pos: [f32; 3],
     pub rot: f32,
-    /// 1.0 = spin with the camera (3DMD buildings), 0.0 = world-fixed
+    /// 1.0 = spin with the camera (buildings), 0.0 = world-fixed
     pub spin: f32,
 }
 
@@ -838,8 +735,6 @@ pub fn render_scene_with_models(
     // optional camera override (iso centre in cells, angle); None frames the grid
     view: Option<([f32; 2], f32)>,
     models: &[PlacedModel<'_>],
-    roads: Option<&crate::road::RoadMesh>,
-    road_textures: &[(u32, u32, Vec<u8>)],
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let instance = wgpu::Instance::default();
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -893,12 +788,6 @@ pub fn render_scene_with_models(
             r
         })
         .collect();
-
-    let road_renderer = roads.map(|rm| {
-        let r = crate::road::RoadRenderer::new(&device, &queue, format, sample_count, rm, road_textures);
-        r.set_params(&queue, &params);
-        r
-    });
 
     let target = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("scene-msaa"),
@@ -982,9 +871,6 @@ pub fn render_scene_with_models(
         for r in &model_renderers {
             r.draw(&mut pass);
         }
-        if let Some(r) = &road_renderer {
-            r.draw(&mut pass);
-        }
     }
 
     let bpr = w * 4;
@@ -1027,15 +913,4 @@ pub fn render_scene_with_models(
     let data = slice.get_mapped_range()?.to_vec();
     readback.unmap();
     Ok(data)
-}
-
-/// Debug helper: count how many vertices each texture id is used by.
-pub fn texture_usage(mesh: &ModelMesh) -> BTreeMap<u32, usize> {
-    let mut m = BTreeMap::new();
-    for p in &mesh.parts {
-        if let Some(id) = mesh.texture_ids.get(p.texture as usize) {
-            *m.entry(*id).or_insert(0) += p.index_count as usize / 3;
-        }
-    }
-    m
 }

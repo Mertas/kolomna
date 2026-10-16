@@ -1,8 +1,9 @@
-//! Kolomna render library: terrain extraction, meshing and isometric wgpu rendering.
+//! Kolomna render library: procedural world generation, meshing and
+//! isometric wgpu rendering.
 //!
-//! Reads the terrain height grid from a city save (chunk a9dd6ff4/e98f9525/1:
-//! u16 version, then an n*n grid of f32 altitudes in meters, n = 129),
-//! meshes it as iso diamonds and textures it with its own terrain atlas.
+//! The world (terrain, river, hills, groves, diorama rim) is generated in
+//! code by `terrain_gen`; the ground atlas is six procedural 256x256 layers
+//! built at startup.
 //!
 //! Surface rules (v4):
 //! - water is a flat plane at the detected surface level, shaded procedurally
@@ -28,7 +29,7 @@
 //! Lighting (v4): smooth per-vertex normals (central differences of the
 //! height field) instead of flat per-triangle derivatives.
 //!
-//! The rendering internals are shared by the `city_terrain` example (offscreen
+//! The rendering internals are shared by the headless dev examples (offscreen
 //! CLI) and `kolomna-app` (windowed + `--shot`).
 
 use std::borrow::Cow;
@@ -39,8 +40,6 @@ use bytemuck::{Pod, Zeroable};
 
 pub mod model;
 pub mod piter;
-pub mod road;
-pub mod assets;
 pub mod procgen;
 pub mod streets;
 pub mod summer_garden;
@@ -49,10 +48,6 @@ pub mod terrain_gen;
 pub const VIEW_W: u32 = 1600;
 pub const VIEW_H: u32 = 1200;
 pub const TILE: u32 = 256;
-pub const FSH_TYPE: u32 = 0x7AB50E44;
-pub const TERRAIN_TYPE: u32 = 0xa9dd6ff4;
-pub const TERRAIN_GROUP: u32 = 0xe98f9525;
-pub const TERRAIN_INSTANCE: u32 = 1;
 /// map units (mesh units) per meter of altitude (visual relief exaggeration)
 pub const ZSCALE: f32 = 0.035;
 /// world cells per texture repeat (texture instance spans this many cells)
@@ -62,20 +57,6 @@ pub const REPEAT_CELLS: f32 = 5.0;
 pub const WOOD_LAYER: f32 = -1000.0;
 /// water surface sits this many metres above the flat-bed mode (see water_level)
 pub const WATER_MARGIN: f32 = 2.2;
-
-/// Terrain textures (group, instance), all 256x256 DXT1.
-/// Layers: 0 = water (unused by shaders), 1 = dark forest green, 2 = sand,
-/// 3 = dirt, 4 = mid green, 5 = light meadow green.
-/// Sand (2) and dirt (3) are sampled with CONSTANT indices by the shader;
-/// the per-vertex `layer` picks among the three green tints only.
-pub const SOURCES: [(u32, u32); 6] = [
-    (0x891b0e1a, 0x00000013),
-    (0x891b0e1a, 0x00000031),
-    (0x891b0e1a, 0x00000032),
-    (0x891b0e1a, 0x00000033),
-    (0x891b0e1a, 0x00000034),
-    (0x891b0e1a, 0x00000035),
-];
 
 
 #[repr(C)]
@@ -287,42 +268,7 @@ pub fn grid_side(vals: &[f32]) -> usize {
     (vals.len() as f64).sqrt().round() as usize
 }
 
-/// Read the terrain chunk (u16 version + n*n f32 altitudes).
-pub fn load_terrain(city: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let archive = kolomna_dbpf::Archive::open(city)?;
-    let e = archive
-        .find(TERRAIN_TYPE, TERRAIN_GROUP, TERRAIN_INSTANCE)
-        .or_else(|| {
-            archive
-                .entries_of_type(TERRAIN_TYPE)
-                .find(|e| e.tgi.instance_id == TERRAIN_INSTANCE)
-        })
-        .ok_or_else(|| {
-            format!("terrain chunk {TERRAIN_TYPE:08x}/.../{TERRAIN_INSTANCE} not found in {city}")
-        })?;
-    let raw = archive.read_subfile(e)?;
-    if raw.len() < 6 || (raw.len() - 2) % 4 != 0 {
-        return Err(format!("terrain chunk: unexpected size {}", raw.len()).into());
-    }
-    let n = ((raw.len() - 2) / 4) as f64;
-    let n = n.sqrt().round() as usize;
-    if n * n * 4 + 2 != raw.len() {
-        return Err(format!(
-            "terrain chunk: {} bytes is not a square f32 grid",
-            raw.len()
-        )
-        .into());
-    }
-    let vals = (0..n * n)
-        .map(|k| {
-            let o = 2 + 4 * k;
-            f32::from_le_bytes(raw[o..o + 4].try_into().unwrap())
-        })
-        .collect();
-    Ok(vals)
-}
-
-/// Water SURFACE level. The save stores the water bed; flat beds cluster on a
+/// Water SURFACE level. The height grid stores the water bed; flat beds cluster on a
 /// tight family whose mode is the deep-flat value (e.g. 198.00 m), and the
 /// shallow shelves ripple up to ~2 m above it. We take the mode + WATER_MARGIN
 /// as the surface so shallow cells are water (not grass poking through).
@@ -688,33 +634,6 @@ pub fn build_mesh(vals: &[f32], mn: f32, _mx: f32, wl: f32) -> Vec<Vertex> {
         }
     }
     verts
-}
-
-/// Load the terrain textures from the archive as a flat RGBA8 buffer:
-/// SOURCES.len() layers of TILE x TILE x 4 bytes, layer order = SOURCES order.
-pub fn load_atlas(dat_path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let archive = kolomna_dbpf::Archive::open(dat_path)?;
-    let layer_bytes = (TILE * TILE * 4) as usize;
-    let mut layers = vec![0u8; layer_bytes * SOURCES.len()];
-    for (i, (group, instance)) in SOURCES.iter().enumerate() {
-        let e = archive
-            .find(FSH_TYPE, *group, *instance)
-            .ok_or_else(|| format!("texture {group:08x}/{instance:08x} not found in {dat_path}"))?;
-        let raw = archive.read_subfile(e)?;
-        let fsh = kolomna_assets::fsh::Fsh::parse(&raw)?;
-        let img = fsh
-            .decode_entry(&raw, 0)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        if img.width != TILE || img.height != TILE {
-            return Err(format!(
-                "texture {group:08x}/{instance:08x}: unexpected size {}x{}",
-                img.width, img.height
-            )
-            .into());
-        }
-        layers[i * layer_bytes..(i + 1) * layer_bytes].copy_from_slice(&img.rgba);
-    }
-    Ok(layers)
 }
 
 /// Build the full mip chain of `tex` (array layers, level 0 uploaded already)
