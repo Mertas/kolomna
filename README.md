@@ -19,7 +19,7 @@
 
 ## Быстрый старт
 
-    rustup default stable-x86_64-pc-windows-gnu   # на этой машине MSVC нет; C: забит — GNU-тулчейн
+    rustup default stable-x86_64-pc-windows-gnu   # MSVC не требуется — сборка под GNU-тулчейн
     cargo build
 
     # приложение (окно): мягкий зум колесом, повороты средней кнопкой, навигация краями окна
@@ -40,7 +40,25 @@
 
 Без аргументов `kolomna-app` открывает город из собственных процедурных данных.
 
-Готовый exe для запуска: **`Kolomna.exe` в корне** (это копия `target/release/kolomna-app.exe`; собрать заново: `cargo build --release`).
+Готовый exe в репозиторий не входит (собранные бинарники игнорируются). Собрать релиз:
+`cargo build --release` → `target/release/kolomna-app.exe`.
+
+## Сборка на Windows (GNU-тулчейн)
+
+Известная особенность `stable-x86_64-pc-windows-gnu`: self-contained gcc из rustup
+собран с префиксом `/c/buildroot` и сам не находит свои стартовые файлы — линковка
+падает с `ld: cannot find crt2.o`. Лечится файлом `.cargo/config.toml` (в репозиторий
+не включён — он машинозависим), который указывает тулчейну, где искать `crt2.o` /
+`libkernel32.a`:
+
+```toml
+[env]
+LIBRARY_PATH = "C:\\Users\\<user>\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\self-contained"
+COMPILER_PATH = "C:\\Users\\<user>\\.rustup\\toolchains\\stable-x86_64-pc-windows-gnu\\lib\\rustlib\\x86_64-pc-windows-gnu\\lib\\self-contained"
+```
+
+Если в этой папке нет `crtbegin.o` / `crtend.o` — их можно взять из w64devkit
+(gcc 14.1) и доложить в тот же `lib/self-contained`.
 
 ## Управление (окно)
 
