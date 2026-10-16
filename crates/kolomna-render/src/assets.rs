@@ -1,9 +1,9 @@
 //! Loaders for archive assets: model meshes and their textures.
 //!
-//! Model meshes live in `data1.dat` (type 5ad0e817); textures live in
-//! `data2..5.dat` as FSH files (type 7ab50e44) in group 1abe787d, keyed by
-//! the material texture id from the 3DMD. `fsh_rgba_search` scans every
-//! `data*.dat` sitting next to a given archive path.
+//! Model meshes live in the model archive (type 5ad0e817); textures live
+//! in the texture archives as FSH files (type 7ab50e44) in group 1abe787d, keyed
+//! by the material texture id from the 3DMD. `fsh_rgba_search` scans every
+//! sibling `.dat` archive sitting next to a given archive path.
 
 use std::error::Error;
 use std::path::Path;
@@ -47,24 +47,36 @@ pub fn fsh_rgba(dat: &str, instance: u32) -> Result<Option<(u32, u32, Vec<u8>)>,
     }
 }
 
-/// Find and decode FSH `instance` in any `data*.dat` next to `any_dat`.
-pub fn fsh_rgba_search(any_dat: &str, instance: u32) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
+/// Every `.dat` archive sitting next to `any_dat`, name-descending (newest
+/// packs first), including `any_dat` itself when it matches.
+pub fn sibling_dats(any_dat: &str) -> Vec<String> {
     let dir = Path::new(any_dat)
         .parent()
         .map(|p| p.to_path_buf())
         .unwrap_or_default();
-    for name in [
-        "data5.dat",
-        "data4.dat",
-        "data3.dat",
-        "data2.dat",
-        "data1.dat",
-    ] {
-        let p = dir.join(name);
-        if !p.exists() {
-            continue;
+    let mut out: Vec<String> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension()
+                .map(|x| x.eq_ignore_ascii_case("dat"))
+                .unwrap_or(false)
+            {
+                if let Some(s) = p.to_str() {
+                    out.push(s.to_string());
+                }
+            }
         }
-        if let Some(img) = fsh_rgba(&p.to_string_lossy(), instance)? {
+    }
+    out.sort();
+    out.reverse();
+    out
+}
+
+/// Find and decode FSH `instance` in any sibling `.dat` archive of `any_dat`.
+pub fn fsh_rgba_search(any_dat: &str, instance: u32) -> Result<(u32, u32, Vec<u8>), Box<dyn Error>> {
+    for p in sibling_dats(any_dat) {
+        if let Some(img) = fsh_rgba(&p, instance)? {
             return Ok(img);
         }
     }

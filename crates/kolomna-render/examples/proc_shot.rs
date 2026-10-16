@@ -1,6 +1,6 @@
 //! Render a row of procedurally generated houses (Foundation-style).
 //!
-//! usage: proc_shot <city.save> <data2.dat> <out_prefix> [count] [zoom] [seed0]
+//! usage: proc_shot <save> <archive.dat> <out_prefix> [count] [zoom] [seed0]
 
 use std::env;
 
@@ -16,7 +16,7 @@ use kolomna_render::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() < 3 {
-        eprintln!("usage: proc_shot <city.save> <data2.dat> <out_prefix> [count] [zoom] [seed0]");
+        eprintln!("usage: proc_shot <save> <archive.dat> <out_prefix> [count] [zoom] [seed0]");
         std::process::exit(1);
     }
     let (city, dat, out) = (&args[0], &args[1], &args[2]);

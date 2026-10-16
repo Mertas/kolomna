@@ -63,7 +63,7 @@ pub const WOOD_LAYER: f32 = -1000.0;
 /// water surface sits this many metres above the flat-bed mode (see water_level)
 pub const WATER_MARGIN: f32 = 2.2;
 
-/// data2.dat terrain textures (group, instance), all 256x256 DXT1.
+/// Terrain textures (group, instance), all 256x256 DXT1.
 /// Layers: 0 = water (unused by shaders), 1 = dark forest green, 2 = sand,
 /// 3 = dirt, 4 = mid green, 5 = light meadow green.
 /// Sand (2) and dirt (3) are sampled with CONSTANT indices by the shader;
@@ -124,7 +124,7 @@ struct Params {
     pivot: f32,
     // water plane height in mesh units (set by the renderer)
     water_z: f32,
-    /// camera tilt = sin(elevation): 0.5 = 2:1 iso, 1.0 = top-down, 0.0 = level
+    /// camera tilt = sin(elevation): 0.5 = classic 2:1 iso, 1.0 = top-down, 0.0 = level
     tilt: f32,
     pad2: f32,
 };

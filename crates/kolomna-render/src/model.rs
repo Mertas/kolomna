@@ -1,11 +1,11 @@
-//! Model rendering: meshes from parsed models + a textured wgpu
+//! Model (3DMD) rendering: meshes from parsed models + a textured wgpu
 //! pipeline that shares the terrain camera (same `Params` uniform, same iso
 //! projection and along-ray depth, so models occlude correctly against terrain).
 //!
 //! Model space conventions (from archived models):
 //! - x / z are horizontal in METRES, y is up in METRES (bbox matches the save's
 //!   occupied size in metres, e.g. 15.9 x 7 x 8 for a small house);
-//! - one cell = 16 m, mesh units = cells horizontally and
+//! - one map cell = 16 m, mesh units = cells horizontally and
 //!   `metres * ZSCALE` vertically;
 //! - material texture ids are FSH instances inside group 1abe787d.
 //!
@@ -244,7 +244,7 @@ pub struct ModelVertex {
 pub struct ModelParams {
     pub pos: [f32; 3],
     pub rot: f32,
-    /// 1.0 = spin with the camera (rotated house meshes), 0.0 = world-fixed
+    /// 1.0 = spin with the camera (3DMD buildings), 0.0 = world-fixed
     pub spin: f32,
     pub _p0: f32,
     pub _p1: f32,

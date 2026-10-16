@@ -35,7 +35,7 @@
    через `place(..., bay, seed)`. Квартал — 10 дворов, у каждого k=1 в улице,
    поэтому типы конкурируют за один кусок: roman (0.6) → bays (0.8) → plain.
 7. **Проверка** — `export PATH="/e/tools/mingw-tools-only:$PATH"; cargo build`;
-   `./target/debug/kolomna-app.exe --shot out/x.png "<city.save>" "<data2.dat>" --zoom 30`;
+   `./target/debug/kolomna-app.exe --shot out/x.png --zoom 30`;
    пиксель-чек: 0 magenta; лог печатает `block N street row: arches/roman/bays`.
    Release: `cargo build --release` → `cp -f target/release/kolomna-app.exe Kolomna.exe`.
    Смоук окна: запустить exe, 10–15 с, лог без panic (UI-кнопка живёт только в оконном режиме).

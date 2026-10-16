@@ -1,6 +1,6 @@
 //! Offscreen isometric terrain preview.
 //!
-//! Renders a textured diamond terrain grid to a PNG: archive textures
+//! Renders a textured diamond terrain grid to a PNG: textures from the archives
 //! (loaded from a local archive) on a procedural demo heightmap.
 //!
 //! usage: cargo run -p kolomna-render --example terrain_preview -- <file.dat> <out.png> [grid_side]
@@ -20,7 +20,7 @@ const ATLAS_ROWS: u32 = 2;
 const FSH_TYPE: u32 = 0x7AB50E44;
 const HEIGHT_MAX: f32 = 8.0;
 
-/// data2.dat textures used for the demo atlas (group, instance), all 256x256 DXT1.
+/// Archive textures used for the demo atlas (group, instance), all 256x256 DXT1.
 const SOURCES: [(u32, u32); 6] = [
     (0x891b0e1a, 0x00000013),
     (0x891b0e1a, 0x00000031),

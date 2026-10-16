@@ -1,15 +1,11 @@
-//! Reader for DBPF archives (DBPF 1.0, 96-byte header).
+//! DBPF archive reader (DBPF 1.0, 96-byte header).
 //!
-//! Layout validated against real archive data:
+//! Layout validated against real archive data files:
 //! - header: magic `DBPF`, major=1, minor=0, created/modified (unix seconds),
 //!   index_major=7, index_count, index_offset, index_size (= count * 20).
 //! - index entries: 20 bytes — type, group, instance, offset, size
-//!   (bit 31 of size = compressed marker in generic DBPF; this variant instead lists
+//!   (bit 31 of size = compressed marker in generic DBPF; here the archive instead lists
 //!   compressed subfiles in a DIR subfile — see `Archive::compressed`).
-//!
-//! References (read-only, not vendored):
-//! - <public DBPF format documentation>
-//! - open-source DBPF archive readers.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -70,7 +66,7 @@ impl Entry {
     }
 }
 
-/// A whole DBPF archive held in memory. Data files are ~100–170 MB, fine for now.
+/// A whole DBPF archive held in memory. The data files are ~100–170 MB, fine for now.
 pub struct Archive {
     path: PathBuf,
     data: Vec<u8>,
@@ -179,7 +175,7 @@ impl Archive {
 
     /// Read a subfile, decompressing it with RefPack when flagged.
     ///
-    /// The compression flag sits not in the entry itself but in the DIR
+    /// The compression flag is kept not in the entry itself but in the DIR
     /// subfile, so both sources are honoured.
     pub fn read_subfile(&self, e: &Entry) -> io::Result<Vec<u8>> {
         let raw = self.read_raw(e)?;
@@ -238,7 +234,7 @@ fn parse_header(data: &[u8]) -> io::Result<Header> {
 /// `u32 packed size (== entry size), u16 compression type (0xfb10),
 /// u24 big-endian decompressed size`; the RefPack stream follows.
 ///
-/// Verified on live data: 200/200 random compressed subfiles of data2.dat
+/// Verified on live data: 200/200 random compressed subfiles of a real archive.
 /// decode to their declared size with the expected SHPI magic.
 pub fn decompress_refpack(raw: &[u8]) -> io::Result<Vec<u8>> {
     if raw.len() < 9 {
@@ -315,7 +311,7 @@ pub fn decompress_refpack(raw: &[u8]) -> io::Result<Vec<u8>> {
 }
 
 /// Human name for common TGI type ids.
-/// Source: community DBPF type list (see open-source readers `file-types.ts`).
+/// Source: community DBPF type list.
 pub fn type_name(t: u32) -> Option<&'static str> {
     Some(match t {
         0x5AD0E817 => "3DMD",

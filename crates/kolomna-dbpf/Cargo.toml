@@ -2,4 +2,4 @@
 name = "kolomna-dbpf"
 version.workspace = true
 edition.workspace = true
-description = "Reader for DBPF archives"
+description = "DBPF archive reader (DBPF 1.0)"

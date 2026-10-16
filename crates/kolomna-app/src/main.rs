@@ -57,7 +57,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn usage() {
-    println!("Kolomna — изометрический город (процедурная генерация, без ассетов)");
+    println!("Kolomna — изометрический город (процедурная генерация, без внешних ассетов)");
     println!();
     println!("  kolomna-app [--zoom N]                 окно редактора");
     println!("  kolomna-app --shot [out.png] [--zoom N]   один кадр в PNG (N — приближение)");

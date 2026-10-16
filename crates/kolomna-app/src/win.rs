@@ -1222,7 +1222,7 @@ struct Camera {
     pivot: [f32; 2],
     /// grid side (cells) — pivot compensation needs it
     grid: f32,
-    /// camera tilt = sin(elevation): 0.5 = 2:1 iso, 1.0 = top-down,
+    /// camera tilt = sin(elevation): 0.5 = classic 2:1 iso, 1.0 = top-down,
     /// 0.0 = straight ahead; vertical middle-drag drives it
     tilt: f32,
     tilt_target: f32,

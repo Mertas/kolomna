@@ -1,8 +1,8 @@
-//! Offscreen isometric render of a saved city's terrain.
+//! Offscreen isometric render of a real city-save's terrain.
 //!
 //! Thin CLI over the `kolomna-render` library (rendering internals in `src/lib.rs`).
 //!
-//! usage: cargo run -p kolomna-render --example city_terrain -- <city.save> <data2.dat> <out.png>
+//! usage: cargo run -p kolomna-render --example city_terrain -- <save> <archive.dat> <out.png>
 
 use std::env;
 
@@ -14,7 +14,7 @@ use kolomna_render::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() < 3 {
-        eprintln!("usage: city_terrain <city.save> <data2.dat> <out.png>");
+        eprintln!("usage: city_terrain <save> <archive.dat> <out.png>");
         std::process::exit(1);
     }
 

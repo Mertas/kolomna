@@ -1,11 +1,10 @@
 //! Terrain + roads from the city save + one house (a small house) -> PNGs.
 //!
-//! usage: cargo run -p kolomna-render --example road_shot -- <city.save> <data2.dat> <out_prefix>
+//! usage: cargo run -p kolomna-render --example road_shot -- <save> <archive.dat> <out_prefix>
 
 use std::env;
-use std::path::Path;
 
-use kolomna_render::assets::{fsh_rgba_search, mesh3d_from_dat};
+use kolomna_render::assets::{fsh_rgba_search, mesh3d_from_dat, sibling_dats};
 use kolomna_render::model::{mesh_from_mesh3d, render_scene_with_models, PlacedModel};
 use kolomna_render::road::{build_road_mesh, load_road_tiles};
 use kolomna_render::{
@@ -15,7 +14,7 @@ use kolomna_render::{
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.len() < 3 {
-        eprintln!("usage: road_shot <city.save> <data2.dat> <out_prefix>");
+        eprintln!("usage: road_shot <save> <archive.dat> <out_prefix>");
         std::process::exit(1);
     }
     let (city, dat, out) = (&args[0], &args[1], &args[2]);
@@ -44,7 +43,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ---- house: all four Z5 orientations of a small house
-    let s1 = sibling(dat, "data1.dat");
+    let s1 = sibling_dats(dat)
+        .into_iter()
+        .find(|d| mesh3d_from_dat(d, 0x5ad0e817, 0xbadb57f1, 0x00ad0400).is_ok())
+        .ok_or("no sibling .dat archive contains the house model")?;
     let mut meshes = Vec::new();
     let mut texsets: Vec<Vec<(u32, u32, Vec<u8>)>> = Vec::new();
     for inst in [0x00ad0400u32, 0x00ad0410, 0x00ad0420, 0x00ad0430] {
@@ -165,9 +167,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn sibling(any_dat: &str, name: &str) -> String {
-    Path::new(any_dat)
-        .parent()
-        .map(|p| p.join(name).to_string_lossy().into_owned())
-        .unwrap_or_else(|| name.to_string())
-}
+

@@ -709,6 +709,41 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kolomna-app"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "kolomna-render",
+ "pollster",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "kolomna-assets"
+version = "0.1.0"
+dependencies = [
+ "kolomna-dbpf",
+ "png 0.17.16",
+]
+
+[[package]]
+name = "kolomna-dbpf"
+version = "0.1.0"
+
+[[package]]
+name = "kolomna-render"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "kolomna-assets",
+ "kolomna-dbpf",
+ "png 0.18.1",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1526,41 +1561,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "kolomna-app"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "pollster",
- "kolomna-render",
- "wgpu",
- "winit",
-]
-
-[[package]]
-name = "kolomna-assets"
-version = "0.1.0"
-dependencies = [
- "png 0.17.16",
- "kolomna-dbpf",
-]
-
-[[package]]
-name = "kolomna-dbpf"
-version = "0.1.0"
-
-[[package]]
-name = "kolomna-render"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "png 0.18.1",
- "pollster",
- "kolomna-assets",
- "kolomna-dbpf",
- "wgpu",
 ]
 
 [[package]]

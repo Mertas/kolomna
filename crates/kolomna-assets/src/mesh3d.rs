@@ -5,7 +5,7 @@
 //! trustworthy (the stored size is ignored in practice), so chunks are parsed
 //! structurally; the parser asserts all bytes are consumed in the end.
 //!
-//! Layouts (cross-checked against public open-source parsers and
+//! Layouts (cross-checked against public community layout docs and
 //! byte-verified on archived models):
 //! - HEAD: u16 major + u16 minor version ("1.5" -> 1, 5)
 //! - VERT: u32 group count; per group: u16 flags, u16 numVerts, u32 format;

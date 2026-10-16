@@ -1,5 +1,5 @@
 //! Road / network tiles from a city save: parse the `c9c05c6e`
-//! (network occupant) records, build one textured mesh and render it on top
+//! (network-occupant) records, build one textured mesh and render it on top
 //! of the terrain with the shared isometric camera.
 //!
 //! Each record is one 16 x 16 m tile: 4 corner vertices (world metres, y =
@@ -17,7 +17,7 @@ use crate::{Params, ZSCALE};
 
 pub const NETWORK_TYPE: u32 = 0xc9c0_5c6e;
 pub const CITY_GROUP: u32 = 0x299b_2d1b;
-/// 1 cell in metres (roads and terrain grids use 16 m per cell).
+/// 1 map cell in metres (roads and terrain grids use 16 m per cell).
 pub const CELL_M: f32 = 16.0;
 
 #[derive(Clone, Debug)]

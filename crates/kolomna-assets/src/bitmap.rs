@@ -3,7 +3,7 @@
 //! All functions produce RGBA8 (r, g, b, a byte order).
 //! Bitmaps are stored little-endian, i.e. 32-bit data is BGRA on disk.
 //! 16-bit packed formats are read big-endian, matching community readers.
-//! Ported from the public descriptions in open-source readers.
+//! Ported from public community format descriptions.
 
 /// Decode `data` (already sliced to exactly the needed length) into RGBA8.
 pub fn decode(code: u8, data: &[u8], width: usize, height: usize) -> Result<Vec<u8>, String> {
